@@ -27,13 +27,13 @@ bypass and failure modes, an ADR, `mypy --strict`, `pyright`, and green CI. No p
 **Why:** Establish a clean, reproducible baseline before connecting external providers or starting
 downstream projects.
 
-- [ ] Locally: `pip install -e ".[dev]"`, then `ruff check ai_agent_harness examples tests`, `mypy ai_agent_harness examples tests`, `pyright`, `pytest`
-- [ ] Push repository and verify CI is green across Python 3.11, 3.12, and 3.13
-- [x] **Decide on package distribution** (ADR 0013 — decided: versioned package on PyPI): copied template vs. versioned package (`ai-agent-harness`) + project scaffold
+- [x] Locally: `pip install -e ".[dev]"`, then `ruff check ai_agent_harness examples tests`, `mypy ai_agent_harness examples tests`, `pyright`, `pytest`
+- [x] Push repository and verify CI is green across Python 3.11, 3.12, and 3.13
+- [x] **Decide on package distribution** (ADR 0013 — decided: versioned package via Git release tags): copied template vs. versioned package (`ai-agent-harness`) + project scaffold
 - [x] **Create and commit a lockfile** (`uv.lock`; CI installs it with `uv sync --locked`, Dependabot proposes updates)
 - [ ] If downstream projects require an older Pydantic 2.x minor version, test that version in CI before lowering the floor in `pyproject.toml` (currently tested: `>=2.13,<3`)
-- [x] Review ADRs 0001–0016 and set approved decisions to `Accepted`
-- [ ] Tag the baseline commit (`v0.4.0`) so downstream projects can pin a known-good version
+- [x] Review ADRs 0001–0018 and set approved decisions to `Accepted`
+- [x] Tag the release commit (`v0.6.0`) so downstream projects can pin a known-good version
 
 **Done when:** All checks are green and the baseline tag is pushed.
 
@@ -57,7 +57,7 @@ message format (thinking blocks, tool calls, stop reasons, error taxonomy) behav
 - [ ] Mid-run failover test: history containing thinking blocks from Provider A is cleanly accepted by Provider B
 - [x] A separately marked live test (`pytest -m live`, excluded from default CI) exists (`tests/live/`) — **ran green against Claude Haiku 5.5 on 2026-10-18 (7 tests)**
 - [ ] [Use Case 01](use-cases/01-finance-and-communications-assistant.md) executed once with a real model instead of `FakeProvider`
-- [ ] First real run completed following [`first-real-run.md`](first-real-run.md) Stage A with zero open findings
+- [x] First real run completed following [`first-real-run.md`](first-real-run.md) Stage A with zero open findings
 - [x] ADR documenting provider choice and handling of provider-specific features (ADR 0017)
 
 ---

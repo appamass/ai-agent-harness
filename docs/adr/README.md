@@ -22,5 +22,5 @@ documented here with context, rejected alternatives, and consequences. Create ne
 | [0014](0014-bind-resume-to-pending-call.md) | Bind `resume` to the pending call (`pending_id`) | Accepted |
 | [0015](0015-safe-defaults-for-read-file-and-file-store.md) | Default deny list for `ReadFile`; file store is POSIX-only | Accepted |
 | [0016](0016-import-name-ai-agent-harness.md) | Import name `ai_agent_harness` instead of `harness` | Accepted |
-| [0017](0017-anthropic-provider-adapter.md) | Anthropic provider adapter as an optional extra | Proposed |
-| [0018](0018-postgres-checkpoint-store.md) | PostgreSQL checkpoint store as an optional extra | Proposed |
+| [0017](0017-anthropic-provider-adapter.md) | Anthropic provider adapter as an optional extra | Accepted |
+| [0018](0018-postgres-checkpoint-store.md) | PostgreSQL checkpoint store as an optional extra | Accepted |

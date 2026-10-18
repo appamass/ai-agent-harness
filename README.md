@@ -109,11 +109,11 @@ Not built yet: streaming, MCP, structured final output, parallel tool calls ([`d
 ## Install
 
 ```bash
-pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness"   # a PyPI release is planned
+pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.6.0"
 ```
 
 Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[postgres]` (PostgreSQL store).
-Pin a minor range (for example `>=0.6,<0.7`) and commit your lockfile: before 1.0, a minor version may contain breaking changes ([`CHANGELOG.md`](CHANGELOG.md)).
+Pin a release tag (for example `@v0.6.0`) and commit your lockfile: before 1.0, a minor version may contain breaking changes ([`CHANGELOG.md`](CHANGELOG.md)).
 What has been run against a real model, and what has not: [`docs/known-limitations.md`](docs/known-limitations.md).
 
 ## Documentation

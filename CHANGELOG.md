@@ -67,7 +67,7 @@ default and `JsonFileCheckpointStore` refuses platforms without `fcntl` (ADR 001
 - CI: installs the exact versions from `uv.lock` (`uv sync --locked`), so new tool releases cannot break CI;
   a `lowest` job tests the lower bounds (e.g. `pydantic==2.13`); Dependabot proposes weekly updates.
 - Packaging: authors and project URLs (`github.com/appamass/ai-agent-harness`), license holder `appamass`,
-  classifiers `3 - Alpha`, `POSIX`, and `MacOS`. All ADRs 0001–0016 accepted; ADR 0013 decided (public PyPI).
+  classifiers `3 - Alpha`, `POSIX`, and `MacOS`. All ADRs 0001–0016 accepted; ADR 0013 decided (versioned package via Git release tags).
 
 ## 0.3.0 – 2026-10-16
 

@@ -10,8 +10,8 @@ token usage look like? Everything is configured so that any mistake stays cheap,
 
 Do not start a live run until every item below is checked:
 
-- [ ] **Step 0 from [`next-steps.md`](next-steps.md)** is complete: local and CI checks are green, ADRs reviewed.
-- [ ] **A real model provider adapter** exists and has tests backed by recorded API responses.
+- [x] **Step 0 from [`next-steps.md`](next-steps.md)** is complete: local and CI checks are green, ADRs reviewed.
+- [x] **A real model provider adapter** exists and has tests backed by recorded API responses.
       `AnthropicProvider` is included (see 1a below); for any other provider, write your own first
       (skill `add-provider-adapter`). The core deliberately ships without provider SDKs.
 - [ ] **API key** is stored in an environment variable or secret manager — never in the repository,
@@ -30,7 +30,7 @@ Do not start a live run until every item below is checked:
 2. **Install** the optional extra:
 
    ```bash
-   pip install "ai-agent-harness[anthropic]"
+   pip install -e ".[anthropic]"          # or: uv sync --extra dev
    ```
 
 3. **Set the key in your own shell** — never in a file, a prompt, a commit, or a chat:
