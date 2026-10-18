@@ -1,6 +1,6 @@
 # 0017 – Anthropic Provider Adapter as an Optional Extra
 
-- **Status:** Proposed
+- **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-18
 - **Affects:** `ai_agent_harness/providers/anthropic.py` (new public module), `pyproject.toml` (extra `anthropic`), tests, docs
 
@@ -32,7 +32,7 @@ a 400, thinking blocks must be sent back with their signature, and error texts e
   `tests/fixtures/anthropic/` (no network, no key). `tests/live/` holds opt-in tests (`pytest -m live`; the marker is registered and
   deselected by default) that call the real API. Responses recorded from the first live run (`HARNESS_RECORD_DIR`) live in
   `tests/fixtures/anthropic/recorded/` and are translated and round-tripped by a test; fixtures for cases not yet recorded
-  (redacted thinking, refusal, cache usage; thinking together with a tool call is missing) are hand-written from the documented shape and say so in the fixtures README.
+  (redacted thinking and refusal) are hand-written from the documented shape and say so in the fixtures README.
 - Requests pass an explicit SDK timeout (600 s) so the SDK does not refuse large non-streaming `max_tokens`; the router's
   `RetryPolicy.request_timeout_s` is the effective limit. Non-streaming is kept on purpose: the runner needs complete messages.
 - Tool call IDs are made safe for the API (`[A-Za-z0-9_-]`) in `tool_use` and `tool_result` alike, so history from another

@@ -1,6 +1,6 @@
 # 0018 – PostgreSQL Checkpoint Store as an Optional Extra
 
-- **Status:** Proposed
+- **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-18
 - **Affects:** `ai_agent_harness/persistence_postgres.py` (new public module), `ai_agent_harness/persistence.py` (shared helpers), `pyproject.toml` (extra `postgres`), CI, tests, docs
 

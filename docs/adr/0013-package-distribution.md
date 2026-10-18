@@ -16,22 +16,24 @@ gradually diverge across projects.
 | Option | Pros | Cons |
 |---|---|---|
 | **A: Copy repository** (status quo) | Zero infrastructure, full local freedom per project | Fixes must be ported to every repo; configuration and core drift is inevitable |
-| **B: Versioned package + project template** | One fix, one version bump across all projects; clean boundary between core (`ai_agent_harness/`) and project code | Requires a package index (public PyPI or private registry) and strict SemVer / `CHANGELOG.md` discipline |
+| **B: Versioned package + project template** | One fix, one version bump across all projects; clean boundary between core (`ai_agent_harness/`) and project code | Requires versioned Git release tags (or a package index) and strict SemVer / `CHANGELOG.md` discipline |
 | **C: Git submodule / subtree** | No package registry needed | Clunky developer ergonomics; version pinning and upgrades are error-prone |
 
 ## Decision
 
-**Option B, decided by the maintainer on 2026-10-18.** `ai-agent-harness` is published as a versioned
-package on public PyPI under the MIT license (import name `ai_agent_harness`, ADR 0016), developed in the
-public repository `github.com/appamass/ai-agent-harness`. Downstream projects depend on a pinned range
-instead of copying the code.
+**Option B, decided by the maintainer on 2026-10-18.** `ai-agent-harness` is distributed as a versioned
+package (import name `ai_agent_harness`, ADR 0016) directly from the public repository
+`github.com/appamass/ai-agent-harness` via pinned Git release tags
+(`pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.6.0"`) under the MIT
+license. Downstream projects depend on a pinned release tag and commit their lockfile instead of copying
+the code; a public PyPI release is not required.
 
 ## Recommendation (original proposal)
 
-**Option B.** Publish `ai_agent_harness/` as the versioned package `ai-agent-harness` following Semantic Versioning
-(on PyPI or an internal package registry such as GitHub Packages / Google Artifact Registry). Provide a
+**Option B.** Distribute `ai_agent_harness/` as the versioned package `ai-agent-harness` following Semantic Versioning
+(via GitHub release tags or an internal package registry such as GitHub Packages / Google Artifact Registry). Provide a
 lightweight project template (e.g., via Copier) that scaffolds only the project-specific layer — custom
-tools, hooks, evals, `AGENTS.md`, and CI — while depending on `ai-agent-harness>=0.4,<0.5`.
+tools, hooks, evals, `AGENTS.md`, and CI — while depending on a pinned release of `ai-agent-harness`.
 
 The repository is already structured for Option B: `ai_agent_harness/` is a self-contained package free of
 project-specific code, the public API is explicitly exported in `ai_agent_harness/__init__.py`, checkpoint schemas
