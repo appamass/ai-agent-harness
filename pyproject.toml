@@ -1,0 +1,109 @@
+[project]
+name = "ai-agent-harness"
+version = "0.6.0"
+description = "Model-agnostic Python harness for AI agents: human approval, guardrails, crash-safe runs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "appamass", email = "info@appamass.com" }]
+keywords = [
+  "ai",
+  "agents",
+  "llm",
+  "harness",
+  "guardrails",
+  "tool-calling",
+  "human-in-the-loop",
+  "checkpointing",
+  "pydantic",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Typing :: Typed",
+]
+# Lower bound = tested version. Only lower it after CI passes on the older version.
+dependencies = ["pydantic>=2.13,<3"]
+
+[project.urls]
+Homepage = "https://github.com/appamass/ai-agent-harness"
+Repository = "https://github.com/appamass/ai-agent-harness"
+Issues = "https://github.com/appamass/ai-agent-harness/issues"
+Changelog = "https://github.com/appamass/ai-agent-harness/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# Model provider adapter (ai_agent_harness.providers.anthropic). The core never imports it.
+anthropic = ["anthropic>=1.15,<2"]
+# Checkpoint store for several workers (ai_agent_harness.persistence_postgres). The core never imports it.
+postgres = ["psycopg[binary,pool]>=3.2,<4"]
+# cryptography only for doc tests (Use Case 01); anthropic so the adapter is type-checked and tested in CI
+dev = [
+  "pytest>=8",
+  "mypy>=1.10",
+  "pyright>=1.1.380",
+  "ruff>=0.5",
+  "cryptography>=42",
+  "anthropic>=1.15,<2",
+  "psycopg[binary,pool]>=3.2,<4",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ai_agent_harness*"]
+
+[tool.setuptools.package-data]
+ai_agent_harness = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests marked "live" call a real model API and cost money: they are opt-in (`pytest -m live`), never part of a default run.
+addopts = "-ra --strict-markers -m 'not live'"
+markers = ["live: calls a real model API (needs an API key, costs money); run with `pytest -m live`"]
+filterwarnings = ["error"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "RUF", "PL", "S", "BLE", "RET", "PT", "TRY", "C4", "PIE"]
+ignore = [
+  "RUF001", "RUF002", "RUF003",  # typographic punctuation (en-dash, em-dash, multiplication sign) in docs/strings is intentional
+  "PLR0911", "PLR0912", "PLR0913", "PLR0915",  # runner and executor intentionally keep sequential control flow in one place
+  "PLR2004",
+  "TRY003", "TRY300",
+  "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "PLR", "PT011", "PT018", "PLC0415", "BLE001", "TRY"]
+
+[tool.pyright]
+include = ["ai_agent_harness", "examples", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+# Runtime checks against external code (adapters, tools, hooks) are intentional even when static types make them look redundant
+reportUnnecessaryIsInstance = false

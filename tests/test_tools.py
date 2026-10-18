@@ -1,0 +1,434 @@
+"""Executor, tool definitions, and built-in tools."""
+
+from __future__ import annotations
+
+import asyncio
+import time
+from pathlib import Path
+from typing import Any, ClassVar
+
+import pytest
+from pydantic import BaseModel
+
+from ai_agent_harness import (
+    DEFAULT_DENIED_READS,
+    AskUser,
+    Autonomy,
+    BaseTool,
+    Decision,
+    Hook,
+    HookPipeline,
+    ReadFile,
+    Risk,
+    RunState,
+    RunStatus,
+    SyncTool,
+    ToolError,
+    ToolRegistry,
+    start,
+)
+from ai_agent_harness.core import ConfigError, ToolInvocation, ToolResult
+from ai_agent_harness.testing import text_response, tool_response
+from ai_agent_harness.tools.builtin import ReadFileInput
+
+from .conftest import Echo, EmptyInput, PathInput, WriteFile, make_agent, results_of, run_sync
+
+
+class BlockingSync(SyncTool[EmptyInput]):
+    name: ClassVar[str] = "blocking"
+    description: ClassVar[str] = "blocks"
+    input_model: ClassVar[type[BaseModel]] = EmptyInput
+    risk: ClassVar[Risk] = Risk.READ
+    timeout_s: ClassVar[float] = 0.1
+
+    def run_sync(self, args: EmptyInput, state: RunState) -> str:
+        time.sleep(0.5)
+        return "too late"
+
+
+def test_sync_tool_timeout_is_enforced() -> None:
+    """Regression K4: blocking code previously bypassed the timeout."""
+    agent, _, _ = make_agent([tool_response(("blocking", {})), text_response("ok")], [BlockingSync()])
+
+    async def timed() -> tuple[float, RunState]:
+        began = time.monotonic()
+        state = await start(agent, "go")
+        return time.monotonic() - began, state
+
+    # Measured inside the run: asyncio.run waits on shutdown for the (uninterruptible) worker thread.
+    duration, state = run_sync(timed())
+    assert duration < 0.4
+    assert "timeout" in results_of(state)[0].content
+
+
+def test_internal_tool_errors_do_not_leak_details() -> None:
+    class Leaky(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "leaky"
+        description: ClassVar[str] = "raises"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+
+        async def run(self, args: EmptyInput, state: RunState) -> str:
+            raise RuntimeError("password=hunter2 at /etc/secret")
+
+    agent, _, _ = make_agent([tool_response(("leaky", {})), text_response("ok")], [Leaky()])
+    content = results_of(run_sync(start(agent, "go")))[0].content
+    assert "hunter2" not in content and "/etc" not in content
+    assert "RuntimeError" in content
+
+
+def test_tool_error_message_reaches_model() -> None:
+    class Friendly(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "friendly"
+        description: ClassVar[str] = "raises ToolError"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+
+        async def run(self, args: EmptyInput, state: RunState) -> str:
+            raise ToolError("Customer 42 does not exist")
+
+    agent, _, _ = make_agent([tool_response(("friendly", {})), text_response("ok")], [Friendly()])
+    assert "Customer 42 does not exist" in results_of(run_sync(start(agent, "go")))[0].content
+
+
+def test_non_string_output_is_rejected() -> None:
+    class Bad(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "bad"
+        description: ClassVar[str] = "returns dict"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+
+        async def run(self, args: EmptyInput, state: RunState) -> Any:
+            return {"x": 1}
+
+    agent, _, _ = make_agent([tool_response(("bad", {})), text_response("ok")], [Bad()])
+    assert results_of(run_sync(start(agent, "go")))[0].is_error
+
+
+def test_long_output_is_truncated() -> None:
+    class Big(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "big"
+        description: ClassVar[str] = "large text"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+
+        async def run(self, args: EmptyInput, state: RunState) -> str:
+            return "x" * 5000
+
+    agent, _, _ = make_agent([tool_response(("big", {})), text_response("ok")], [Big()], max_result_chars=1000)
+    content = results_of(run_sync(start(agent, "go")))[0].content
+    assert len(content) < 1100 and "truncated" in content
+
+
+def test_after_tool_block_withholds_result() -> None:
+    """Regression H1: previously a block decision in after_tool was ignored."""
+
+    class NoEcho(Hook):
+        async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
+            return Decision.block("contains secret")
+
+    agent, _, _ = make_agent(
+        [tool_response(("echo", {})), text_response("ok")], [Echo()], hooks=HookPipeline([NoEcho()])
+    )
+    result = results_of(run_sync(start(agent, "go")))[0]
+    assert result.is_error and "withheld" in result.content and "echo" not in result.content.split(":")[-1]
+
+
+def test_before_tool_can_require_approval_with_validated_args() -> None:
+    seen: list[BaseModel] = []
+
+    class BigWrites(Hook):
+        async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+            seen.append(invocation.args)
+            return Decision.require_approval("large write operation")
+
+    write = WriteFile()
+    agent, _, _ = make_agent(
+        [tool_response(("write_file", {"path": "a"}))],
+        [write],
+        autonomy=Autonomy.AUTONOMOUS,
+        hooks=HookPipeline([BigWrites()]),
+    )
+    state = run_sync(start(agent, "go"))
+    assert state.status is RunStatus.WAITING_FOR_APPROVAL
+    assert "large write operation" in (state.status_reason or "")
+    assert isinstance(seen[0], PathInput)
+    assert seen[0].path == "a"
+    assert write.written == []
+
+
+def test_policy_is_checked_before_hooks() -> None:
+    calls: list[str] = []
+
+    class Spy(Hook):
+        async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+            calls.append(invocation.tool_name)
+            return Decision()
+
+    agent, _, _ = make_agent(
+        [tool_response(("write_file", {"path": "a"})), text_response("ok")], [WriteFile()], hooks=HookPipeline([Spy()])
+    )
+    run_sync(start(agent, "go"))
+    assert calls == []
+
+
+def test_allowlist_restricts_tools() -> None:
+    agent, provider, _ = make_agent(
+        [tool_response(("echo", {})), text_response("ok")], [Echo(), AskUser()], allowed_tools=frozenset({"ask_user"})
+    )
+    state = run_sync(start(agent, "go"))
+    assert [t.name for t in provider.requests[0].tools] == ["ask_user"]
+    assert results_of(state)[0].is_error
+
+
+def test_allowlist_with_unknown_tool_is_config_error() -> None:
+    with pytest.raises(ConfigError):
+        make_agent([], [Echo()], allowed_tools=frozenset({"ehco"}))
+
+
+class TestToolDefinitions:
+    def test_bad_name_is_rejected_at_registration(self) -> None:
+        class BadName(Echo):
+            name: ClassVar[str] = "has spaces"
+
+        with pytest.raises(ConfigError):
+            ToolRegistry([BadName()])
+
+    def test_missing_description_is_rejected(self) -> None:
+        class NoDescription(Echo):
+            description: ClassVar[str] = " "
+
+        with pytest.raises(ConfigError):
+            ToolRegistry([NoDescription()])
+
+    def test_invalid_timeout_is_rejected(self) -> None:
+        class NoTimeout(Echo):
+            timeout_s: ClassVar[float] = 0
+
+        with pytest.raises(ConfigError):
+            ToolRegistry([NoTimeout()])
+
+    def test_duplicate_name_is_rejected(self) -> None:
+        with pytest.raises(ConfigError):
+            ToolRegistry([Echo(), Echo()])
+
+    def test_bare_base_model_as_input_is_rejected(self) -> None:
+        """`BaseModel` itself cannot validate — it would only fail at runtime as `failed`."""
+
+        class BareInput(Echo):
+            input_model: ClassVar[type[BaseModel]] = BaseModel
+
+        with pytest.raises(ConfigError, match="subclass"):
+            ToolRegistry([BareInput()])
+
+    def test_untyped_field_in_input_model_is_rejected(self) -> None:
+        """Fields with unconstrained `Any`/`object` (including in dicts or tuples) produce a typeless JSON schema."""
+
+        class UntypedInput(BaseModel):
+            payload: Any
+
+        class UntypedDictInput(BaseModel):
+            mapping: dict[str, Any]
+
+        class UntypedTool(Echo):
+            input_model: ClassVar[type[BaseModel]] = UntypedInput
+
+        class UntypedDictTool(Echo):
+            input_model: ClassVar[type[BaseModel]] = UntypedDictInput
+
+        with pytest.raises(ConfigError, match="payload"):
+            ToolRegistry([UntypedTool()])
+        with pytest.raises(ConfigError, match="mapping"):
+            ToolRegistry([UntypedDictTool()])
+
+    def test_non_json_schema_field_in_input_model_is_rejected(self) -> None:
+        """An `input_model` that cannot produce a valid JSON schema fails immediately on registration."""
+        from pydantic import ConfigDict
+
+        class ArbitraryInput(BaseModel):
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+            lock: asyncio.Lock
+
+        class ArbitraryTool(Echo):
+            input_model: ClassVar[type[BaseModel]] = ArbitraryInput
+
+        with pytest.raises(ConfigError, match="JSON schema"):
+            ToolRegistry([ArbitraryTool()])
+
+
+class TestReadFile:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        (tmp_path / "project").mkdir()
+        (tmp_path / "project" / "ok.txt").write_text("hello", encoding="utf-8")
+        (tmp_path / "secret.txt").write_text("secret", encoding="utf-8")
+        return tmp_path / "project"
+
+    def read(self, root: Path, path: str, **kwargs: Any) -> str:
+        output = asyncio.run(ReadFile(root, **kwargs).run(ReadFileInput(path=path), RunState(agent_name="t")))
+        assert isinstance(output, str)
+        return output
+
+    def test_reads_file(self, root: Path) -> None:
+        assert self.read(root, "ok.txt") == "hello"
+
+    @pytest.mark.parametrize("path", ["../secret.txt", "/etc/passwd", "sub/../../secret.txt"])
+    def test_traversal_is_blocked(self, root: Path, path: str) -> None:
+        with pytest.raises(ToolError, match=r"outside|not an existing"):
+            self.read(root, path)
+
+    def test_symlink_escape_is_blocked(self, root: Path) -> None:
+        (root / "link.txt").symlink_to(root.parent / "secret.txt")
+        with pytest.raises(ToolError, match="outside"):
+            self.read(root, "link.txt")
+
+    def test_size_limit(self, root: Path) -> None:
+        with pytest.raises(ToolError, match="exceeds"):
+            self.read(root, "ok.txt", max_bytes=2)
+
+    def test_binary_file(self, root: Path) -> None:
+        (root / "bin.dat").write_bytes(b"\xff\xfe\x00")
+        with pytest.raises(ToolError, match="UTF-8"):
+            self.read(root, "bin.dat")
+
+    def test_missing_root_is_config_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError):
+            ReadFile(tmp_path / "does-not-exist")
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            ".env",
+            ".env.local",
+            "envs/production.env",
+            "secrets/token.txt",
+            "config/server.pem",
+            "deploy.KEY",
+            ".git/config",
+            ".GIT/HEAD",
+            "x/../.env",
+        ],
+    )
+    def test_sensitive_files_are_denied_by_default(self, root: Path, path: str) -> None:
+        """ReadFile is Risk.READ and allowed even at read_only, so it must not leak secrets by default."""
+        target = root / path.replace("x/../", "")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("secret", encoding="utf-8")
+        with pytest.raises(ToolError, match="protected"):
+            self.read(root, path)
+
+    def test_symlink_to_a_denied_file_is_blocked(self, root: Path) -> None:
+        (root / ".env").write_text("secret", encoding="utf-8")
+        (root / "harmless.txt").symlink_to(root / ".env")
+        with pytest.raises(ToolError, match="protected"):
+            self.read(root, "harmless.txt")
+
+    @pytest.mark.parametrize(("link", "real"), [(".env", "envs/production.env"), ("secrets", "vault")])
+    def test_denied_name_that_is_a_symlink_to_an_allowed_name_is_blocked(
+        self, root: Path, link: str, real: str
+    ) -> None:
+        """Common layout: `.env -> envs/production.env`. The requested name must be checked, not only the target."""
+        target = root / real
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if link == "secrets":
+            target.mkdir()
+            (target / "tok").write_text("secret", encoding="utf-8")
+        else:
+            target.write_text("SECRET=1", encoding="utf-8")
+        (root / link).symlink_to(target)
+        requested = ["secrets/tok"] if link == "secrets" else [".env", "./.env", ".ENV"]
+        for path in requested:
+            with pytest.raises(ToolError, match="protected"):
+                self.read(root, path)
+
+    def test_similar_names_are_not_denied(self, root: Path) -> None:
+        (root / "environment.md").write_text("docs", encoding="utf-8")
+        (root / "my_secrets_guide.txt").write_text("guide", encoding="utf-8")
+        assert self.read(root, "environment.md") == "docs"
+        assert self.read(root, "my_secrets_guide.txt") == "guide"
+
+    def test_deny_list_can_be_overridden(self, root: Path) -> None:
+        (root / ".env").write_text("A=1", encoding="utf-8")
+        (root / "data.sqlite").write_text("db", encoding="utf-8")
+        assert self.read(root, ".env", denied=()) == "A=1"
+        with pytest.raises(ToolError, match="protected"):
+            self.read(root, "data.sqlite", denied=(*DEFAULT_DENIED_READS, "*.sqlite"))
+
+    @pytest.mark.parametrize("pattern", ["", "secrets/", "a/b", "  ", " .env", ".env ", None, 3])
+    def test_invalid_deny_pattern_is_config_error(self, root: Path, pattern: Any) -> None:
+        with pytest.raises(ConfigError):
+            ReadFile(root, denied=(pattern,))
+
+    def test_single_string_as_deny_list_is_config_error(self, root: Path) -> None:
+        with pytest.raises(ConfigError):
+            ReadFile(root, denied=".env")
+
+
+def test_hanging_sync_tools_never_starve_the_checkpoint_store(tmp_path: Path) -> None:
+    """Finding 2.5: hanging SyncTools use a dedicated thread pool, not the event loop's default executor.
+
+    Here the default pool is shrunk to a single thread. If SyncTools ran in it, the first hanging
+    call would occupy that thread and checkpoint saving would block forever.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from ai_agent_harness import JsonFileCheckpointStore, RunStatus, SyncTool, start
+
+    release = threading.Event()
+
+    class Hangs(SyncTool[EmptyInput]):
+        name: ClassVar[str] = "hangs"
+        description: ClassVar[str] = "hangs (e.g. socket without timeout)"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+        timeout_s: ClassVar[float] = 0.05
+
+        def run_sync(self, args: EmptyInput, state: RunState) -> str:
+            release.wait(10)
+            return "late"
+
+    agent, _, _ = make_agent(
+        [tool_response(("hangs", {}), ("hangs", {}), ("hangs", {})), text_response("ok")],
+        [Hangs()],
+        checkpoints=JsonFileCheckpointStore(tmp_path),
+    )
+
+    async def main() -> RunStatus:
+        asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=1))
+        state = await asyncio.wait_for(start(agent, "go"), timeout=5)
+        return state.status
+
+    try:
+        assert asyncio.run(main()) is RunStatus.DONE
+    finally:
+        release.set()
+
+
+def test_sync_tool_sees_context_variables_of_the_caller() -> None:
+    """Tracing context (e.g. OpenTelemetry) must propagate into the SyncTool worker thread."""
+    import contextvars
+
+    from ai_agent_harness import SyncTool
+
+    trace: contextvars.ContextVar[str] = contextvars.ContextVar("trace", default="none")
+    seen: list[str] = []
+
+    class Traced(SyncTool[EmptyInput]):
+        name: ClassVar[str] = "traced"
+        description: ClassVar[str] = "reads tracing context"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+
+        def run_sync(self, args: EmptyInput, state: RunState) -> str:
+            seen.append(trace.get())
+            return "ok"
+
+    agent, _, _ = make_agent([tool_response(("traced", {})), text_response("ok")], [Traced()])
+
+    async def main() -> None:
+        trace.set("trace-1")
+        await start(agent, "go")
+
+    asyncio.run(main())
+    assert seen == ["trace-1"]

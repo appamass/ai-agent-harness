@@ -1,0 +1,23 @@
+{
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-haiku-5-5",
+  "content": [
+    {
+      "type": "text",
+      "text": "Paris is the capital of France."
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 25,
+    "output_tokens": 40,
+    "cache_read_input_tokens": 900,
+    "cache_creation_input_tokens": 30,
+    "output_tokens_details": {
+      "thinking_tokens": 25
+    }
+  }
+}

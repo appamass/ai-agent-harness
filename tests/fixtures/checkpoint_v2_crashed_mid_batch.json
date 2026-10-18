@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "run_id": "fixture-v2",
+  "tenant_id": "customer-1",
+  "agent_name": "fixture",
+  "revision": 3,
+  "status": "running",
+  "status_reason": null,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Read and write"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "text": "Read first, then write.",
+          "provider_data": {
+            "signature": "sig-v2"
+          },
+          "provider_id": "provider-a"
+        },
+        {
+          "type": "tool_call",
+          "id": "call_1",
+          "name": "echo",
+          "arguments": {},
+          "arguments_error": null
+        },
+        {
+          "type": "tool_call",
+          "id": "call_2",
+          "name": "crash",
+          "arguments": {},
+          "arguments_error": null
+        }
+      ]
+    }
+  ],
+  "pending": null,
+  "batch_done": [
+    {
+      "type": "tool_result",
+      "call_id": "call_1",
+      "content": "echo",
+      "is_error": false
+    }
+  ],
+  "step": 1,
+  "consecutive_retries": 0,
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 40,
+    "cache_read_tokens": 900,
+    "cache_write_tokens": 30,
+    "reasoning_tokens": 25
+  },
+  "elapsed_s": 0.02,
+  "created_at": "2026-10-16T12:00:00Z",
+  "updated_at": "2026-10-16T12:00:00Z"
+}

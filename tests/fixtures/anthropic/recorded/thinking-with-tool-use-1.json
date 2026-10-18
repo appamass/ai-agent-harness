@@ -1,0 +1,46 @@
+{
+  "model": "claude-haiku-5-5",
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "CAQSngcKEAgSGAI4AUIIdGhpbmtpbmcSDJpvhJmzTQUXkn93NxoMSLcfvBZzmurt897BIjBrvPnCEt1buCop+ko1mQir48RR2BWT/iXsOBGgCQJ0Icy3RygknjZpQgSZKWTgHzkquwbIAAobqMa93rx5gauE0UK7kKU6A+vfUnZCv2WrahBXW/GRILqGyBo19xR/l+z9NBhimdSn0nGmABTVO6lgBbq0K1wOZSI12VpvfcR6ok/N8RjoTnLkRVfSTV3HMKawCdnuCE/F4+DzpNACUJ/i+VWQQQV+NZIhU1hKmN5FUmpqUr2neubWFKkUti1Kz+QF00cP3ZeB9GRdbmTJ3fPg48Y5Qy470eH+B1IvMltxrPMxJvzkglQ9llAb11e5wLTuR+yXXGzgsYW/Hc9F+5eUZhpa6CMdK7HOK7YPPGdgDOTobeRp2UFSn0ULOVAfm2SC2au7jUHVBuSNbvyKsfk1ehag7YHvAFR0Y9AHJ0JAxmgcAdZUrMSBRI1fxSnQNzKrzhNw3qn3bkB9D156QBJtXNheE5J6ZUN8PnFCBsohMsE+ArDvgH1AIACpY/OQeLYQQFWNpR60g0fBOHDo3uWNIPNj79OOi+vaIpl5bhkWq9z5837p47GK73cLwNHFWxzYowjQ9VZUY3Y1VLoYSXsbeUYzo8CW8rhnNLZzGUO/YL9aLmWAhcSoZAwl31MMrcfI+dwADwv5RkqXq9SUJFFsprt8CGxi0K5/x5V/Wi8kMeRemCQ93wM/p6OaHNMXVWgANuj3nd8EXaKgW9F7pK3nezUJPL1Yyniep8j7eGQ4rRa//zwGAmL0o2/cPeT/j5mk9HJZs9N8KhdjOm3FtGdyTR/T6tyZnfPPOWBPWO4LpkfYrcrzc7SKxQbVtGY5mQ8gXvVKFMtS99GmzXAsyzKxMF5dfpye5y1KGwmowNmi/16yJwv88TtkysdVqnymli5R6moXuzaNrrbQAoNL4mpcWvSWR1QiJR28q9zLuJfqkvbrbb86ZS2UKC9xyvcQ50Znwh+Ssm/wV8EJF+gR2L/cdawF2/D4TDBKHFpnwLQPD63Et0U360EircoGwRurRLzgezPqCO8ept3BEzDxgDu/DRNkxO2pDkc9IIOWy3mZGmyKUFHR/Xk2Ym8q8T3NbhS+lmZGrUAMBFqlBNKOafDPnvOfhqtqZmL/KnPDEUmuIYppAJl2UOUKySE/fapdlApP2xSf3H73GCQdLQZWShgB"
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_01EfnF7tBteo7VRu7sP8tmPe",
+      "name": "save_note",
+      "input": {
+        "name": "codename.md",
+        "content": "Project codename: **7391**\n\nSource: `README.md`, which describes the project as \"Zebra\" and states its internal codename is 7391."
+      },
+      "caller": {
+        "type": "direct"
+      }
+    }
+  ],
+  "container": null,
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 83,
+    "cache_read_input_tokens": 1035,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 83,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 199,
+    "output_tokens_details": {
+      "thinking_tokens": 85
+    },
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard"
+  },
+  "diagnostics": null
+}

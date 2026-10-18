@@ -1,0 +1,38 @@
+{
+  "model": "claude-haiku-5-5",
+  "id": "msg_fixture",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "",
+      "signature": "CAQS2AUKEAgSGAI4AUIIdGhpbmtpbmcSDFlbMqLI7mqYN6NcyxoMqtmB2ZXUWgK2zYu9IjDnHBBS3KuIx8Py+pi+GpPQVXUkzoo7IRQhAbF5iZf55kL3XX2vq3ZxyzY+lbDFnXQq9QTAkMKvTGGYP5UTtBF8r/cF7AsHsEQukgO5DwjSqYmeyVQdXW+3AgiXm3/L2Jwyi4X5uGei6j7GKQoNoFflrzszCXgfXHac/2HX1EBQlXa3fft6QoFvaarT8ab5JUHurlgNQEtfRgMhsdjI8U0dQ4SLZiFZ22ln6CWFPW0s/oiFBHkcIiU1cickLkNXXG4WlrXH9ZGj0mfvMFlCalSV5IXCebEKyeaVYffv7ERAa1YL/6+KX16Hfctsyhv8V7czDGS10eX/XWV1aJonkC8DT53sezOSwaOKHUcNoXsmlpe/i+EJyphfzhMKtfkeWAeL0nAoU9mcSXSpIXCvIUbeIOpjznVWsF6FjqjPIyvRYgp07DJ0p33J+eo3YIVl5n86Xx2QNVot5UFmZzqm0v7A/GgoTiBtnBWjYCxrhiNG0X7/9miVthCV6IWGpIFXwvLMGgcC+O+CSBCvexGYi3gy07IsCOoLj8+sfGaGwnFRziK2Usz/6Vh4wQdzC9MAYw5HKdzMs+ZlULuBuzR4BSWEZz95G9lRYan+v3T0LsWJCvu1gQa9l2smrDEpO/rbotjwaO3Myy8MxHrGSL9a8wh1UpY5mt7LYwhVcWKytTeohSkWiS5VvBJZWEG0rdAMoAFahHjXG+I11a8w1vmBxsI2nrqSRYMm0B188nWumT7FCFdf1Y9Jm9lSt3M0dH0pgyH4oDfj1hQu3zALW5132CixzB+X2HmAmB12x+I3uLcZnz/xOshqMcUkbiwo277FF0I1jkv9Cqo8iRMkluFjyxrUwsq+s/J2rhcHLRndqqJp4MgWm4ItyQBB2Mf6OoocsqXlprEOz7mDIRgB"
+    },
+    {
+      "type": "text",
+      "text": "I can't read the `.env` file because it's protected, so I can't tell you the value of `SECRET_TOKEN`. I won't try to get at it another way. If you need that value, you could check the file directly on your machine or ask whoever manages the project's access settings."
+    }
+  ],
+  "container": null,
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "stop_details": null,
+  "usage": {
+    "input_tokens": 2,
+    "cache_creation_input_tokens": 80,
+    "cache_read_input_tokens": 962,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 80,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 128,
+    "output_tokens_details": {
+      "thinking_tokens": 44
+    },
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard"
+  },
+  "diagnostics": null
+}

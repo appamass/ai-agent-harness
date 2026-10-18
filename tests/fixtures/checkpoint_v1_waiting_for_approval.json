@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "run_id": "fixture-v1",
+  "tenant_id": "customer-1",
+  "agent_name": "fixture",
+  "revision": 3,
+  "status": "waiting_for_approval",
+  "status_reason": "Tool: write_file (Risk: write)\nArguments: {\n  \"path\": \"a.py\"\n}\nReason for approval: Policy requires approval",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Read and write a.py"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "text": "Read first, then write.",
+          "provider_data": {
+            "signature": "sig-abc123"
+          }
+        },
+        {
+          "type": "tool_call",
+          "id": "call_1",
+          "name": "echo",
+          "arguments": {}
+        },
+        {
+          "type": "tool_call",
+          "id": "call_2",
+          "name": "write_file",
+          "arguments": {
+            "path": "a.py"
+          }
+        },
+        {
+          "type": "tool_call",
+          "id": "call_3",
+          "name": "echo",
+          "arguments": {}
+        }
+      ]
+    }
+  ],
+  "pending": {
+    "done": [
+      {
+        "type": "tool_result",
+        "call_id": "call_1",
+        "content": "echo",
+        "is_error": false
+      }
+    ],
+    "waiting": {
+      "kind": "approval",
+      "call": {
+        "type": "tool_call",
+        "id": "call_2",
+        "name": "write_file",
+        "arguments": {
+          "path": "a.py"
+        }
+      },
+      "prompt": "Tool: write_file (Risk: write)\nArguments: {\n  \"path\": \"a.py\"\n}\nReason for approval: Policy requires approval"
+    },
+    "remaining": [
+      {
+        "type": "tool_call",
+        "id": "call_3",
+        "name": "echo",
+        "arguments": {}
+      }
+    ]
+  },
+  "step": 1,
+  "consecutive_retries": 0,
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 34
+  },
+  "elapsed_s": 0.01,
+  "created_at": "2026-10-16T10:00:00Z",
+  "updated_at": "2026-10-16T10:00:00Z"
+}
