@@ -5,15 +5,19 @@ a class that inherits from `Hook` and overrides only the required method.
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import posixpath
 import re
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from fnmatch import fnmatchcase
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from .core.errors import ConfigError
 from .core.hooks import CONTINUE, Decision, Hook, ToolInvocation
 from .core.state import RunState
-from .core.types import ModelRequest, Risk
+from .core.types import ModelRequest, ModelResponse, Risk, ToolResult
 
 DEFAULT_PROTECTED: tuple[str, ...] = (
     "tests",
@@ -93,11 +97,23 @@ class ProtectedPaths(Hook):
     Run such tools only inside a sandbox with read-only mounts.
     """
 
-    def __init__(self, patterns: Iterable[str] = DEFAULT_PROTECTED, *, extra_keys: Iterable[str] = ()) -> None:
+    def __init__(
+        self,
+        patterns: Iterable[str] = DEFAULT_PROTECTED,
+        *,
+        extra_keys: Iterable[str] = (),
+        root: str | Path | None = None,
+    ) -> None:
         self._patterns = tuple(p.casefold().strip("/") for p in patterns)
         if not self._patterns:
             raise ValueError("ProtectedPaths requires at least one pattern")
         self._extra_keys = frozenset(k.casefold() for k in extra_keys)
+        self._root: Path | None = None
+        if root is not None:
+            resolved = Path(root).resolve(strict=False)
+            if not resolved.is_dir():
+                raise ConfigError(f"ProtectedPaths: root directory does not exist: {resolved}")
+            self._root = resolved
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
         if invocation.risk is Risk.READ:
@@ -108,16 +124,303 @@ class ProtectedPaths(Hook):
         return CONTINUE
 
     def is_protected(self, raw: str) -> bool:
-        normalized = posixpath.normpath(raw.replace("\\", "/")).casefold()
-        segments = [s for s in normalized.split("/") if s not in ("", ".")]
-        for start in range(len(segments)):
-            candidate = "/".join(segments[start:])
-            if any(fnmatchcase(candidate, pattern) for pattern in self._patterns):
+        if _matches_patterns(raw, self._patterns):
+            return True
+        if self._root is not None:
+            target = (self._root / raw.replace("\\", "/")).resolve(strict=False)
+            if not target.is_relative_to(self._root):
+                return True
+            rel = target.relative_to(self._root).as_posix()
+            if _matches_patterns(rel, self._patterns):
                 return True
         return False
 
 
-def _path_values(data: Any, extra_keys: frozenset[str], key: str | None = None, *, top: bool = True) -> Iterator[str]:
+def _matches_patterns(raw: str, patterns: tuple[str, ...]) -> bool:
+    normalized = posixpath.normpath(raw.replace("\\", "/")).casefold()
+    segments = [s for s in normalized.split("/") if s not in ("", ".")]
+    for start in range(len(segments)):
+        candidate = "/".join(segments[start:])
+        if any(fnmatchcase(candidate, pattern) for pattern in patterns):
+            return True
+    return False
+
+
+DEFAULT_SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
+    (
+        "api_token",
+        r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{20,}|(?<!-)sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}"
+        r"|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
+        r"|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,}|pypi-AgE[A-Za-z0-9_-]{30,}|[sr]k_live_[A-Za-z0-9]{16,})",
+    ),
+    ("aws_access_key", r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
+    ("auth_bearer", r"(?i:\bBearer\s+)[A-Za-z0-9._~+/=-]{20,}"),
+    ("auth_basic", r"(?i:\bAuthorization:\s*Basic\s+)[A-Za-z0-9+/=]{8,}"),
+    ("jwt", r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("url_credentials", r"\b[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^/\s:@]+:[^/\s:@]+@[^\s/]+"),
+)
+
+
+class SecretGuard(Hook):
+    """Prevents credentials and private keys from leaking through tool arguments, tool outputs, or inputs.
+
+    Usable both as a `Hook` inside `HookPipeline` and standalone via `find_secret(text)` and `redact(text)`.
+    Error reasons report only the pattern category name, never the matched secret value. Model responses are
+    checked too (`check_model_output`), so a secret the model repeats does not reach the user or the history.
+    """
+
+    def __init__(
+        self,
+        patterns: Iterable[tuple[str, str]] = DEFAULT_SECRET_PATTERNS,
+        *,
+        check_user_input: bool = False,
+        check_model_output: bool = True,
+    ) -> None:
+        compiled = tuple((name, re.compile(expr)) for name, expr in patterns)
+        if not compiled:
+            raise ValueError("SecretGuard requires at least one pattern")
+        self._patterns = compiled
+        self._check_user_input = check_user_input
+        self._check_model_output = check_model_output
+
+    def find_secret(self, text: str) -> str | None:
+        """Returns the category name of the first detected secret in `text`, or `None`."""
+        for name, pattern in self._patterns:
+            if pattern.search(text) is not None:
+                return name
+        return None
+
+    def redact(self, text: str, *, replacement: str = "[REDACTED]") -> str:
+        """Replaces all detected secrets in `text` with `replacement`."""
+        cleaned = text
+        for _, pattern in self._patterns:
+            cleaned = pattern.sub(replacement, cleaned)
+        return cleaned
+
+    async def on_user_input(self, state: RunState, text: str) -> Decision:
+        if not self._check_user_input:
+            return CONTINUE
+        kind = self.find_secret(text)
+        if kind is not None:
+            return Decision.block(f"User input blocked: contains potential secret ({kind})")
+        return CONTINUE
+
+    async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
+        if not self._check_model_output:
+            return CONTINUE
+        kind = self.find_secret(response.message.text)
+        if kind is not None:
+            return Decision.block(f"Model response blocked: contains potential secret ({kind})")
+        return CONTINUE
+
+    async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+        for value in _all_strings(invocation.args.model_dump()):
+            kind = self.find_secret(value)
+            if kind is not None:
+                return Decision.block(f"Tool arguments blocked: contains potential secret ({kind})")
+        return CONTINUE
+
+    async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
+        kind = self.find_secret(result.content)
+        if kind is not None:
+            return Decision.block(f"Tool output withheld: contains potential secret ({kind})")
+        return CONTINUE
+
+
+_URL_IN_TEXT = re.compile(
+    r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]+[^\s<>()\"'\]]*"
+    r"|\bmailto:[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"
+    r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
+    r"|\bjavascript:[^\s<>()\"'\]]+"
+)
+_TRAILING_PUNCT = ".,;:!?'\")"
+_URL_KEY_WORD = re.compile(r"(?:^|[^a-z])(?:url|uri|href|endpoint|webhook)s?(?:$|[^a-z])")
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_HOST_CHARS = re.compile(r"[a-z0-9.-]+")
+
+
+def _is_url_key(key: str | None, extra: frozenset[str]) -> bool:
+    if key is None:
+        return False
+    folded = key.casefold()
+    return folded in extra or _URL_KEY_WORD.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+
+
+class EgressGuard(Hook):
+    """Prevents data exfiltration and SSRF through URLs in tool arguments and model responses.
+
+    `allowed_domains` is required, so the policy is always a deliberate choice. Pass `()` to block every URL.
+    By default only `https://` URLs pointing to explicitly allowed domains are permitted.
+    Direct IP addresses, `localhost`, `.local`/`.internal` hosts, and URLs with embedded credentials
+    are always rejected. Usable both as a `Hook` and standalone via `check_url(url)` / `check_text(text)`.
+
+    Two checks apply to tool arguments. Free text is scanned for URL-like parts (`scheme://`, `scheme:/`,
+    `scheme:\\`, and `mailto:`, `data:`, `file:`, and similar). A value in a field whose name says it is a
+    URL (`url`, `uri`, `href`, `endpoint`, `webhook`, also as `base_url` or `callbackUrl`; extend with
+    `url_keys`) must be a complete allowed URL, so `evil.example/x` and `//evil.example/x` are blocked there.
+    A bare host or path in a differently named field is not found. Name such fields in `url_keys`.
+    """
+
+    def __init__(
+        self,
+        allowed_domains: Iterable[str],
+        *,
+        allow_http: bool = False,
+        check_model_output: bool = True,
+        url_keys: Iterable[str] = (),
+    ) -> None:
+        if isinstance(allowed_domains, str):
+            raise ConfigError("EgressGuard: allowed_domains must be a list of domains, not a single string")
+        self._domains = tuple(d.strip().casefold().lstrip("*") for d in allowed_domains if d.strip())
+        self._allow_http = allow_http
+        self._check_model_output = check_model_output
+        self._url_keys = frozenset(k.casefold() for k in url_keys)
+
+    def check_url(self, url: str) -> str | None:
+        """Returns `None` if `url` is allowed, or a concise reason string if blocked."""
+        if any(c.isspace() or not c.isprintable() or c == "\\" for c in url):
+            return "URL contains whitespace, control characters, or a backslash"
+        try:
+            parsed = urlsplit(url)
+            _ = parsed.port  # reading the port raises ValueError when it is invalid
+        except ValueError:
+            return "Malformed URL"
+        scheme = parsed.scheme.casefold()
+        allowed_schemes = ("https", "http") if self._allow_http else ("https",)
+        if scheme not in allowed_schemes:
+            return f"URL scheme '{scheme or 'none'}' is not allowed"
+        if parsed.username is not None or parsed.password is not None:
+            return "URL must not contain embedded credentials"
+        host = (parsed.hostname or "").casefold().rstrip(".")
+        if not host:
+            return "URL is missing a hostname"
+        if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+            return "Host is a local or internal address"
+        if _is_ip_literal(host):
+            return "Direct IP addresses are not allowed"
+        if _HOST_CHARS.fullmatch(host) is None:
+            return "Host contains characters that are not allowed"
+        if not _domain_matches(host, self._domains):
+            return "Host is not in the allowed domains list"
+        return None
+
+    def check_text(self, text: str) -> str | None:
+        """Scans `text` for URLs and returns the first violation reason, or `None`."""
+        for match in _URL_IN_TEXT.finditer(text):
+            raw_url = match.group(0).rstrip(_TRAILING_PUNCT)
+            reason = self.check_url(raw_url)
+            if reason is not None:
+                return reason
+        return None
+
+    async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+        for key, value, is_dict_key in _walk_strings(invocation.args.model_dump()):
+            if not value:
+                continue
+            if not is_dict_key and _is_url_key(key, self._url_keys):
+                reason = self.check_url(value)
+            else:
+                reason = self.check_text(value)
+            if reason is not None:
+                return Decision.block(f"Outbound URL blocked: {reason}")
+        return CONTINUE
+
+    async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
+        if not self._check_model_output:
+            return CONTINUE
+        reason = self.check_text(response.message.text)
+        if reason is not None:
+            return Decision.block(f"Model response blocked by egress policy: {reason}")
+        return CONTINUE
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _domain_matches(host: str, allowed: tuple[str, ...]) -> bool:
+    for pattern in allowed:
+        if pattern.startswith("."):
+            suffix = pattern[1:]
+            if host == suffix or host.endswith(pattern):
+                return True
+        elif host == pattern:
+            return True
+    return False
+
+
+DEFAULT_WEAKENING_PATTERNS: tuple[str, ...] = (
+    r"#\s*type:\s*ignore",
+    r"#\s*pyright:\s*ignore",
+    r"#\s*noqa\b",
+    r"#\s*(?:ruff|flake8)\s*:\s*noqa\b",
+    r"#\s*pylint\s*:\s*(?:disable|skip-file)",
+    r"#\s*mypy\s*:\s*ignore-errors",
+    r"#\s*nosec\b",
+    r"#\s*pragma:\s*no\s*cover",
+    r"\bpytest\.mark\.(?:skipif|skip|xfail)\b",
+    r"\bpytest\.(?:skip\s*\(|importorskip\b)",
+    r"\bunittest\.skip(?:If|Unless)?\b",
+    r"//\s*@ts-(?:ignore|nocheck|expect-error)\b",
+    r"\bsys\.exit\s*\(\s*0\s*\)",
+)
+
+
+class WeakeningGuard(Hook):
+    """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
+
+    def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
+        compiled = tuple(re.compile(p, re.IGNORECASE) for p in patterns)
+        if not compiled:
+            raise ValueError("WeakeningGuard requires at least one pattern")
+        self._patterns = compiled
+
+    def check_text(self, text: str) -> str | None:
+        """Returns the first matched check-weakening directive in `text`, or `None`."""
+        for pattern in self._patterns:
+            match = pattern.search(text)
+            if match is not None:
+                return match.group(0).strip()
+        return None
+
+    async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+        if invocation.risk is Risk.READ:
+            return CONTINUE
+        for value in _all_strings(invocation.args.model_dump()):
+            found = self.check_text(value)
+            if found is not None:
+                return Decision.block(f"Write blocked: contains check-weakening directive '{found}'")
+        return CONTINUE
+
+
+def _walk_strings(data: Any, key: str | None = None, *, top: bool = True) -> Iterator[tuple[str | None, str, bool]]:
+    """Yields `(field_key, string_value, is_nested_dict_key)` across arbitrary JSON-like structures."""
+    if isinstance(data, dict):
+        mapping: dict[Any, Any] = data  # pyright: ignore[reportUnknownVariableType] – JSON-like data
+        for k, v in mapping.items():
+            if not top:
+                yield (key, str(k), True)
+            yield from _walk_strings(v, str(k), top=False)
+    elif isinstance(data, list | tuple | set):
+        items: list[Any] | tuple[Any, ...] | set[Any] = data  # pyright: ignore[reportUnknownVariableType]
+        for item in items:
+            yield from _walk_strings(item, key, top=False)
+    elif isinstance(data, str):
+        yield (key, data, False)
+
+
+def _all_strings(data: Any) -> Iterator[str]:
+    for _, value, _ in _walk_strings(data):
+        if value:
+            yield value
+
+
+def _path_values(data: Any, extra_keys: frozenset[str]) -> Iterator[str]:
     """All values that could be a path: always under path-like field names, otherwise any string without whitespace.
 
     Free text (email body, comment) almost always contains whitespace and remains allowed. A single
@@ -126,17 +429,11 @@ def _path_values(data: Any, extra_keys: frozenset[str], key: str | None = None, 
     like paths (`files={"tests/x.py": "..."}`: containing `/`, `\\`, or `.`) — plain names like `tests`
     and top-level tool model field names do not.
     """
-    if isinstance(data, dict):
-        mapping: dict[Any, Any] = data  # pyright: ignore[reportUnknownVariableType] – JSON-like data
-        for k, v in mapping.items():
-            if not top and any(sep in str(k) for sep in ("/", "\\", ".")):
-                yield str(k)  # keys like "tests/x.py" or "conftest.py", not plain names like "tests"
-            yield from _path_values(v, extra_keys, str(k), top=False)
-    elif isinstance(data, list | tuple | set):
-        items: list[Any] | tuple[Any, ...] | set[Any] = data  # pyright: ignore[reportUnknownVariableType]
-        for item in items:
-            yield from _path_values(item, extra_keys, key, top=False)
-    elif isinstance(data, str):
-        named = key is not None and (_PATH_KEY.search(key.casefold()) is not None or key.casefold() in extra_keys)
-        if named or (data and not any(c.isspace() for c in data)):
-            yield data
+    for key, value, is_dict_key in _walk_strings(data):
+        if is_dict_key:
+            if any(sep in value for sep in ("/", "\\", ".")):
+                yield value
+        else:
+            named = key is not None and (_PATH_KEY.search(key.casefold()) is not None or key.casefold() in extra_keys)
+            if named or (value and not any(c.isspace() for c in value)):
+                yield value

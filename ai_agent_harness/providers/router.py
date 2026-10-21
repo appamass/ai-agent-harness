@@ -20,6 +20,7 @@ import logging
 import random
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from ..core.errors import ConfigError, ProviderError
 from ..core.events import Emit, EventType
@@ -29,6 +30,10 @@ from .base import ModelProvider
 log = logging.getLogger("ai_agent_harness.providers")
 
 Sleep = Callable[[float], Awaitable[None]]
+
+
+async def _noop_emit(type_: EventType, data: dict[str, Any]) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -77,8 +82,9 @@ class ModelRouter:
             if (p.capabilities.tools or not request.tools) and (p.capabilities.vision or not request.has_images)
         )
 
-    async def complete(self, request: ModelRequest, emit: Emit) -> tuple[ModelResponse, str]:
+    async def complete(self, request: ModelRequest, emit: Emit | None = None) -> tuple[ModelResponse, str]:
         """Returns `(response, provider_id_that_answered)`."""
+        active_emit = emit or _noop_emit
         candidates = self.candidates(request)
         if not candidates:
             raise ProviderError("No configured model satisfies the requirements of this request", retryable=False)
@@ -86,7 +92,7 @@ class ModelRouter:
         last_error: ProviderError | None = None
         for index, provider in enumerate(candidates):
             if index > 0:
-                await emit(
+                await active_emit(
                     EventType.PROVIDER_FAILOVER,
                     {"to": provider.id, "retryable": bool(last_error and last_error.retryable)},
                 )
@@ -113,7 +119,7 @@ class ModelRouter:
                 if not last_error.retryable or attempt == self._retry.max_attempts:
                     break
                 delay = self._retry.delay(attempt, self._jitter())
-                await emit(
+                await active_emit(
                     EventType.PROVIDER_RETRY,
                     {
                         "provider": provider.id,

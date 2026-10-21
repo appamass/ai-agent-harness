@@ -168,7 +168,74 @@ assert done.status is RunStatus.DONE and Pay.paid == [50, 900]
 ```
 
 See `ai_agent_harness/core/hooks.py` for which decisions are allowed at each hook point (input, before/after model, before/after tool, run end).
-Reusable guardrails that ship with the library: `ProtectedPaths` (keeps agents away from tests and CI config) and `KillSwitch` (emergency stop).
+Reusable guardrails that ship with the library: `ProtectedPaths` (keeps agents away from tests and CI config, including via symlinks when `root=` is set),
+`SecretGuard` (blocks tool arguments and results that contain common API tokens, private keys, and URL credentials; `redact()` is a separate
+helper for your own code), `EgressGuard` (HTTPS plus an outbound domain allowlist for URLs in tool arguments and model text), `WeakeningGuard`
+(blocks `# type: ignore`, `# noqa`, `pytest.mark.skip`, etc. on writes), and `KillSwitch` (emergency stop).
+These guards are fast pattern checks, not complete protection. What they miss is listed in [`known-limitations.md`](known-limitations.md#built-in-guards-are-heuristics).
+
+## Modular bricks (pick and choose)
+
+You do not have to adopt the full agent loop to use this library. Every layer works standalone — you can use only the guardrails, only the tool
+execution gate, or a 5-line script agent:
+
+```python
+# executable
+from ai_agent_harness import (
+    EgressGuard,
+    ProtectedPaths,
+    Risk,
+    SecretGuard,
+    ToolCall,
+    ToolExecutor,
+    ToolRegistry,
+    ToolResult,
+    WeakeningGuard,
+    as_untrusted,
+    tool,
+)
+
+# 1. Guardrails standalone (plain synchronous checks, no RunState or Agent needed)
+secrets = SecretGuard()
+assert secrets.find_secret("token = hf_abcdefghijklmnopqrstuvwxyz1234") == "api_token"
+assert "[REDACTED]" in secrets.redact("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload")
+
+egress = EgressGuard(allowed_domains=["api.example.com", ".trusted.org"])
+assert egress.check_url("https://api.example.com/v1/status") is None
+assert egress.check_url("https://169.254.169.254/latest/meta-data/") is not None
+
+paths = ProtectedPaths()
+assert paths.is_protected("tests/test_auth.py") and not paths.is_protected("src/auth.py")
+assert WeakeningGuard().check_text("x = 1  # type: ignore") is not None
+
+
+# 2. Function tools (@tool, `risk` is always required) + standalone execution gate (ToolExecutor)
+@tool(risk=Risk.READ, untrusted_output=True)
+def fetch_note(topic: str) -> str:
+    """Fetches an external note for a topic."""
+    return f"Note on {topic}"
+
+
+gate = ToolExecutor([fetch_note], hooks=[secrets, egress])
+outcome = asyncio.run(gate.execute(ToolCall(id="c1", name="fetch_note", arguments={"topic": "routing"})))
+assert isinstance(outcome, ToolResult) and not outcome.is_error
+assert outcome.content.startswith('<untrusted source="fetch_note">')
+
+# Pin tool digests (name, description, schema, risk, timeout, untrusted_output) to notice a changed tool at startup
+# or later with `pinned.verify()`
+pinned = ToolRegistry([fetch_note], expected_digests={"fetch_note": fetch_note.digest()})
+assert "fetch_note" in pinned.digests()
+
+
+# 3. Five-line agent with Agent.create() and an async model function
+async def tiny_model(request):
+    return f"Handled: {request.messages[-1].text}"
+
+
+mini = Agent.create(tiny_model, "You are concise.", tools=[fetch_note], hooks=[secrets, egress])
+mini_state = asyncio.run(start(mini, "hello"))
+assert mini_state.status is RunStatus.DONE and mini_state.last_text == "Handled: hello"
+```
 
 ## A model provider
 
