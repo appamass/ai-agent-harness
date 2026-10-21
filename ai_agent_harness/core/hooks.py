@@ -27,10 +27,10 @@ from typing import TYPE_CHECKING, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from .state import RunState
 from .types import Risk, ToolCall, ToolResult
 
 if TYPE_CHECKING:
-    from .state import RunState
     from .types import ModelRequest, ModelResponse
 
 log = logging.getLogger("ai_agent_harness.hooks")
@@ -121,6 +121,7 @@ class HookPipeline:
 
     `block` and `retry` stop evaluation immediately. `require_approval` is
     recorded while remaining hooks continue to run — a later `block` wins.
+    Pass `state=None` when using the pipeline standalone outside a full agent run.
     """
 
     def __init__(self, hooks: Sequence[Hook] = ()) -> None:
@@ -130,25 +131,31 @@ class HookPipeline:
     def hooks(self) -> tuple[Hook, ...]:
         return self._hooks
 
-    async def on_user_input(self, state: RunState, text: str) -> Decision:
-        return await self._decide("on_user_input", lambda h: h.on_user_input(state, text))
+    async def on_user_input(self, state: RunState | None, text: str) -> Decision:
+        active = _ensure_state(state)
+        return await self._decide("on_user_input", lambda h: h.on_user_input(active, text))
 
-    async def before_model(self, state: RunState, request: ModelRequest) -> Decision:
-        return await self._decide("before_model", lambda h: h.before_model(state, request))
+    async def before_model(self, state: RunState | None, request: ModelRequest) -> Decision:
+        active = _ensure_state(state)
+        return await self._decide("before_model", lambda h: h.before_model(active, request))
 
-    async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
-        return await self._decide("after_model", lambda h: h.after_model(state, response))
+    async def after_model(self, state: RunState | None, response: ModelResponse) -> Decision:
+        active = _ensure_state(state)
+        return await self._decide("after_model", lambda h: h.after_model(active, response))
 
-    async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        return await self._decide("before_tool", lambda h: h.before_tool(state, invocation))
+    async def before_tool(self, state: RunState | None, invocation: ToolInvocation) -> Decision:
+        active = _ensure_state(state)
+        return await self._decide("before_tool", lambda h: h.before_tool(active, invocation))
 
-    async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
-        return await self._decide("after_tool", lambda h: h.after_tool(state, invocation, result))
+    async def after_tool(self, state: RunState | None, invocation: ToolInvocation, result: ToolResult) -> Decision:
+        active = _ensure_state(state)
+        return await self._decide("after_tool", lambda h: h.after_tool(active, invocation, result))
 
-    async def on_run_end(self, state: RunState) -> None:
+    async def on_run_end(self, state: RunState | None = None) -> None:
+        active = _ensure_state(state)
         for hook in self._hooks:
             try:
-                await hook.on_run_end(state)
+                await hook.on_run_end(active)
             except Exception:
                 log.exception("Hook %s failed in on_run_end", hook.name)
 
@@ -170,3 +177,9 @@ class HookPipeline:
             if decision.action is Action.REQUIRE_APPROVAL and approval is None:
                 approval = decision
         return approval or CONTINUE
+
+
+def _ensure_state(state: RunState | None) -> RunState:
+    if state is not None:
+        return state
+    return RunState(agent_name="standalone")

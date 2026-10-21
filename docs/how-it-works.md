@@ -14,20 +14,20 @@ ai_agent_harness/
 │   ├── events.py         EventBus, Event, EventType (metadata only)
 │   └── errors.py         Error hierarchy
 ├── providers/
-│   ├── base.py           ModelProvider protocol, Capabilities, adapter contract, without_foreign_thinking
+│   ├── base.py           ModelProvider protocol, Capabilities, CallableProvider, without_foreign_thinking
 │   ├── router.py         RetryPolicy, exponential backoff with jitter, timeout, failover, capability filter
 │   └── anthropic.py      AnthropicProvider (optional extra `anthropic`; the core never imports it)
 ├── tools/
-│   ├── base.py           BaseTool, SyncTool (isolated thread pool), InputRequest
-│   ├── registry.py       ToolRegistry with startup schema and definition validation
-│   ├── executor.py       ToolExecutor: the single tool execution gate
+│   ├── base.py           BaseTool, SyncTool (isolated thread pool), @tool decorator, InputRequest
+│   ├── registry.py       ToolRegistry with startup schema validation and optional digest pinning
+│   ├── executor.py       ToolExecutor: the single tool execution gate (also usable standalone)
 │   └── builtin.py        AskUser, ReadFile (reference tools)
 ├── runtime/
-│   ├── agent.py          Agent: validated composition of the building blocks
+│   ├── agent.py          Agent and Agent.create(): validated composition of the building blocks
 │   └── runner.py         start / resume: the agent loop
-├── context.py            ContextBuilder, ContextSource
+├── context.py            ContextBuilder, ContextSource, as_untrusted
 ├── policy.py             Autonomy levels, allowlist, Limits
-├── guardrails.py         ProtectedPaths (anti-reward-hacking), KillSwitch
+├── guardrails.py         ProtectedPaths, SecretGuard, EgressGuard, WeakeningGuard, KillSwitch
 ├── persistence.py        CheckpointStore, InMemoryCheckpointStore, JsonFileCheckpointStore (atomic + locked)
 ├── persistence_postgres.py  PostgresCheckpointStore (optional extra `postgres`; the core never imports it)
 ├── observability.py      log_listener

@@ -25,22 +25,22 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import re
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar, get_type_hints, overload
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, create_model
 
 from ..core.errors import ConfigError
+from ..core.state import RunState
 from ..core.types import ID_PATTERN, Risk, ToolSpec
-
-if TYPE_CHECKING:
-    from ..core.state import RunState
 
 InputT = TypeVar("InputT", bound=BaseModel)
 _NAME = re.compile(ID_PATTERN)
@@ -87,6 +87,7 @@ class BaseTool(ABC, Generic[InputT]):
     input_model: ClassVar[type[BaseModel]]
     risk: ClassVar[Risk]
     timeout_s: ClassVar[float] = 30.0
+    untrusted_output: ClassVar[bool] = False
 
     @abstractmethod
     async def run(self, args: InputT, state: RunState) -> ToolOutput: ...
@@ -94,6 +95,28 @@ class BaseTool(ABC, Generic[InputT]):
     @classmethod
     def spec(cls) -> ToolSpec:
         return ToolSpec(name=cls.name, description=cls.description, input_schema=cls.input_model.model_json_schema())
+
+    @classmethod
+    def digest(cls) -> str:
+        """SHA-256 fingerprint (64 hex chars) of everything that decides what the tool is and may do.
+
+        Covers name, description, input schema, risk, timeout, and `untrusted_output`. Pin it with
+        `ToolRegistry(expected_digests=...)` to notice a changed tool.
+        """
+        canonical = json.dumps(
+            {
+                "name": cls.name,
+                "description": cls.description,
+                "input_schema": cls.input_model.model_json_schema(),
+                "risk": cls.risk.value,
+                "timeout_s": float(cls.timeout_s),
+                "untrusted_output": cls.untrusted_output,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @classmethod
     def validate_definition(cls) -> None:
@@ -133,6 +156,8 @@ class BaseTool(ABC, Generic[InputT]):
         timeout = cls.timeout_s
         if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
             raise ConfigError(f"{where}: 'timeout_s' must be > 0")
+        if not isinstance(cls.untrusted_output, bool):
+            raise ConfigError(f"{where}: 'untrusted_output' must be a bool")
 
 
 SYNC_TOOL_THREADS = 16
@@ -169,3 +194,146 @@ class SyncTool(BaseTool[InputT]):
             return context.run(self.run_sync, args, state)
 
         return await loop.run_in_executor(_sync_executor(), call)
+
+
+ToolFn = Callable[..., Any]
+
+
+@overload
+def tool(
+    fn: ToolFn,
+    /,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    risk: Risk,
+    timeout_s: float = 30.0,
+    untrusted_output: bool = False,
+) -> BaseTool[Any]: ...
+
+
+@overload
+def tool(
+    fn: None = None,
+    /,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    risk: Risk,
+    timeout_s: float = 30.0,
+    untrusted_output: bool = False,
+) -> Callable[[ToolFn], BaseTool[Any]]: ...
+
+
+def tool(
+    fn: ToolFn | None = None,
+    /,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    risk: Risk,
+    timeout_s: float = 30.0,
+    untrusted_output: bool = False,
+) -> BaseTool[Any] | Callable[[ToolFn], BaseTool[Any]]:
+    """Turns a typed Python function (sync or async) into a validated `BaseTool` or `SyncTool`.
+
+    Parameters are derived from the function's type annotations into a strict Pydantic model
+    (`extra="forbid"`). If the function declares a `state: RunState` parameter, the active
+    `RunState` is passed automatically and hidden from the model's JSON schema.
+    """
+
+    def decorate(target: ToolFn) -> BaseTool[Any]:
+        return _build_function_tool(
+            target,
+            name=name,
+            description=description,
+            risk=risk,
+            timeout_s=timeout_s,
+            untrusted_output=untrusted_output,
+        )
+
+    return decorate(fn) if fn is not None else decorate
+
+
+def _build_function_tool(
+    fn: ToolFn,
+    *,
+    name: str | None,
+    description: str | None,
+    risk: Risk,
+    timeout_s: float,
+    untrusted_output: bool,
+) -> BaseTool[Any]:
+    if not callable(fn):
+        raise ConfigError("@tool requires a callable function")
+    tool_name = name if name is not None else getattr(fn, "__name__", "")
+    tool_desc = (description if description is not None else inspect.getdoc(fn)) or ""
+    tool_risk = risk
+    tool_timeout = timeout_s
+    tool_untrusted = untrusted_output
+
+    try:
+        hints = get_type_hints(fn, localns={"RunState": RunState})
+    except Exception as exc:
+        raise ConfigError(f"Tool function '{tool_name}': failed to resolve type annotations: {exc}") from exc
+
+    sig = inspect.signature(fn)
+    fields: dict[str, Any] = {}
+    field_names: list[str] = []
+    passes_state = False
+    for param_name, param in sig.parameters.items():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            raise ConfigError(f"Tool function '{tool_name}': *args and **kwargs are not allowed")
+        if param_name == "state" and hints.get("state", RunState) is RunState:
+            passes_state = True
+            continue
+        if param_name not in hints:
+            raise ConfigError(f"Tool function '{tool_name}': parameter '{param_name}' is missing a type annotation")
+        default = ... if param.default is inspect.Parameter.empty else param.default
+        fields[param_name] = (hints[param_name], default)
+        field_names.append(param_name)
+
+    model_cls: type[BaseModel] = create_model(
+        f"{tool_name}_Input",
+        __config__=ConfigDict(extra="forbid"),
+        **fields,
+    )
+    names_tuple = tuple(field_names)
+
+    if inspect.iscoroutinefunction(fn):
+
+        class _AsyncFunctionTool(BaseTool[BaseModel]):
+            name: ClassVar[str] = tool_name
+            description: ClassVar[str] = tool_desc
+            input_model: ClassVar[type[BaseModel]] = model_cls
+            risk: ClassVar[Risk] = tool_risk
+            timeout_s: ClassVar[float] = tool_timeout
+            untrusted_output: ClassVar[bool] = tool_untrusted
+
+            async def run(self, args: BaseModel, state: RunState) -> ToolOutput:
+                kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}
+                if passes_state:
+                    kwargs["state"] = state
+                result: ToolOutput = await fn(**kwargs)
+                return result
+
+        _AsyncFunctionTool.validate_definition()
+        return _AsyncFunctionTool()
+
+    class _SyncFunctionTool(SyncTool[BaseModel]):
+        name: ClassVar[str] = tool_name
+        description: ClassVar[str] = tool_desc
+        input_model: ClassVar[type[BaseModel]] = model_cls
+        risk: ClassVar[Risk] = tool_risk
+        timeout_s: ClassVar[float] = tool_timeout
+        untrusted_output: ClassVar[bool] = tool_untrusted
+
+        def run_sync(self, args: BaseModel, state: RunState) -> ToolOutput:
+            kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}
+            if passes_state:
+                kwargs["state"] = state
+            result: ToolOutput = fn(**kwargs)
+            return result
+
+    _SyncFunctionTool.validate_definition()
+    return _SyncFunctionTool()

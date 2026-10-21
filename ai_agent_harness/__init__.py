@@ -3,7 +3,7 @@
 Public API — everything a project typically needs. See README.md.
 """
 
-from .context import ContextBuilder, ContextSource
+from .context import ContextBuilder, ContextSource, as_untrusted
 from .core import (
     Decision,
     Event,
@@ -18,30 +18,63 @@ from .core import (
     RunState,
     RunStatus,
     StopReason,
+    TextBlock,
     ToolCall,
     ToolError,
     ToolInvocation,
     ToolResult,
+    ToolSpec,
     restore_state,
 )
-from .guardrails import KillSwitch, ProtectedPaths
+from .guardrails import (
+    DEFAULT_PROTECTED,
+    DEFAULT_SECRET_PATTERNS,
+    DEFAULT_WEAKENING_PATTERNS,
+    EgressGuard,
+    KillSwitch,
+    ProtectedPaths,
+    SecretGuard,
+    WeakeningGuard,
+)
 from .persistence import CheckpointStore, InMemoryCheckpointStore, JsonFileCheckpointStore
-from .policy import Autonomy, Limits
-from .providers import Capabilities, ModelProvider, ModelRouter, RetryPolicy, without_foreign_thinking
+from .policy import Autonomy, Limits, PermissionPolicy, Verdict
+from .providers import (
+    CallableProvider,
+    Capabilities,
+    ModelProvider,
+    ModelRouter,
+    RetryPolicy,
+    without_foreign_thinking,
+)
 from .runtime import Agent, resume, start
-from .tools import DEFAULT_DENIED_READS, AskUser, BaseTool, InputRequest, ReadFile, SyncTool, ToolRegistry
+from .tools import (
+    DEFAULT_DENIED_READS,
+    AskUser,
+    BaseTool,
+    InputRequest,
+    ReadFile,
+    SyncTool,
+    ToolExecutor,
+    ToolRegistry,
+    tool,
+)
 
 __all__ = [
     "DEFAULT_DENIED_READS",
+    "DEFAULT_PROTECTED",
+    "DEFAULT_SECRET_PATTERNS",
+    "DEFAULT_WEAKENING_PATTERNS",
     "Agent",
     "AskUser",
     "Autonomy",
     "BaseTool",
+    "CallableProvider",
     "Capabilities",
     "CheckpointStore",
     "ContextBuilder",
     "ContextSource",
     "Decision",
+    "EgressGuard",
     "Event",
     "EventBus",
     "EventType",
@@ -57,21 +90,30 @@ __all__ = [
     "ModelRequest",
     "ModelResponse",
     "ModelRouter",
+    "PermissionPolicy",
     "ProtectedPaths",
     "ReadFile",
     "RetryPolicy",
     "Risk",
     "RunState",
     "RunStatus",
+    "SecretGuard",
     "StopReason",
     "SyncTool",
+    "TextBlock",
     "ToolCall",
     "ToolError",
+    "ToolExecutor",
     "ToolInvocation",
     "ToolRegistry",
     "ToolResult",
+    "ToolSpec",
+    "Verdict",
+    "WeakeningGuard",
+    "as_untrusted",
     "restore_state",
     "resume",
     "start",
+    "tool",
     "without_foreign_thinking",
 ]

@@ -31,12 +31,13 @@ Adapter contract — violations are bugs in the adapter, not in the harness:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-from ..core.types import Block, Message, ModelRequest, ModelResponse, TextBlock, ThinkingBlock
+from ..core.errors import ConfigError
+from ..core.types import Block, Message, ModelRequest, ModelResponse, StopReason, TextBlock, ThinkingBlock
 
 
 class Capabilities(BaseModel):
@@ -57,6 +58,51 @@ class ModelProvider(Protocol):
     def capabilities(self) -> Capabilities: ...
 
     async def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
+ModelFn = Callable[[ModelRequest], Awaitable[ModelResponse | str]]
+
+
+class CallableProvider:
+    """Wraps an async function `(ModelRequest) -> ModelResponse | str` as a `ModelProvider`.
+
+    Useful for small scripts, custom HTTP clients, or connecting external SDKs without writing
+    a full adapter class. If the function returns a plain `str`, it is wrapped into a
+    `ModelResponse` with `StopReason.END`.
+    """
+
+    def __init__(
+        self,
+        fn: ModelFn,
+        *,
+        id: str = "callable",
+        tools: bool = True,
+        vision: bool = False,
+    ) -> None:
+        if not callable(fn):
+            raise ConfigError("CallableProvider requires a callable")
+        if not id.strip():
+            raise ConfigError("CallableProvider: id must not be empty")
+        self._fn = fn
+        self._id = id
+        self._capabilities = Capabilities(tools=tools, vision=vision)
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return self._capabilities
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        result = await self._fn(request)
+        if isinstance(result, str):
+            return ModelResponse(
+                message=Message(role="assistant", content=(TextBlock(text=result),)),
+                stop_reason=StopReason.END,
+            )
+        return result
 
 
 FOREIGN_THINKING_NOTE = "(Reasoning from another model omitted)"

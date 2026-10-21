@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
+from ..context import as_untrusted
 from ..core.errors import ToolError
 from ..core.events import Emit, EventType
-from ..core.hooks import Action, HookPipeline, ToolInvocation
+from ..core.hooks import Action, Hook, HookPipeline, ToolInvocation
 from ..core.state import PendingCall, RunState
 from ..core.types import ToolCall, ToolResult
 from ..policy import PermissionPolicy, Verdict
@@ -38,33 +40,39 @@ ToolOutcome = ToolResult | PendingCall
 """Outcome of the execution gate: either a finished `ToolResult` (already in `state.batch_done`) or a `PendingCall`."""
 
 
+async def _noop_emit(type_: EventType, data: dict[str, Any]) -> None:
+    return None
+
+
 class ToolExecutor:
     def __init__(
         self,
-        registry: ToolRegistry,
-        policy: PermissionPolicy,
-        hooks: HookPipeline,
-        emit: Emit,
+        registry: ToolRegistry | Iterable[BaseTool[Any]],
+        policy: PermissionPolicy | None = None,
+        hooks: HookPipeline | Sequence[Hook] = (),
+        emit: Emit | None = None,
         *,
         max_result_chars: int = 20_000,
     ) -> None:
-        self._registry = registry
-        self._policy = policy
-        self._hooks = hooks
-        self._emit = emit
+        self._registry = registry if isinstance(registry, ToolRegistry) else ToolRegistry(registry)
+        self._policy = policy if policy is not None else PermissionPolicy()
+        self._hooks = hooks if isinstance(hooks, HookPipeline) else HookPipeline(hooks)
+        self._emit = emit or _noop_emit
         self._max_result_chars = max_result_chars
 
     def visible_tools(self) -> list[BaseTool[Any]]:
         """Tools offered to the model: everything not denied by the policy."""
         return [t for t in self._registry if self._policy.check(t.name, t.risk) is not Verdict.DENY]
 
-    async def execute(self, call: ToolCall, state: RunState, *, approved: bool = False) -> ToolOutcome:
+    async def execute(self, call: ToolCall, state: RunState | None = None, *, approved: bool = False) -> ToolOutcome:
+        active_state = state if state is not None else RunState(agent_name="standalone")
+
         def error(message: str) -> ToolResult:
             return ToolResult(call_id=call.id, content=message, is_error=True)
 
         def fail(message: str) -> ToolResult:
             result = error(message)
-            state.batch_done = (*state.batch_done, result)
+            active_state.batch_done = (*active_state.batch_done, result)
             return result
 
         # 1. Look up tool
@@ -93,7 +101,7 @@ class ToolExecutor:
 
         # 4. Pre-execution hooks
         invocation = ToolInvocation(call=call, tool_name=tool.name, risk=tool.risk, args=args)
-        decision = await self._hooks.before_tool(state, invocation)
+        decision = await self._hooks.before_tool(active_state, invocation)
         if decision.action is Action.BLOCK:
             blocked = fail(f"Call to '{tool.name}' blocked: {decision.reason}")
             await self._emit(EventType.TOOL_BLOCKED, {"tool": tool.name, "source": "before_tool"})
@@ -117,7 +125,7 @@ class ToolExecutor:
         await self._emit(EventType.TOOL_STARTED, {"tool": tool.name})
         try:
             # Tools are external code: verify return type at runtime, not just via type annotations
-            output: object = await asyncio.wait_for(tool.run(args, state), timeout=tool.timeout_s)
+            output: object = await asyncio.wait_for(tool.run(args, active_state), timeout=tool.timeout_s)
         except asyncio.CancelledError:
             fail(
                 f"Execution of '{tool.name}' was cancelled. Whether the tool already executed "
@@ -126,14 +134,16 @@ class ToolExecutor:
             raise
         except TimeoutError:
             limit = f"{tool.timeout_s:g}"
-            return await self._complete(state, invocation, error(f"'{tool.name}' exceeded the timeout of {limit} s."))
+            return await self._complete(
+                active_state, invocation, error(f"'{tool.name}' exceeded the timeout of {limit} s.")
+            )
         except ToolError as exc:
-            return await self._complete(state, invocation, error(f"'{tool.name}': {exc}"))
+            return await self._complete(active_state, invocation, error(f"'{tool.name}': {exc}"))
         except Exception as exc:
             log.exception("Tool %s failed (call_id=%s)", tool.name, call.id)
             kind = type(exc).__name__
             return await self._complete(
-                state, invocation, error(f"'{tool.name}' failed with an internal error ({kind}).")
+                active_state, invocation, error(f"'{tool.name}' failed with an internal error ({kind}).")
             )
 
         # 7. Process output
@@ -142,8 +152,11 @@ class ToolExecutor:
             return PendingCall(kind="input", call=call, prompt=output.question)
         if not isinstance(output, str):
             log.error("Tool %s returned %s instead of str", tool.name, type(output).__name__)
-            return await self._complete(state, invocation, error(f"'{tool.name}' returned an invalid result."))
-        return await self._complete(state, invocation, ToolResult(call_id=call.id, content=self._truncate(output)))
+            return await self._complete(active_state, invocation, error(f"'{tool.name}' returned an invalid result."))
+        content = self._truncate(output)
+        if tool.untrusted_output:
+            content = as_untrusted(tool.name, content)
+        return await self._complete(active_state, invocation, ToolResult(call_id=call.id, content=content))
 
     async def _complete(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> ToolResult:
         # 8. Post-execution hooks

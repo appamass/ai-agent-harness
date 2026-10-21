@@ -45,18 +45,18 @@
 - `ai_agent_harness/core/hooks.py`: `Hook`, `HookPipeline`, `Decision`, `Action`, `ToolInvocation`.
 - `ai_agent_harness/core/events.py`: `Event`, `EventType`, `EventBus` (enforces scalar/metadata-only payloads).
 - `ai_agent_harness/core/errors.py`: `HarnessError`, `ConfigError`, `ProtocolError`, `InvalidStateError`, `SchemaVersionError`, `ConcurrencyError`, `ProviderError`, `ToolError`.
-- `ai_agent_harness/providers/base.py`: `ModelProvider` protocol, `Capabilities`, adapter contract, `without_foreign_thinking`.
+- `ai_agent_harness/providers/base.py`: `ModelProvider` protocol, `Capabilities`, `CallableProvider`, adapter contract, `without_foreign_thinking`.
 - `ai_agent_harness/providers/anthropic.py`: `AnthropicProvider` for the Anthropic Messages API (optional extra `ai-agent-harness[anthropic]`).
 - `ai_agent_harness/providers/router.py`: `ModelRouter`, `RetryPolicy` (exponential backoff, jitter, timeout, capability filtering, provider failover).
-- `ai_agent_harness/tools/base.py`: `BaseTool`, `SyncTool` (isolated thread pool), `InputRequest`, strict JSON-schema validation.
-- `ai_agent_harness/tools/registry.py`: `ToolRegistry` (validates tool definitions at registration time).
-- `ai_agent_harness/tools/executor.py`: `ToolExecutor` (the 8-step tool execution gate).
+- `ai_agent_harness/tools/base.py`: `BaseTool`, `SyncTool` (isolated thread pool), `@tool` function decorator, `InputRequest`, strict JSON-schema validation.
+- `ai_agent_harness/tools/registry.py`: `ToolRegistry` (validates tool definitions and optional `expected_digests` at registration time).
+- `ai_agent_harness/tools/executor.py`: `ToolExecutor` (the 8-step tool execution gate, usable standalone or in the runner).
 - `ai_agent_harness/tools/builtin.py`: `AskUser` and `ReadFile` (path-traversal-safe reference tools).
-- `ai_agent_harness/runtime/agent.py`: `Agent` configuration dataclass.
+- `ai_agent_harness/runtime/agent.py`: `Agent` configuration dataclass and `Agent.create()` shorthand.
 - `ai_agent_harness/runtime/runner.py`: `start()` and `resume()` — the deterministic agent loop.
-- `ai_agent_harness/context.py`: `ContextBuilder` and `ContextSource` protocol.
+- `ai_agent_harness/context.py`: `ContextBuilder`, `ContextSource` protocol, and `as_untrusted()`.
 - `ai_agent_harness/policy.py`: `Autonomy`, `Verdict`, `PermissionPolicy`, `Limits`.
-- `ai_agent_harness/guardrails.py`: `ProtectedPaths` (anti-reward-hacking) and `KillSwitch` (emergency stop).
+- `ai_agent_harness/guardrails.py`: `ProtectedPaths` (anti-reward-hacking + symlink check), `SecretGuard`, `EgressGuard`, `WeakeningGuard`, and `KillSwitch` (emergency stop).
 - `ai_agent_harness/persistence_postgres.py`: `PostgresCheckpointStore` (optional extra `ai-agent-harness[postgres]`): same optimistic locking on PostgreSQL for several workers, `list_runs`, `delete_run`, `delete_tenant`, `schema_sql`.
 - `ai_agent_harness/persistence.py`: `CheckpointStore`, `InMemoryCheckpointStore`, `JsonFileCheckpointStore` (atomic POSIX file locking).
 - `ai_agent_harness/observability.py`: `log_listener` for structured metadata logging.
@@ -97,3 +97,4 @@ All `# executable` Python blocks in these documents run in CI via `tests/test_do
 - [0016-import-name-ai-agent-harness.md](docs/adr/0016-import-name-ai-agent-harness.md)
 - [0017-anthropic-provider-adapter.md](docs/adr/0017-anthropic-provider-adapter.md)
 - [0018-postgres-checkpoint-store.md](docs/adr/0018-postgres-checkpoint-store.md)
+- [0019-modular-bricks-and-security-guards.md](docs/adr/0019-modular-bricks-and-security-guards.md)

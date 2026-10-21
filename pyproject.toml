@@ -1,6 +1,6 @@
 [project]
 name = "ai-agent-harness"
-version = "0.6.0"
+version = "0.7.0"
 description = "Model-agnostic Python harness for AI agents: human approval, guardrails, crash-safe runs"
 readme = "README.md"
 license = "MIT"

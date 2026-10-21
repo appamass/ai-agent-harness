@@ -24,3 +24,4 @@ documented here with context, rejected alternatives, and consequences. Create ne
 | [0016](0016-import-name-ai-agent-harness.md) | Import name `ai_agent_harness` instead of `harness` | Accepted |
 | [0017](0017-anthropic-provider-adapter.md) | Anthropic provider adapter as an optional extra | Accepted |
 | [0018](0018-postgres-checkpoint-store.md) | PostgreSQL checkpoint store as an optional extra | Accepted |
+| [0019](0019-modular-bricks-and-security-guards.md) | Standalone modular bricks, ergonomic shorthands, and built-in security guards | Accepted |

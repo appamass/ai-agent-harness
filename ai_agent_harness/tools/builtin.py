@@ -40,7 +40,26 @@ class AskUser(BaseTool[AskUserInput]):
         return InputRequest(question=args.question)
 
 
-DEFAULT_DENIED_READS: tuple[str, ...] = (".env", ".env.*", "*.env", "secrets", ".git", "*.pem", "*.key")
+DEFAULT_DENIED_READS: tuple[str, ...] = (
+    ".env",
+    ".env.*",
+    "*.env",
+    ".envrc",
+    "secrets",
+    ".git",
+    ".ssh",
+    ".aws",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa",
+    "id_ed25519",
+    "credentials.json",
+)
 """Name patterns that `ReadFile` refuses by default. A pattern matches any single part of the path
 (directory or file name, case-insensitive), so `secrets` also blocks `secrets/token.txt`."""
 
