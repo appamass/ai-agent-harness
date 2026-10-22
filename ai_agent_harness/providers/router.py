@@ -122,15 +122,14 @@ class ModelRouter:
             async with asyncio.timeout(self._retry.request_timeout_s) as deadline:
                 async for chunk in cast(AsyncIterator[object], stream_fn(request)):
                     if isinstance(chunk, StreamDelta):
-                        if on_delta is not None and (chunk.text or chunk.thinking):
+                        if on_delta is not None and chunk.text:
                             # A slow consumer is not a slow provider: the provider's clock stops while it holds us up
                             when = deadline.when()
                             left = None if when is None else when - loop.time()
                             deadline.reschedule(None)
                             await on_delta(chunk)
                             deadline.reschedule(None if left is None else loop.time() + left)
-                            if chunk.text:  # reasoning deltas are not shown, so they do not commit us to this answer
-                                delivered += 1
+                            delivered += 1
                     elif isinstance(chunk, ModelResponse):
                         final = chunk
             if final is None:

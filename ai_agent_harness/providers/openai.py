@@ -164,8 +164,7 @@ class OpenAIProvider:
                     continue
                 reasoning = getattr(delta, "reasoning_content", None)
                 if isinstance(reasoning, str) and reasoning:
-                    reasoning_parts.append(reasoning)
-                    yield StreamDelta(thinking=reasoning)
+                    reasoning_parts.append(reasoning)  # kept for the final ThinkingBlock, not shown as a delta
                 content = getattr(delta, "content", None)
                 if content:
                     text_parts.append(str(content))

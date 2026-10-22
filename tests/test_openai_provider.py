@@ -477,8 +477,7 @@ def test_streaming_keeps_reasoning_like_the_non_streaming_path() -> None:
     deltas = [i for i in items if isinstance(i, StreamDelta)]
     final = items[-1]
     assert isinstance(final, ModelResponse)
-    assert [d.thinking for d in deltas if d.thinking] == ["step 1, ", "step 2"]
-    assert "".join(d.text for d in deltas) == "The answer is 42."
+    assert [d.text for d in deltas] == ["The answer", " is 42."]  # reasoning is not streamed as deltas
     thinking = [b for b in final.message.content if isinstance(b, ThinkingBlock)]
     assert [b.text for b in thinking] == ["step 1, step 2"]
     assert final.message.text == "The answer is 42."

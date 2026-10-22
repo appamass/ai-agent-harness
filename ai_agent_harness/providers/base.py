@@ -96,10 +96,12 @@ def assistant_message(blocks: Sequence[Block]) -> Message:
 
 @dataclass(frozen=True)
 class StreamDelta:
-    """Incremental chunk produced by a streaming model provider."""
+    """Incremental answer text produced by a streaming model provider.
+
+    Reasoning is not streamed: it only arrives as a `ThinkingBlock` in the final `ModelResponse`.
+    """
 
     text: str = ""
-    thinking: str = ""
 
 
 class Capabilities(BaseModel):

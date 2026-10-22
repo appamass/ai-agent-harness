@@ -802,3 +802,16 @@ def test_mcp_timeouts_must_be_finite_positive_numbers(value: float) -> None:
         MCPServerConfig(server_name="mock", transport=transport, tool_risks={}, timeout_s=value)
     with pytest.raises(ConfigError, match="connect_timeout_s"):
         MCPServerConfig(server_name="mock", transport=transport, tool_risks={}, connect_timeout_s=value)
+
+
+def test_a_registry_pin_covers_the_schema_the_server_announced() -> None:
+    """MCP tools show the model the server's schema, so `digest()` must change when that schema changes."""
+
+    def digest_for(schema: dict[str, Any]) -> str:
+        server = MockMCPServer("mock")
+        server.register_tool("lookup", "Looks something up", schema, lambda args: "ok")
+        return _load(server, {"lookup": Risk.READ})[0].digest()
+
+    loose = {"type": "object", "properties": {"q": {"type": "string"}}}
+    bounded = {"type": "object", "properties": {"q": {"type": "string", "maxLength": 5}}}
+    assert digest_for(loose) != digest_for(bounded)

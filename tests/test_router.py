@@ -18,7 +18,7 @@ from ai_agent_harness import (
     StreamDelta,
 )
 from ai_agent_harness.core import ConfigError, ImageBlock, Message, ProviderError, ToolSpec
-from ai_agent_harness.testing import FakeProvider, text_response
+from ai_agent_harness.testing import FakeProvider, Streamed, text_response
 
 from .conftest import no_sleep, run_sync
 
@@ -187,7 +187,7 @@ def test_router_stream_failover_before_deltas() -> None:
 
 
 def test_stream_does_not_fail_over_after_deltas_were_delivered() -> None:
-    primary = FakeProvider([[StreamDelta(text="partial "), ProviderError("reset", retryable=True)]], id="p")
+    primary = FakeProvider([Streamed(StreamDelta(text="partial "), ProviderError("reset", retryable=True))], id="p")
     backup = FakeProvider([text_response("other")], id="b")
     router = ModelRouter(primary, [backup], RetryPolicy(max_attempts=2, base_delay_s=0, max_delay_s=0), sleep=no_sleep)
     seen: list[str] = []
@@ -203,7 +203,8 @@ def test_stream_does_not_fail_over_after_deltas_were_delivered() -> None:
 
 
 def test_stream_without_a_final_response_is_an_error() -> None:
-    router = ModelRouter(FakeProvider([[StreamDelta(text="x")]]), retry=RetryPolicy(max_attempts=1), sleep=no_sleep)
+    provider = FakeProvider([Streamed(StreamDelta(text="x"))])
+    router = ModelRouter(provider, retry=RetryPolicy(max_attempts=1), sleep=no_sleep)
     request = ModelRequest(system="s", messages=(Message.user("hi"),))
     with pytest.raises(ProviderError, match="without returning"):
         run_sync(router.stream(request))

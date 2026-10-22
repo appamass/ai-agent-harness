@@ -45,7 +45,7 @@ from ai_agent_harness import (
     stream_start,
 )
 from ai_agent_harness.core.errors import ConcurrencyError, ConfigError, ProviderError
-from ai_agent_harness.testing import FakeProvider, text_response, tool_response
+from ai_agent_harness.testing import FakeProvider, Streamed, text_response, tool_response
 
 from .conftest import Crash, WriteFile, make_agent, no_sleep
 
@@ -183,12 +183,7 @@ async def test_stream_mid_stream_provider_failure_persists_failed() -> None:
     store = InMemoryCheckpointStore()
     # Provider yields one delta then dies with ProviderError
     provider = FakeProvider(
-        [
-            [
-                StreamDelta(text="Chunk before crash "),
-                ProviderError("Network connection reset", retryable=False),
-            ]
-        ]
+        [Streamed(StreamDelta(text="Chunk before crash "), ProviderError("Network connection reset", retryable=False))]
     )
     agent = Agent.create(provider, "Prompt", name="crash_agent", checkpoints=store)
 
@@ -313,7 +308,7 @@ def _many_agent(store: InMemoryCheckpointStore) -> Agent:
     """Streams far more deltas than any queue holds: the run is blocked on a full queue."""
     deltas = [StreamDelta(text=f"w{i} ") for i in range(500)]
     return Agent.create(
-        FakeProvider([[*deltas, text_response("done")]]), "Prompt", name="many_agent", checkpoints=store
+        FakeProvider([Streamed(*deltas, text_response("done"))]), "Prompt", name="many_agent", checkpoints=store
     )
 
 
@@ -528,18 +523,18 @@ async def test_a_consumer_stalling_longer_than_the_provider_deadline_is_not_a_pr
     async def stalled(_: StreamDelta) -> None:
         await asyncio.sleep(0.4)  # longer than request_timeout_s
 
-    one_chunk = FakeProvider([[StreamDelta(text="hi"), text_response("hi")]], id="one")
+    one_chunk = FakeProvider([Streamed(StreamDelta(text="hi"), text_response("hi"))], id="one")
     router = ModelRouter(one_chunk, retry=RetryPolicy(max_attempts=1, request_timeout_s=0.1))
     response, _ = await router.stream(_REQUEST, on_delta=stalled)
     assert response.message.text == "hi"
 
 
 @pytest.mark.anyio
-async def test_reasoning_only_deltas_do_not_block_retry_and_failover() -> None:
+async def test_empty_deltas_do_not_block_retry_and_failover() -> None:
     flaky = FakeProvider(
         [
-            [StreamDelta(thinking="pondering"), ProviderError("dropped", retryable=True, provider_id="flaky")],
-            [StreamDelta(thinking="pondering"), text_response("ok")],
+            Streamed(StreamDelta(), ProviderError("dropped", retryable=True, provider_id="flaky")),
+            Streamed(StreamDelta(), text_response("ok")),
         ],
         id="flaky",
     )
@@ -552,6 +547,7 @@ async def test_reasoning_only_deltas_do_not_block_retry_and_failover() -> None:
     router = ModelRouter(flaky, retry=RetryPolicy(max_attempts=2, base_delay_s=0.0, max_delay_s=0.0), sleep=no_sleep)
     response, _ = await router.stream(_REQUEST, on_delta=collect)
     assert response.message.text == "ok" and len(flaky.requests) == 2
+    assert seen == []  # nothing reached the consumer, so the retry could not show a second answer
 
 
 @pytest.mark.anyio

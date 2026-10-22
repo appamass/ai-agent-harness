@@ -2,27 +2,35 @@
 
 `FakeProvider` replays scripted responses or errors — without calling a real
 model. This lets you test the loop, guardrails, tools, and policies deterministically.
-Do not use in production code.
+A plain `ModelResponse` streams its text word by word; `Streamed(...)` scripts the exact
+deltas (and errors) of one streamed call. Do not use in production code.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator, Sequence
-from typing import Any, cast
+from typing import Any
 
 from .core.types import Message, ModelRequest, ModelResponse, StopReason, TextBlock, ToolCall, Usage
 from .providers.base import Capabilities, StreamDelta
 
 
+class Streamed:
+    """One scripted call that streams exactly these items in order; a scripted exception is raised where it stands."""
+
+    def __init__(self, *items: StreamDelta | ModelResponse | BaseException) -> None:
+        self.items = items
+
+
 class FakeProvider:
     def __init__(
         self,
-        script: Sequence[ModelResponse | BaseException | Sequence[StreamDelta | ModelResponse | BaseException]],
+        script: Sequence[ModelResponse | BaseException | Streamed],
         *,
         id: str = "fake",
         capabilities: Capabilities | None = None,
     ) -> None:
-        self._script: list[Any] = list(script)
+        self._script: list[ModelResponse | BaseException | Streamed] = list(script)
         self._id = id
         self._capabilities = capabilities or Capabilities(tools=True, vision=True)
         self.requests: list[ModelRequest] = []
@@ -39,7 +47,7 @@ class FakeProvider:
     def remaining(self) -> int:
         return len(self._script)
 
-    def _next_item(self, request: ModelRequest) -> Any:
+    def _next_item(self, request: ModelRequest) -> ModelResponse | Streamed:
         self.requests.append(request)
         if not self._script:
             raise AssertionError(f"FakeProvider '{self._id}': script is empty, unexpected call")
@@ -49,27 +57,26 @@ class FakeProvider:
         return item
 
     @staticmethod
-    def _events(item: Any) -> Iterator[StreamDelta | ModelResponse]:
+    def _events(item: ModelResponse | Streamed) -> Iterator[StreamDelta | ModelResponse]:
         """What a script item makes the provider emit; scripted exceptions are raised in order."""
         if isinstance(item, ModelResponse):
             yield from _word_deltas(item)
             yield item
             return
-        if not isinstance(item, (list, tuple)):
-            raise TypeError(f"unexpected script item {type(item).__name__}")
-        for sub in cast(Sequence[object], item):
+        for sub in item.items:
             if isinstance(sub, BaseException):
                 raise sub
-            if isinstance(sub, (StreamDelta, ModelResponse)):
-                yield sub
+            yield sub
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         item = self._next_item(request)
         if isinstance(item, ModelResponse):
             return item
-        for event in self._events(item):
-            if isinstance(event, ModelResponse):
-                return event
+        for sub in item.items:
+            if isinstance(sub, BaseException):
+                raise sub
+            if isinstance(sub, ModelResponse):
+                return sub
         raise AssertionError(f"FakeProvider '{self._id}': scripted sequence did not contain ModelResponse")
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:

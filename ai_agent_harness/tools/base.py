@@ -108,13 +108,14 @@ class BaseTool(ABC, Generic[InputT]):
     def digest(cls) -> str:
         """SHA-256 fingerprint (64 hex chars) of everything that decides what the tool is and may do.
 
-        Covers name, description, input schema, risk, timeout, and `untrusted_output`. Pin it with
-        `ToolRegistry(expected_digests=...)` to notice a changed tool.
+        Covers what the model sees (`spec()`: name, description, input schema), risk, timeout, and
+        `untrusted_output`. Pin it with `ToolRegistry(expected_digests=...)` to notice a changed tool.
         """
+        spec = cls.spec()
         payload: dict[str, Any] = {
-            "name": cls.name,
-            "description": cls.description,
-            "input_schema": cls.input_model.model_json_schema(),
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": spec.input_schema,
             "risk": cls.risk.value,
             "timeout_s": float(cls.timeout_s),
             "untrusted_output": cls.untrusted_output,
