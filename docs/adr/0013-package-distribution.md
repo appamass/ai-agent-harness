@@ -10,8 +10,8 @@ A copied repository needs every fix and hardening ported by hand to every projec
 
 ## Decision
 
-A versioned package (import name `ai_agent_harness`, ADR 0016), installed from pinned Git release tags of `github.com/appamass/ai-agent-harness` under the MIT license:
-`pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.7.0"`.
+A versioned package (import name `ai_agent_harness`, ADR 0016), installed from pinned Git release tags of `github.com/appamass/ai-agent-harness` under the MIT license
+(the install line is in the [README](../../README.md#install)).
 Projects pin a tag and commit a lockfile. There is no PyPI release.
 
 ## Rejected

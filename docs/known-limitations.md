@@ -46,7 +46,7 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   With several providers in one router, the tier every provider supports is used.
 - **MCP trust is configuration, not discovery:** every tool needs a local `Risk`, digests pin the raw definition at load time only, and a
   `list_changed` notification makes calls fail until you reload. The local argument model is a coarse pre-check; the server validates. The
-  server allowlist is opt-in (`allowed_servers`). Stdio servers get a minimal environment and 16 MiB messages. Remote transports (HTTP/SSE) and
+  server allowlist is opt-in (`allowed_servers`). Stdio servers get a minimal environment and a bounded message size (`DEFAULT_MAX_MESSAGE_BYTES`). Remote transports (HTTP/SSE) and
   MCP resources/prompts are not supported. Server tool names are mapped to `[A-Za-z0-9_-]` (a dot becomes `_`; two names that collide are refused). Close tools you no longer need (`await tools.aclose()`). A timed-out call is not cancelled on the server (no `notifications/cancelled`), so its outcome is unknown; `terminate()` does not reap grandchildren such as servers started through `npx`.
 
 ## Runtime behavior

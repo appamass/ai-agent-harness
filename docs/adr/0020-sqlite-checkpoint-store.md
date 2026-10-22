@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (maintainer, 2026-10-22)
 - **Date:** 2026-10-22
-- **Affects:** `ai_agent_harness/persistence_sqlite.py`, `persistence.py` (shared `RunInfo` and helpers), `ai_agent_harness/__init__.py`, `tests/test_sqlite_store.py`
+- **Affects:** `ai_agent_harness/persistence_sqlite.py`, `persistence.py` and `persistence_sql.py` (shared helpers), `ai_agent_harness/__init__.py`, `tests/test_sqlite_store.py`
 
 ## Context
 
@@ -11,9 +11,9 @@ Stores so far: in memory (tests), file (POSIX only, needs `fcntl`), PostgreSQL (
 ## Decision
 
 - `SqliteCheckpointStore` on the standard library `sqlite3` only (no new dependency), exported from `ai_agent_harness`. It is meant for Windows, Linux, and macOS (CI runs on Linux only; Windows is untested) and creates parent directories.
-- Same table and index as the PostgreSQL store (`(tenant_id, run_id)` key, `revision`, `status`, `schema_version`, `state`, `updated_at`; index `(tenant_id, status)`) and the same helpers (`WriteRecord`, `settle_write`, id and limit checks) from `persistence.py`.
+- Same table and index as the PostgreSQL store (`(tenant_id, run_id)` key, `revision`, `status`, `schema_version`, `state`, `updated_at`; index `(tenant_id, status)`) the same statements and `WriteRecord` (`persistence_sql.py`), and the same `settle_write`, id and limit checks (`persistence.py`).
 - **Locking in one statement:** `INSERT … ON CONFLICT (tenant_id, run_id) DO UPDATE … WHERE revision = ? RETURNING revision`; no row back raises `ConcurrencyError`.
-- WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`. An internal `threading.Lock` plus `asyncio.to_thread`; `settle_write` keeps revisions in sync on cancellation (ADR 0006).
+- WAL mode, `synchronous = NORMAL`, `busy_timeout = 5000`, applied on first use (a borrowed connection gets them at construction). An internal `threading.Lock` plus `asyncio.to_thread`; `settle_write` keeps revisions in sync on cancellation (ADR 0006).
 - `list_runs`, `delete_run`, `delete_tenant` like the PostgreSQL store.
 
 ## Rejected

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-18
-- **Affects:** `ai_agent_harness/persistence_postgres.py`, `persistence.py` (shared helpers), `pyproject.toml` (extra `postgres`), CI, tests
+- **Affects:** `ai_agent_harness/persistence_postgres.py`, `persistence.py` and `persistence_sql.py` (shared helpers), `pyproject.toml` (extra `postgres`), CI, tests
 
 ## Context
 
@@ -13,7 +13,7 @@
 - `PostgresCheckpointStore` is an **optional extra** (`pip install "ai-agent-harness[postgres]"`, `psycopg[binary,pool]>=3.2,<4`, async). Without the driver it raises `ConfigError` with the install hint.
 - **Table:** primary key `(tenant_id, run_id)`, `revision`, `status`, `schema_version`, `state`, `updated_at`; index `(tenant_id, status)`. `state` is the exact JSON text (not `jsonb`), loaded only through `restore_state` (ADR 0010).
 - **Locking in one statement:** `INSERT … ON CONFLICT (tenant_id, run_id) DO UPDATE … WHERE revision = expected RETURNING revision`. A missing row is created; a different revision returns no row and raises `ConcurrencyError`.
-- **Shared with the other SQL store:** cancellation handling (`persistence.settle_write`), `check_ids`, `WriteRecord`, identifier and limit checks.
+- **Shared with the other SQL store:** the statements, `WriteRecord`, and identifier checks (`persistence_sql.py`); cancellation handling (`settle_write`), id and limit checks (`persistence.py`).
 - **Connections:** one short-lived connection per operation by default; `pool=` takes an `AsyncConnectionPool` opened in the caller's loop. The store keeps no global state.
 - **Schema:** `setup()` runs `CREATE TABLE IF NOT EXISTS` (index names carry a short hash of the table name); `schema_sql()` returns the DDL for migration tools. Schema and table names are validated (`[a-z_][a-z0-9_]{0,62}`) and quoted; values are bound parameters.
 - **Operations:** `list_runs(tenant_id, status=, limit=)` for approval queues and recovery jobs (`RunStatus.RUNNING` means a process died), `delete_run`, `delete_tenant`.

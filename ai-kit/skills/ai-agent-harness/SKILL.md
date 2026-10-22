@@ -29,8 +29,8 @@ Activate this skill when:
 
 | Mode | When to Choose | How to Implement |
 |---|---|---|
-| **1. Use (Dependency)** | Building a greenfield Python service that needs reliable stateful agent loops. | `pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.7.0"` ([ADR 0013](../../../docs/adr/0013-package-distribution.md)). |
-| **2. Copy (Modular Bricks)** | You already have an established framework but need a proven component. | Use or copy bricks (together with `core/` and `policy.py`) ([ADR 0019](../../../docs/adr/0019-modular-bricks-and-security-guards.md)). E.g., `ToolExecutor`, `SecretGuard`, or `PostgresCheckpointStore`. |
+| **1. Use (Dependency)** | Building a greenfield Python service that needs reliable stateful agent loops. | Pin a release tag: [install line](../../../README.md#install) ([ADR 0013](../../../docs/adr/0013-package-distribution.md)). |
+| **2. Copy (Modular Bricks)** | You already have an established framework but need a proven component. | Use or copy bricks (together with `core/` and `policy.py`; stores also need `persistence.py` and `persistence_sql.py`) ([ADR 0019](../../../docs/adr/0019-modular-bricks-and-security-guards.md)). E.g., `ToolExecutor`, `SecretGuard`, or `PostgresCheckpointStore`. |
 | **3. Rebuild (Invariants in Your Stack)** | Using LangGraph, Pydantic AI, or an in-house engine and must satisfy strict compliance. | Follow the recipes in [Adopt in other frameworks](references/adopt-in-x.md) and respect the 9 invariants. |
 
 ---

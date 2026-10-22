@@ -11,7 +11,7 @@ Runs wait hours or days. If the shape of `RunState` changes meanwhile, new code 
 
 ## Decision
 
-1. `RunState.schema_version` (`SCHEMA_VERSION`, now 3) is stored in every checkpoint. A missing field means version 1.
+1. `RunState.schema_version` (`SCHEMA_VERSION`) is stored in every checkpoint. A missing field means version 1.
 2. Checkpoints load **only** through `restore_state(raw, tenant_id=…, run_id=…)`: read the version, apply `MIGRATIONS[n]` step by step, validate with Pydantic, run `check_protocol()`. A checkpoint under the wrong tenant or run ID is rejected (`InvalidStateError`); a migration that does not return an object raises `SchemaVersionError`. Custom stores must use it too.
 3. A newer `schema_version` raises `SchemaVersionError` at once. `resume` rejects any state whose version differs, even from a store that skipped `restore_state`.
 4. Every schema change: bump `SCHEMA_VERSION`, add the migration, commit a fixture of the old format.
