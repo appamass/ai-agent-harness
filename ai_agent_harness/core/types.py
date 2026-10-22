@@ -9,6 +9,7 @@ so typos in adapters fail immediately.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -21,6 +22,12 @@ ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 """Allowed format for tool names, run IDs, and tenant IDs (safe for filenames and APIs)."""
 ID_RE = re.compile(ID_PATTERN)
 _NOT_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def canonical_digest(payload: dict[str, Any]) -> str:
+    """SHA-256 (64 hex chars) over the canonical JSON form of `payload`: stable across key order and platforms."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def sanitize_id(value: str) -> str:

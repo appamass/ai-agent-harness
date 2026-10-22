@@ -7,8 +7,8 @@ Trust model for external MCP servers (ADR 0024):
    schema as the server sent them. Mutated tools fail closed at load time. A server that announces a changed
    tool list later (`notifications/tools/list_changed`) makes further calls fail closed until the tools are reloaded.
 3. Server allowlist: opt-in. Pass `allowed_servers` to `load_mcp_tools` to restrict which servers may be loaded.
-4. Untrusted by default: All MCP tool outputs have untrusted_output=True and are
-   wrapped in `<untrusted>` frames by ToolExecutor to neutralize prompt injections.
+4. Always untrusted: every MCP tool has `untrusted_output=True`, so ToolExecutor wraps its output and error text in
+   `<untrusted>` frames (a hint to the model, not a security boundary).
 5. Invariant preservation: MCP tools execute exclusively through ToolExecutor (the
    8-step gate), obeying PermissionPolicy (Autonomy x Risk), hooks, and write-ahead.
 """
@@ -29,8 +29,17 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 from .._version import __version__
 from ..core.errors import ConfigError, ToolError
 from ..core.state import RunState
-from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, is_positive_number, sanitize_id
-from .base import BaseTool, canonical_digest, check_truncation_mode, make_tool
+from ..core.types import (
+    ID_PATTERN,
+    ID_RE,
+    Risk,
+    ToolSpec,
+    TruncationMode,
+    canonical_digest,
+    is_positive_number,
+    sanitize_id,
+)
+from .base import BaseTool, check_truncation_mode, make_tool
 
 log = logging.getLogger("ai_agent_harness.mcp")
 
@@ -529,8 +538,6 @@ class MCPServerConfig:
     tool_digests: dict[str, str] | None = None
     """Optional SHA-256 tool digest pins. Any mutated tool fails closed at startup."""
     timeout_s: float = 30.0
-    untrusted_output: bool = True
-    """Untrusted by default: wraps tool output in an <untrusted> frame."""
     name_prefix: str | None = None
     max_result_chars: int | None = None
     truncation_mode: TruncationMode | None = None
@@ -582,7 +589,7 @@ def _build_mcp_tool(
         input_model=input_model,
         risk=risk,
         timeout_s=config.timeout_s,
-        untrusted_output=config.untrusted_output,
+        untrusted_output=True,  # server output is external data, never instructions
         strict_schema=False,  # the server's schema is arbitrary; the server validates
         max_result_chars=config.max_result_chars,
         truncation_mode=config.truncation_mode,

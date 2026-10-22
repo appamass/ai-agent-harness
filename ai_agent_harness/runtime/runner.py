@@ -59,6 +59,7 @@ from ..core.types import (
     ThinkingBlock,
     ToolCall,
     ToolResult,
+    canonical_digest,
     is_positive_number,
 )
 from ..providers.base import StreamDelta
@@ -297,15 +298,15 @@ class _ResumeInput:
 
 
 def _check_output_binding(state: RunState, output_model: type[BaseModel] | None) -> None:
-    """A run started with an `output_model` keeps it (ADR 0023). The stored schema only detects a changed model."""
-    if state.output_schema is None:
+    """A run started with an `output_model` keeps it (ADR 0023). The stored digest detects a changed model."""
+    if state.output_schema_digest is None:
         return
     if output_model is None:
         raise InvalidStateError(
             f"Run requires structured output ({state.output_model_name}): pass the same output_model "
             "again on every resume (ADR 0023)"
         )
-    if output_model.model_json_schema() != state.output_schema:
+    if canonical_digest(output_model.model_json_schema()) != state.output_schema_digest:
         raise InvalidStateError(
             f"output_model {output_model.__name__} does not match the schema this run was started with"
         )
@@ -314,8 +315,8 @@ def _check_output_binding(state: RunState, output_model: type[BaseModel] | None)
 def _bind(run: _Run, deps: object) -> _Run:
     """The last step of setting up a run: nothing after it can fail, so a failed setup leaves the state as it was."""
     state, model = run.state, run.output_model
-    if model is not None and state.output_schema is None:
-        state.output_schema = run.output_schema
+    if model is not None and run.output_schema is not None and state.output_schema_digest is None:
+        state.output_schema_digest = canonical_digest(run.output_schema)
         state.output_model_name = model.__name__
     state.bind_deps(deps)
     return run

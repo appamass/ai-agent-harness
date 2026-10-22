@@ -76,7 +76,6 @@ def test_native_structured_output_success() -> None:
     assert state.output == {"city": "Berlin", "temperature_c": 19.0, "condition": "Sunny"}
     model = state.output_as(CityWeather)
     assert model == CityWeather(city="Berlin", temperature_c=19.0, condition="Sunny")
-    assert state.output_object == model
     assert len(provider.requests) == 1
     assert provider.requests[0].output_schema == CityWeather.model_json_schema()
     assert_consistent(state)
@@ -232,13 +231,13 @@ def test_checkpoint_and_resume_across_approval_preserves_output_model(tmp_path: 
 
     paused = run_sync(start(agent, "Publish report for Zurich", output_model=CityWeather))
     assert paused.status is RunStatus.WAITING_FOR_APPROVAL
-    assert paused.output_schema is not None
+    assert paused.output_schema_digest is not None
     assert paused.output_model_name == "CityWeather"
 
     # Reload state from store to test persistence fidelity
     reloaded = run_sync(store.load(paused.tenant_id, paused.run_id))
     assert reloaded is not None
-    assert reloaded.output_schema is not None
+    assert reloaded.output_schema_digest is not None
 
     resumed = run_sync(resume(agent, reloaded, approved=True, pending_id=reloaded.pending_id, output_model=CityWeather))
     assert resumed.status is RunStatus.DONE
@@ -537,7 +536,7 @@ def test_a_failed_run_setup_leaves_the_callers_state_unchanged() -> None:
     with pytest.raises(PydanticInvalidForJsonSchema):  # the run is set up before anything is bound to the state
         run_sync(resume(agent, state, user_input="again", deps=deps, output_model=_NoSchema))
 
-    assert state.output_schema is None and state.output_model_name is None  # not locked to a model
+    assert state.output_schema_digest is None and state.output_model_name is None  # not locked to a model
     assert state.deps is None  # deps are not kept alive
 
 
@@ -554,7 +553,7 @@ def test_a_late_run_setup_failure_leaves_the_callers_state_unchanged(monkeypatch
     with pytest.raises(ConfigError, match="setup failed"):
         run_sync(resume(agent, state, user_input="again", deps=deps, output_model=CityWeather))
 
-    assert state.output_schema is None and state.output_model_name is None
+    assert state.output_schema_digest is None and state.output_model_name is None
     assert state.deps is None
 
 
@@ -639,7 +638,7 @@ def test_final_output_is_allowed_under_an_allowlist() -> None:
 
 
 def _output_kept(state: RunState) -> bool:
-    return state.output is not None or state.output_object is not None
+    return state.output is not None
 
 
 def test_structured_output_is_dropped_when_a_run_does_not_end_as_done() -> None:

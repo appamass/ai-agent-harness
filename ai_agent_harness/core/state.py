@@ -31,19 +31,30 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .errors import InvalidStateError, ProtocolError, SchemaVersionError
-from .types import ID_PATTERN, Block, Message, TextBlock, ToolCall, ToolResult, Usage, is_positive_number
+from .types import (
+    ID_PATTERN,
+    Block,
+    Message,
+    TextBlock,
+    ToolCall,
+    ToolResult,
+    Usage,
+    canonical_digest,
+    is_positive_number,
+)
 
 CONTINUE_PROMPT = (
     "Your response was truncated due to the length limit. Continue from the exact point where you stopped."
 )
 """User prompt sent by the runner to continue a truncated response (`StopReason.MAX_TOKENS`)."""
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Current version of the serialized state. Increment on every schema change (ADR 0010).
 
 History: 1 — initial version. 2 — `batch_done`, cache/reasoning tokens in `usage`,
 `ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012). 3 — `output_schema`,
-`output_model_name`, `output` for structured final output (ADR 0023).
+`output_model_name`, `output` for structured final output (ADR 0023). 4 — `output_schema_digest` replaces
+`output_schema`: the stored schema only detected a changed model, so its digest is enough.
 """
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
@@ -62,7 +73,15 @@ def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3}
+def _v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
+    """v4 stores the digest of the output model's JSON schema instead of the schema itself (ADR 0023)."""
+    schema = data.pop("output_schema", None)
+    digest = canonical_digest(cast("dict[str, Any]", schema)) if isinstance(schema, dict) else None
+    data["output_schema_digest"] = digest
+    return data
+
+
+MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4}
 """Migrations from version n to n+1, keyed by n."""
 
 
@@ -126,8 +145,8 @@ class RunState(BaseModel):
         default=(),
         description="Completed results of the current tool batch — survive a crash (write-ahead)",
     )
-    output_schema: dict[str, Any] | None = Field(
-        default=None, description="JSON schema for structured final output (ADR 0023)"
+    output_schema_digest: str | None = Field(
+        default=None, description="`canonical_digest` of the output model's JSON schema (ADR 0023)"
     )
     output_model_name: str | None = Field(default=None, description="Class name of required output_model (ADR 0023)")
     output: dict[str, Any] | None = Field(
@@ -140,7 +159,6 @@ class RunState(BaseModel):
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
     _deps: object = PrivateAttr(default=None)  # never serialized: neither in checkpoints nor in events
-    _output_object: BaseModel | None = PrivateAttr(default=None)  # in-memory cached model instance
 
     # ------------------------------------------------------- Runtime dependencies
 
@@ -222,17 +240,10 @@ class RunState(BaseModel):
     def clear_output(self) -> None:
         """Drops the structured output of an earlier turn before the run continues."""
         self.output = None
-        self._output_object = None
 
-    @property
-    def output_object(self) -> BaseModel | None:
-        """The in-memory validated Pydantic object from this execution, if available."""
-        return self._output_object
-
-    def set_output(self, output_object: BaseModel) -> None:
-        """Stores a validated structured output: as a JSON-safe dict (for checkpoints) and as the instance."""
-        self.output = output_object.model_dump(mode="json")
-        self._output_object = output_object
+    def set_output(self, output: BaseModel) -> None:
+        """Stores a validated structured output as a JSON-safe dict. Read it back with `output_as(model)`."""
+        self.output = output.model_dump(mode="json")
         self._touch()
 
     @property

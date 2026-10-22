@@ -28,6 +28,7 @@ from ai_agent_harness import (
 )
 from ai_agent_harness.core import InvalidStateError, SchemaVersionError
 from ai_agent_harness.core import state as state_module
+from ai_agent_harness.core.types import canonical_digest
 from ai_agent_harness.testing import FakeProvider, text_response
 
 from .conftest import FIXTURES_DIR, Echo, WriteFile, assert_consistent, run_sync
@@ -35,6 +36,7 @@ from .conftest import FIXTURES_DIR, Echo, WriteFile, assert_consistent, run_sync
 FIXTURE = FIXTURES_DIR / "checkpoint_v1_waiting_for_approval.json"
 FIXTURE_V2 = FIXTURES_DIR / "checkpoint_v2_waiting_for_approval.json"
 FIXTURE_V3 = FIXTURES_DIR / "checkpoint_v3_done_with_output.json"
+FIXTURE_V4 = FIXTURES_DIR / "checkpoint_v4_done_with_output.json"
 
 
 def load_fixture(path: Path) -> RunState:
@@ -74,13 +76,13 @@ def test_v1_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
 
 
 def test_v2_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
-    """Verifies that real v2 checkpoints load, migrate through v2->v3, and resume cleanly."""
+    """Verifies that real v2 checkpoints load, migrate to the current version, and resume cleanly."""
     (tmp_path / "customer-1").mkdir()
     shutil.copy(FIXTURE_V2, tmp_path / "customer-1" / "fixture-v2-waiting.json")
     store = JsonFileCheckpointStore(tmp_path)
     state = run_sync(store.load("customer-1", "fixture-v2-waiting"))
     assert state is not None
-    assert state.schema_version == 3
+    assert state.schema_version == state_module.SCHEMA_VERSION
     assert state.status is RunStatus.WAITING_FOR_APPROVAL
 
     write = WriteFile()
@@ -93,8 +95,9 @@ def test_v2_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
     assert reloaded.model_dump() == done.model_dump()
 
 
-def test_v3_fixture_keeps_its_structured_output_and_demands_the_same_model_on_resume() -> None:
-    """The v3 format added `output_schema`, `output_model_name`, and `output` (ADR 0023)."""
+@pytest.mark.parametrize("fixture", [FIXTURE_V3, FIXTURE_V4], ids=["v3", "v4"])
+def test_a_fixture_keeps_its_structured_output_and_demands_the_same_model_on_resume(fixture: Path) -> None:
+    """The v3 format added `output_schema`, `output_model_name`, and `output`; v4 keeps only the schema's digest."""
     from pydantic import BaseModel
 
     class Weather(BaseModel):
@@ -104,11 +107,11 @@ def test_v3_fixture_keeps_its_structured_output_and_demands_the_same_model_on_re
     class Other(BaseModel):
         value: int
 
-    state = load_fixture(FIXTURE_V3)
-    assert state.schema_version == 3 and state.status is RunStatus.DONE
+    state = load_fixture(fixture)
+    assert state.schema_version == state_module.SCHEMA_VERSION and state.status is RunStatus.DONE
     assert state.output_model_name == "Weather"
     assert state.output_as(Weather) == Weather(city="customer-city", celsius=3.5)
-    assert state.output_schema == Weather.model_json_schema()
+    assert state.output_schema_digest == canonical_digest(Weather.model_json_schema())
 
     write = WriteFile()
     with pytest.raises(InvalidStateError, match="output_model"):

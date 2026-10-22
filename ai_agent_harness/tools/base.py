@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
 import inspect
 import json
 import threading
@@ -40,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, create_model
 
 from ..core.errors import ConfigError
 from ..core.state import RunState
-from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, is_positive_number
+from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, canonical_digest, is_positive_number
 
 InputT = TypeVar("InputT", bound=BaseModel)
 _SCHEMA_TYPE_KEYS = frozenset({"type", "anyOf", "oneOf", "allOf", "$ref", "enum", "const"})
@@ -65,12 +64,6 @@ def _has_concrete_schema_type(raw: Any) -> bool:
         return False
     nested_props: dict[str, dict[str, Any]] = prop.get("properties") or {}
     return all(_has_concrete_schema_type(sub) for sub in nested_props.values())
-
-
-def canonical_digest(payload: dict[str, Any]) -> str:
-    """SHA-256 (64 hex chars) over the canonical JSON form of `payload`: stable across key order and platforms."""
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def check_truncation_mode(mode: object, where: str) -> None:
