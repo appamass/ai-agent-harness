@@ -49,7 +49,11 @@ from .base import (
     SDK_TIMEOUT_S,
     Capabilities,
     StreamDelta,
-    is_retryable_status,
+    api_error,
+    assistant_message,
+    check_not_empty,
+    error_kind,
+    tool_call,
     without_foreign_thinking,
 )
 
@@ -89,10 +93,7 @@ class AnthropicProvider:
         vision: bool = True,
         cache: bool = True,
     ) -> None:
-        if not model.strip():
-            raise ConfigError("AnthropicProvider: model must not be empty")
-        if not id.strip():
-            raise ConfigError("AnthropicProvider: id must not be empty")
+        check_not_empty("AnthropicProvider", model=model, id=id)
         if client is not None and api_key is not None:
             raise ConfigError("AnthropicProvider: pass either client or api_key, not both")
         self._model = model
@@ -172,25 +173,12 @@ class AnthropicProvider:
         return response
 
     def _translate(self, exc: anthropic.APIError) -> ProviderError:
-        if isinstance(exc, anthropic.APIStatusError):
-            return self._status_error(exc)
-        if isinstance(exc, anthropic.APIConnectionError):  # includes timeouts
-            return ProviderError("Anthropic API connection failed", retryable=True, provider_id=self._id)
-        return ProviderError("Anthropic API returned an invalid response", retryable=False, provider_id=self._id)
-
-    def _status_error(self, exc: anthropic.APIStatusError) -> ProviderError:
-        status = exc.status_code
-        kind = "unknown"
+        if not isinstance(exc, anthropic.APIStatusError):
+            return api_error("Anthropic", self._id, connection=isinstance(exc, anthropic.APIConnectionError))
         body: object = exc.body
-        if isinstance(body, dict):
-            detail: object = cast("dict[str, object]", body).get("error")
-            if isinstance(detail, dict):
-                value: object = cast("dict[str, object]", detail).get("type")
-                if isinstance(value, str) and _ERROR_TYPE.fullmatch(value):
-                    kind = value
-        return ProviderError(
-            f"Anthropic API error {status} ({kind})", retryable=is_retryable_status(status), provider_id=self._id
-        )
+        detail: object = cast("dict[str, object]", body).get("error") if isinstance(body, dict) else None
+        value = cast("dict[str, object]", detail).get("type") if isinstance(detail, dict) else None
+        return api_error("Anthropic", self._id, status=exc.status_code, kind=error_kind(value, _ERROR_TYPE))
 
     def _parameters(self, request: ModelRequest) -> dict[str, Any]:
         parameters: dict[str, Any] = {
@@ -251,11 +239,10 @@ def _api_id(value: str) -> str:
 
 def _thinking_block(block: ThinkingBlock) -> dict[str, Any] | None:
     data = block.provider_data
-    signature = data.get("signature")
-    opaque = data.get("data")
-    if data.get("kind") == "thinking" and isinstance(signature, str) and signature:
+    kind, signature, opaque = data.get("kind"), data.get("signature"), data.get("data")
+    if kind == "thinking" and isinstance(signature, str) and signature:
         return {"type": "thinking", "thinking": block.text, "signature": signature}
-    if data.get("kind") == "redacted_thinking" and isinstance(opaque, str) and opaque:
+    if kind == "redacted_thinking" and isinstance(opaque, str) and opaque:
         return {"type": "redacted_thinking", "data": opaque}
     return None  # unverifiable reasoning would be rejected by the API
 
@@ -273,16 +260,10 @@ def _to_response(message: api.Message) -> ModelResponse:
             blocks.append(ThinkingBlock(provider_data={"kind": "redacted_thinking", "data": item.data}))
         elif isinstance(item, api.ToolUseBlock):
             raw_input: object = item.input  # typed as a dict, but the SDK does not enforce it
-            if isinstance(raw_input, dict):
-                blocks.append(ToolCall(id=item.id, name=item.name, arguments=dict(cast("dict[str, Any]", raw_input))))
-            else:  # the executor reports this to the model so it can retry
-                blocks.append(ToolCall(id=item.id, name=item.name, arguments_error="Tool input was not a JSON object"))
-    if not blocks:  # for example a refusal without content
-        blocks.append(TextBlock(text=""))
-    stop = _STOP_REASONS.get(message.stop_reason or "", StopReason.END)
+            blocks.append(tool_call(item.id, item.name, raw_input))
     return ModelResponse(
-        message=Message(role="assistant", content=tuple(blocks)),
-        stop_reason=stop,
+        message=assistant_message(blocks),
+        stop_reason=_STOP_REASONS.get(message.stop_reason or "", StopReason.END),
         usage=_usage(message.usage),
         model=message.model,
     )

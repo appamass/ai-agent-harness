@@ -41,7 +41,11 @@ from .base import (
     SDK_TIMEOUT_S,
     Capabilities,
     StreamDelta,
-    is_retryable_status,
+    api_error,
+    assistant_message,
+    check_not_empty,
+    error_kind,
+    tool_call,
     without_foreign_thinking,
 )
 
@@ -79,12 +83,11 @@ class OpenAIProvider:
         max_tokens_param: Literal["max_tokens", "max_completion_tokens"] = "max_tokens",
         default_headers: dict[str, str] | None = None,
     ) -> None:
-        if not model.strip():
-            raise ConfigError("OpenAIProvider: model must not be empty")
-        if not id.strip():
-            raise ConfigError("OpenAIProvider: id must not be empty")
+        check_not_empty("OpenAIProvider", model=model, id=id)
         if client is not None and (api_key is not None or base_url is not None or organization is not None):
             raise ConfigError("OpenAIProvider: pass either client or connection parameters, not both")
+        if max_tokens_param not in ("max_tokens", "max_completion_tokens"):  # also for callers without a type checker
+            raise ConfigError("OpenAIProvider: max_tokens_param must be 'max_tokens' or 'max_completion_tokens'")
 
         self._model = model
         self._id = id
@@ -100,8 +103,6 @@ class OpenAIProvider:
                 max_retries=0,
             )
         )
-        if max_tokens_param not in ("max_tokens", "max_completion_tokens"):
-            raise ConfigError("OpenAIProvider: max_tokens_param must be 'max_tokens' or 'max_completion_tokens'")
         self._max_tokens_param = max_tokens_param
         # Honest capabilities: many compatible servers (Ollama, vLLM, Gemini-compat) do not accept `json_schema`.
         self._capabilities = Capabilities(tools=True, vision=vision, structured_output=structured_output)
@@ -206,15 +207,9 @@ class OpenAIProvider:
         )
 
     def _translate(self, exc: openai.APIError) -> ProviderError:
-        if isinstance(exc, openai.APIStatusError):
-            return self._status_error(exc)
-        if isinstance(exc, openai.APIConnectionError):
-            return ProviderError("OpenAI API connection failed", retryable=True, provider_id=self._id)
-        return ProviderError("OpenAI API returned an invalid response", retryable=False, provider_id=self._id)
-
-    def _status_error(self, exc: openai.APIStatusError) -> ProviderError:
-        status = exc.status_code
-        kind = "unknown"
+        if not isinstance(exc, openai.APIStatusError):
+            return api_error("OpenAI", self._id, connection=isinstance(exc, openai.APIConnectionError))
+        value: object = None
         body: object = exc.body
         if isinstance(body, dict):
             fields = cast("dict[str, object]", body)
@@ -222,19 +217,14 @@ class OpenAIProvider:
             nested = fields.get("error")
             detail = cast("dict[str, object]", nested) if isinstance(nested, dict) else fields
             value = detail.get("code") or detail.get("type")
-            if isinstance(value, str) and _ERROR_TYPE.fullmatch(value):
-                kind = value
-        return ProviderError(
-            f"OpenAI API error {status} ({kind})", retryable=is_retryable_status(status), provider_id=self._id
-        )
+        return api_error("OpenAI", self._id, status=exc.status_code, kind=error_kind(value, _ERROR_TYPE))
 
     def _parameters(self, request: ModelRequest) -> dict[str, Any]:
         messages: list[dict[str, Any]] = []
         if request.system:
             messages.append({"role": "system", "content": request.system})
 
-        cleaned_messages = without_foreign_thinking(request.messages, self._id)
-        for m in cleaned_messages:
+        for m in without_foreign_thinking(request.messages, self._id):
             messages.extend(_to_api_messages(m))
 
         parameters: dict[str, Any] = {
@@ -276,15 +266,11 @@ def _to_api_messages(message: Message) -> list[dict[str, Any]]:
             if isinstance(block, TextBlock) and block.text:
                 text_parts.append(block.text)
             elif isinstance(block, ToolCall):
-                args_str = json.dumps(block.arguments)
                 tool_calls.append(
                     {
                         "id": block.id,
                         "type": "function",
-                        "function": {
-                            "name": block.name,
-                            "arguments": args_str,
-                        },
+                        "function": {"name": block.name, "arguments": json.dumps(block.arguments)},
                     }
                 )
         content: str | None = "".join(text_parts)
@@ -338,9 +324,7 @@ def _tool_call(call_id: str, name: str, raw_arguments: str) -> ToolCall:
         parsed: object = json.loads(raw_arguments)
     except json.JSONDecodeError as exc:
         return ToolCall(id=call_id, name=name, arguments_error=f"Invalid JSON: {exc.msg}")
-    if not isinstance(parsed, dict):
-        return ToolCall(id=call_id, name=name, arguments_error="Tool input was not a JSON object")
-    return ToolCall(id=call_id, name=name, arguments=cast("dict[str, Any]", parsed))
+    return tool_call(call_id, name, parsed)
 
 
 def _assemble(
@@ -358,10 +342,8 @@ def _assemble(
     if text:
         blocks.append(TextBlock(text=text))
     blocks.extend(tool_calls)
-    if not blocks:
-        blocks.append(TextBlock(text=""))
     return ModelResponse(
-        message=Message(role="assistant", content=tuple(blocks)),
+        message=assistant_message(blocks),
         stop_reason=_STOP_REASONS.get(finish_reason or "", StopReason.END),
         usage=usage,
         model=model,
@@ -404,6 +386,5 @@ def _usage(usage: CompletionUsage | None) -> Usage:
         input_tokens=input_tokens,
         output_tokens=completion_tokens,
         cache_read_tokens=cached_tokens,
-        cache_write_tokens=0,
         reasoning_tokens=min(reasoning_tokens, completion_tokens),
     )
