@@ -1,4 +1,4 @@
-# 0009 – AI-Assisted Development: AGENTS.md, Skills, Independent Reviewer
+# 0009 – AI-Assisted Development
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-16
@@ -6,32 +6,21 @@
 
 ## Context
 
-This template is built and extended with AI coding agents (Claude Code, Codex, Cursor, etc.). The exact
-same risks that the harness prevents at runtime — especially reward hacking (weakening tests or linter
-rules to get a green build), violating invariants, or letting documentation drift — also apply to AI
-coding agents working on this repository.
+The repository is built with AI coding agents. The risks the harness stops at runtime (weakening tests or linters to get green, breaking invariants, drifting docs) also apply to the agents that work on it.
 
 ## Decision
 
-- `AGENTS.md` is the tool-agnostic single source of truth for rules, commands, and non-negotiable
-  invariants. `CLAUDE.md` imports it (`@AGENTS.md`) and adds only Claude-specific instructions.
-- Repeatable engineering workflows live as step-by-step playbooks in `.claude/skills/` (`add-tool`,
-  `add-guardrail`, `add-provider-adapter`, `write-adr`, `verify-change`).
-- A read-only `architecture-reviewer` subagent audits changes independently before work is considered complete.
-- `.claude/settings.json` pre-approves verification commands, requires human confirmation before editing
-  `.github/`, `.claude/`, or `pyproject.toml`, and blocks access to `.env` and `secrets/`.
-- Architectural decisions are recorded in `docs/adr/`; the `Accepted` status is set only by a human.
-- Documentation code blocks (`docs/use-cases/`, `docs/first-real-run.md`) are executed by `tests/test_docs.py`
-  so documentation cannot silently drift out of sync with the API.
+- `AGENTS.md` is the one tool-agnostic source for rules, commands, and invariants. `CLAUDE.md` imports it and adds only Claude-specific workflow.
+- Repeatable workflows live in `.claude/skills/` (`add-tool`, `add-guardrail`, `add-provider-adapter`, `write-adr`, `verify-change`).
+- A read-only `architecture-reviewer` subagent checks changes independently.
+- `.claude/settings.json` pre-approves verification commands, asks before editing `.github/`, `.claude/`, or `pyproject.toml`, and blocks `.env` and `secrets/`.
+- The `Accepted` status of an ADR is set by a human. Code blocks in the docs run in `tests/test_docs.py`.
 
-## Alternatives
+## Rejected
 
-| Alternative | Why Rejected |
-|---|---|
-| Only `CLAUDE.md` | Other coding agents used by the team would not read the rules |
-| Rules only in `README.md` | Not automatically loaded into every coding agent session |
+- Only `CLAUDE.md`: other agents would not read the rules.
+- Rules only in `README.md`: not loaded into agent sessions.
 
 ## Consequences
 
-- Positive: Every coding agent session starts with the exact same invariants; code changes are reviewed by an independent persona rather than self-graded.
-- Negative: Markdown instructions are context, not hard enforcement. Hard boundaries require tool permissions (`settings.json`), CI checks (`tests/test_architecture.py`), and human code review.
+Markdown is context, not enforcement. Hard limits come from permissions, CI (`tests/test_architecture.py`), and human review.

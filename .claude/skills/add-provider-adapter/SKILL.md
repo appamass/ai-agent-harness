@@ -6,7 +6,6 @@ description: Build an adapter for a model provider (Anthropic, OpenAI, Google, l
 # Adding a Model Provider Adapter
 
 Contract: module docstring of `ai_agent_harness/providers/base.py`. Reference test double: `ai_agent_harness/testing.py` (`FakeProvider`). Reference adapter: `ai_agent_harness/providers/anthropic.py` with its tests (`tests/test_anthropic_provider.py`, mock transport + wire-format fixtures) and live tests (`tests/live/`).
-Walkthrough: `docs/first-real-run.md`.
 
 ## 1. Location and Dependency
 
@@ -32,7 +31,7 @@ Walkthrough: `docs/first-real-run.md`.
 
 | Case | Raise |
 |---|---|
-| HTTP 429, 5xx, 529 overload, network errors, SDK timeout | `ProviderError(..., retryable=True, provider_id=self.id)` |
+| HTTP 408, 409, 429, 5xx (incl. 529 overload), network errors, SDK timeout (`is_retryable_status`) | `ProviderError(..., retryable=True, provider_id=self.id)` |
 | HTTP 400, invalid request, auth failure, content policy rejection | `ProviderError(..., retryable=False, provider_id=self.id)` |
 
 Retries, exponential backoff, timeouts, and failover are handled by `ModelRouter` — do not retry inside the adapter.
@@ -40,7 +39,7 @@ Never include API keys or secrets in error messages.
 
 ## 4. Honest Capabilities
 
-Declare `Capabilities(tools=..., vision=...)`. The router skips providers that lack capabilities required by a request.
+Declare `Capabilities(tools=..., vision=..., structured_output=...)` honestly (OpenAI-compatible servers often reject `json_schema`). The router skips providers that lack capabilities required by a request. Offer `stream()` if the API streams.
 
 ## 5. Mandatory Tests
 

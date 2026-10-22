@@ -5,12 +5,11 @@ Read this before you rely on the harness. Everything here is deliberate or not b
 ## Status of the project
 
 - **Version 0.x.** The public API may change between minor versions (see [`../CHANGELOG.md`](../CHANGELOG.md)).
-- **Verified live so far:** the Anthropic adapter with Claude Haiku 5.5 (11 opt-in live tests and the example agent, see [`first-real-run.md`](first-real-run.md)).
+- **Verified live so far:** the Anthropic adapter with Claude Haiku 5.5 (8 opt-in live tests plus 3 for the example agent).
   **Not verified live:** other providers and models, long-running or high-volume workloads, several real workers against one database in production.
-- **Only Anthropic is bundled.** The core ships without LLM SDKs; Anthropic is an optional extra. For other providers write an adapter
-  (contract: `ai_agent_harness/providers/base.py`, skill `add-provider-adapter`).
-- **Not built yet:** streaming, MCP integration, structured final output, automatic context compaction, parallel tool execution
-  (see [`next-steps.md`](next-steps.md)).
+- **Bundled provider adapters:** The core ships without LLM SDKs; Anthropic (`[anthropic]`) and OpenAI-compatible (`[openai]`) are optional extras. For other custom providers, write an adapter following `ai_agent_harness/providers/base.py` and skill `add-provider-adapter`.
+- **Not built yet:** automatic context compaction, parallel tool execution.
+  Streaming, MCP, and structured final output exist but have only been tested offline (fake providers, stub servers, wire bodies: recorded for Anthropic, hand-written for OpenAI; the OpenAI live tests have not been run).
 
 ## Safety boundaries
 
@@ -31,10 +30,24 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   the target is readable under its own name unless it also matches a pattern or lies outside the root. Tools that can create links must not share a
   root with secrets.
 - **`ToolExecutor` used alone:** `ToolExecutor` is exported so you can use the gate without `Agent`. Its `approved=True` argument skips the
-  human approval step for any risk level, and a call without `state` has no `pending_id` binding. The approval rules (invariant 5, ADR 0014) are
+  human approval step for any risk level, and a call without `state` has no `pending_id` binding. The approval rules (invariant 4, ADR 0014) are
   enforced by `start` and `resume`. If you call the executor yourself, you own that step.
 - **Shell tools:** `ProtectedPaths` inspects structured arguments, not free-form shell command strings. Run shell tools only inside a sandbox
   with read-only mounts for protected paths.
+
+## Streaming, structured output, MCP
+
+- **Streamed text is unfiltered:** `TextDelta`s reach the consumer while the model is still answering. `after_model` hooks and guards only see the
+  complete response, so a response they block has already been shown. Do not forward deltas to end users when guards must hold back content
+  (ADR 0025). A consumer that stops reading without closing the handle cancels the run after `idle_timeout_s`; close handles with `async with`.
+- **Structured output is requested, not forced:** native `response_format` (OpenAI-compatible, `structured_output=True`) or an instructed
+  `final_output` tool. The result is always validated by your Pydantic model, and resuming a run needs the same `output_model` again (ADR 0023).
+  Compatible servers that reject `json_schema` (Ollama, vLLM, Gemini-compat) need `OpenAIProvider(..., structured_output=False)`.
+  With several providers in one router, the tier every provider supports is used.
+- **MCP trust is configuration, not discovery:** every tool needs a local `Risk`, digests pin the raw definition at load time only, and a
+  `list_changed` notification makes calls fail until you reload. The local argument model is a coarse pre-check; the server validates. The
+  server allowlist is opt-in (`allowed_servers`). Stdio servers get a minimal environment and 16 MiB messages. Remote transports (HTTP/SSE) and
+  MCP resources/prompts are not supported. Server tool names are mapped to `[A-Za-z0-9_-]` (a dot becomes `_`; two names that collide are refused). Close tools you no longer need (`await tools.aclose()`). A timed-out call is not cancelled on the server (no `notifications/cancelled`), so its outcome is unknown; `terminate()` does not reap grandchildren such as servers started through `npx`.
 
 ## Runtime behavior
 
@@ -57,7 +70,7 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   map to the same path; the store detects and rejects this collision, so normalize IDs to lowercase. Locking is per tenant. It writes plaintext JSON
   and is meant for development and single-host use.
 - **`PostgresCheckpointStore`:** works anywhere PostgreSQL does, but stores plaintext JSON too. Use TLS, a least-privilege role, and encryption at rest,
-  or wrap the store with per-tenant keys (Use Case 01, note its limit: it does not detect replay of an older complete row). Database errors and logs may
+  or wrap the store with per-tenant keys (note: that does not detect replay of an older complete row). Database errors and logs may
   quote row data: treat them like checkpoints. See [ADR 0018](adr/0018-postgres-checkpoint-store.md).
 
 ## Built-in guards are heuristics
@@ -84,4 +97,4 @@ They are not data loss prevention and not a sandbox. Use them as one layer.
   The check and the later write are separate steps, so a link created in between is not seen. Each path check reads the file system.
 - **`ToolRegistry` pins:** a digest is checked when a tool is registered and when you call `verify()`. The executor does not re-check it on every
   call. Tools without a pin are not checked at all.
-- **`as_untrusted`:** the frame tells the model that the content is data. It is a hint, not a boundary. It does not wrap error messages of a failed tool.
+- **`as_untrusted`:** the frame tells the model that the content is data. It is a hint, not a boundary. Error text of a failed `untrusted_output` tool is framed too; the executor's own messages (timeout, internal error) are not.

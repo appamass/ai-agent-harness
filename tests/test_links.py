@@ -20,8 +20,9 @@ def documents() -> list[Path]:
         *ROOT.glob("docs/**/*.md"),
         *ROOT.glob("examples/**/*.md"),
         *ROOT.glob("tests/**/*.md"),
+        *ROOT.glob("ai-kit/**/*.md"),
     ]
-    return sorted([*found, ROOT / "llms.txt"])
+    return sorted(found)
 
 
 def strip_code(text: str) -> str:
@@ -48,7 +49,7 @@ def anchors(path: Path) -> set[str]:
 
 def test_the_documents_to_check_exist() -> None:
     names = {p.relative_to(ROOT).as_posix() for p in documents()}
-    assert {"README.md", "docs/README.md", "CONTRIBUTING.md", "SECURITY.md", "llms.txt"} <= names
+    assert {"README.md", "AGENTS.md", "docs/guide.md"} <= names
 
 
 @pytest.mark.parametrize("path", documents(), ids=lambda p: p.relative_to(ROOT).as_posix())

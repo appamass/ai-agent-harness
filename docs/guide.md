@@ -355,7 +355,61 @@ assert loaded is not None and loaded.status is RunStatus.WAITING_FOR_APPROVAL an
   `restore_state(raw, tenant_id=tenant_id, run_id=run_id)`, never directly with `RunState.model_validate_json`. That gives you schema migrations,
   ownership checks, and protocol checks ([ADR 0010](adr/0010-checkpoint-schema-versioning.md)).
 
+## More building blocks
+
+**OpenAI and compatible servers:** `pip install "ai-agent-harness[openai]"`, then `OpenAIProvider("gpt-4o")`. For Ollama, vLLM, or Gemini's compatible endpoint
+pass `base_url=` and `structured_output=False` (they often reject `json_schema`); models that reject `max_tokens` need
+`max_tokens_param="max_completion_tokens"`.
+
+**A typed result, live text, and a SQLite store** (all run offline with `FakeProvider`):
+
+```python
+# executable
+import asyncio
+import tempfile
+from pathlib import Path
+
+from pydantic import BaseModel
+
+from ai_agent_harness import Agent, SqliteCheckpointStore, TextDelta, stream_start
+from ai_agent_harness import RunStatus as Status
+from ai_agent_harness import start as start_run
+from ai_agent_harness.testing import FakeProvider, text_response
+
+
+class Weather(BaseModel):
+    city: str
+    celsius: float
+
+
+async def typed_and_streamed() -> None:
+    with tempfile.TemporaryDirectory() as tmp, SqliteCheckpointStore(Path(tmp) / "runs.sqlite") as sqlite_store:
+        await sqlite_store.setup()
+        provider = FakeProvider([text_response('{"city": "Bern", "celsius": 3.5}'), text_response("live words")])
+        agent = Agent.create(provider, "You report weather.", checkpoints=sqlite_store)
+
+        # output_model: the run ends with a validated Weather (resume needs the same model again)
+        typed = await start_run(agent, "Weather in Bern?", output_model=Weather)
+        assert typed.status is Status.DONE and typed.output_as(Weather) == Weather(city="Bern", celsius=3.5)
+
+        # stream_start: text arrives while the model answers. Close handles with `async with`.
+        async with stream_start(agent, "Say something") as handle:
+            words = [item.text async for item in handle if isinstance(item, TextDelta)]
+        assert "".join(words).strip() == "live words"
+
+
+asyncio.run(typed_and_streamed())
+```
+
+Streamed text is unfiltered live output: `after_model` guards see a response only when it is complete (see [limits](known-limitations.md#streaming-structured-output-mcp)).
+
+**Tool output size:** results above `max_result_chars` keep their head and their tail (`truncation_mode="head_and_tail"`, the default; `"head"` keeps only the start).
+Set it on `Agent`, `ToolExecutor`, or a single tool (`@tool(max_result_chars=...)`; a tool can lower the agent's limit, not raise it).
+
+**Tracing and MCP:** `agent.events.subscribe(OpenTelemetryListener())` (`pip install "ai-agent-harness[opentelemetry]"`) emits GenAI spans and metrics from metadata only.
+`await load_mcp_tools(MCPServerConfig(server_name=..., command=[...], tool_risks={"tool": Risk.READ}))` turns MCP tools into gated tools; every tool
+needs a risk you set locally ([ADR 0024](adr/0024-mcp-integration-and-trust-model.md)).
+
 ## Where to go next
 
-[`how-it-works.md`](how-it-works.md) for the run loop and the gate · [`use-cases/`](use-cases/README.md) for complete, tested scenarios ·
-[`first-real-run.md`](first-real-run.md) before you connect a real model · [`production-checklist.md`](production-checklist.md) before you go live.
+[`guarantees.md`](guarantees.md) for what is enforced and by which test · [`production-checklist.md`](production-checklist.md) before you go live.

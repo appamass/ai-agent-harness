@@ -5,8 +5,7 @@ description: Build a new guardrail as a Hook (user input, model response, tool c
 
 # Adding a New Guardrail
 
-Reference examples: `ai_agent_harness/guardrails.py` (`ProtectedPaths`, `KillSwitch`) and the guardrails in
-`docs/use-cases/` (`RecipientAllowlist`, `ExfiltrationGuard`, `PaymentLimits`, `TenantRefundPolicy`).
+Reference examples: `ai_agent_harness/guardrails.py` (`ProtectedPaths`, `KillSwitch`, `SecretGuard`, `EgressGuard`).
 
 ## 1. Choose the Right Hook Point
 

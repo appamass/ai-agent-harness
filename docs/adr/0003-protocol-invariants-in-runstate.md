@@ -1,4 +1,4 @@
-# 0003 – Enforce Protocol Invariants in RunState
+# 0003 – Protocol Invariants Live in `RunState`
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-15
@@ -6,28 +6,17 @@
 
 ## Context
 
-All major LLM APIs require that message roles alternate (`user` ↔ `assistant`) and that every tool call
-in an assistant message is immediately answered by exactly one matching tool result in the following
-user message. In early prototypes, retries, truncated responses (`MAX_TOKENS`), and paused runs produced
-invalid message histories that were only rejected later by live provider APIs.
+APIs require alternating roles and exactly one matching tool result for every tool call. Retries, truncated responses, and paused runs produced broken histories that only a live API rejected.
 
 ## Decision
 
-Messages are mutated exclusively through `RunState` methods (`add_user_text`, `add_assistant`,
-`add_tool_results`, `close_open_tool_calls`), which validate the protocol on every step and raise
-`ProtocolError` on any violation. `check_protocol()` validates complete histories, including loaded
-checkpoints. Every run termination closes any open tool calls (committing already completed results
-from `batch_done` and recording the remainder as error results).
+Messages change only through `RunState` methods (`add_user_text`, `add_assistant`, `add_tool_results`, `close_open_tool_calls`), which raise `ProtocolError` on any violation. `check_protocol()` validates whole histories, including loaded checkpoints. Every run end closes open tool calls: finished results are kept, the rest become error results.
 
-## Alternatives
+## Rejected
 
-| Alternative | Why Rejected |
-|---|---|
-| Validate only inside provider adapters | Bugs surface too late and behave differently across providers |
-| Unchecked list manipulation | Any new control-flow path in the runner could silently corrupt the conversation history |
+- Validation only in adapters: bugs surface late and differ per provider.
+- Plain list manipulation: any new runner path could corrupt the history.
 
 ## Consequences
 
-- Positive: Invalid message histories are structurally impossible, even after process crashes or checkpoint tampering.
-- Negative: Direct `state.messages.append(...)` is forbidden by convention and AST tests (`AGENTS.md`, `tests/test_architecture.py`).
-- Verification: `assert_consistent` in `tests/conftest.py` runs across virtually all runner tests.
+Direct changes of `state.messages` outside `core/state.py` fail `tests/test_architecture.py` (AST test). `assert_consistent` in `tests/conftest.py` checks almost every runner test.
