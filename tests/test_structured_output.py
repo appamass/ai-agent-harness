@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
 import pytest
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic.errors import PydanticInvalidForJsonSchema
 
 from ai_agent_harness import (
     Agent,
@@ -522,8 +524,26 @@ def test_output_models_with_free_form_fields_work_in_the_tool_tier() -> None:
     assert state.output == args
 
 
-def test_a_failed_run_setup_leaves_the_callers_state_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+class _NoSchema(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    handler: Callable[[], None]
+
+
+def test_a_failed_run_setup_leaves_the_callers_state_unchanged() -> None:
     agent = Agent.create(FakeProvider([text_response("first")]))
+    state = run_sync(start(agent, "hi"))
+    deps = object()
+
+    with pytest.raises(PydanticInvalidForJsonSchema):  # the run is set up before anything is bound to the state
+        run_sync(resume(agent, state, user_input="again", deps=deps, output_model=_NoSchema))
+
+    assert state.output_schema is None and state.output_model_name is None  # not locked to a model
+    assert state.deps is None  # deps are not kept alive
+
+
+def test_a_late_run_setup_failure_leaves_the_callers_state_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails after the schema was built: binding must still come last."""
+    agent = Agent.create(FakeProvider([text_response("first")], capabilities=_NO_NATIVE))
     state = run_sync(start(agent, "hi"))
     deps = object()
 
@@ -534,8 +554,8 @@ def test_a_failed_run_setup_leaves_the_callers_state_unchanged(monkeypatch: pyte
     with pytest.raises(ConfigError, match="setup failed"):
         run_sync(resume(agent, state, user_input="again", deps=deps, output_model=CityWeather))
 
-    assert state.output_schema is None and state.output_model_name is None  # not locked to a model
-    assert state.deps is None  # deps are not kept alive
+    assert state.output_schema is None and state.output_model_name is None
+    assert state.deps is None
 
 
 # ------------------------------------------------------------------ A withheld output must never finish a run

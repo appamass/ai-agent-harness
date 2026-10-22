@@ -49,7 +49,7 @@ from pydantic import BaseModel, ValidationError
 from ..core import state as state_schema
 from ..core.errors import ConcurrencyError, ConfigError, InvalidStateError, ProviderError
 from ..core.events import Event, EventType
-from ..core.hooks import Action
+from ..core.hooks import Action, Decision
 from ..core.state import CONTINUE_PROMPT, PendingBatch, PendingCall, RunState, RunStatus
 from ..core.types import FINAL_OUTPUT_TOOL_NAME, Message, Risk, StopReason, ThinkingBlock, ToolCall, ToolResult
 from ..providers.base import StreamDelta
@@ -97,6 +97,20 @@ class _StreamSink:
         self.idle_timeout_s = float(idle_timeout_s)
         self.closed = False
         self.started = False  # the run task has begun executing
+
+    def start(self) -> bool:
+        """Marks the run task as started. False if the stream was closed before (the body must not run)."""
+        self.started = True
+        return not self.closed
+
+    def cancel(self, task: asyncio.Task[RunState]) -> None:
+        """Closes the sink and cancels the run task once it has started.
+
+        A task cancelled before it ran would skip `_Run.guarded`; it sees `closed` in `start()` instead.
+        """
+        self.closed = True
+        if self.started and not task.done():
+            task.cancel()
 
     def _put_nowait(self, item: StreamItem | None) -> None:
         with contextlib.suppress(asyncio.QueueFull):
@@ -233,10 +247,7 @@ class StreamHandle:
 
     def cancel(self) -> None:
         """Synchronously cancels the running task. Iteration continues until what was buffered is read."""
-        self._sink.closed = True
-        if not self._task.done() and self._sink.started:
-            self._task.cancel()
-        # else: a task cancelled before it ran would skip `guarded`; it sees `closed` when it starts
+        self._sink.cancel(self._task)
 
 
 def _final_output_tool(model: type[BaseModel]) -> BaseTool[BaseModel]:
@@ -262,31 +273,20 @@ def _extract_json_text(text: str) -> str:
     return text[start : end + 1] if 0 <= start < end else text.strip()
 
 
-def _new_state(
-    agent: Agent,
-    user_input: str,
-    *,
-    tenant_id: str,
-    run_id: str | None,
-    deps: object,
-    output_model: type[BaseModel] | None,
-) -> RunState:
-    _require_text(user_input, "user_input", agent.limits.max_input_chars)
-    fields: dict[str, Any] = {"agent_name": agent.name, "tenant_id": tenant_id}
-    if run_id is not None:
-        fields["run_id"] = run_id
-    state = RunState(**fields)
-    _bind_output(state, output_model)
-    state.bind_deps(deps)
-    return state
+@dataclass(frozen=True)
+class _ResumeInput:
+    """What the caller passes to `resume` / `stream_resume` for the waiting call or a new turn."""
+
+    answer: str | None = None
+    approved: bool | None = None
+    user_input: str | None = None
+    recover: bool = False
+    pending_id: str | None = None
 
 
-def _bind_output(state: RunState, output_model: type[BaseModel] | None) -> None:
-    """Ties a run to its `output_model` (ADR 0023). The stored schema only detects a changed model."""
+def _check_output_binding(state: RunState, output_model: type[BaseModel] | None) -> None:
+    """A run started with an `output_model` keeps it (ADR 0023). The stored schema only detects a changed model."""
     if state.output_schema is None:
-        if output_model is not None:
-            state.output_schema = output_model.model_json_schema()
-            state.output_model_name = output_model.__name__
         return
     if output_model is None:
         raise InvalidStateError(
@@ -299,37 +299,14 @@ def _bind_output(state: RunState, output_model: type[BaseModel] | None) -> None:
         )
 
 
-def _prepare_resume(
-    agent: Agent,
-    state: RunState,
-    *,
-    answer: str | None,
-    approved: bool | None,
-    user_input: str | None,
-    recover: bool,
-    deps: object,
-    pending_id: str | None,
-    output_model: type[BaseModel] | None,
-) -> None:
-    if state.agent_name != agent.name:
-        raise InvalidStateError(f"Run belongs to agent '{state.agent_name}', not '{agent.name}'")
-    if state.schema_version != state_schema.SCHEMA_VERSION:
-        raise InvalidStateError(
-            f"State has schema version {state.schema_version}, expected {state_schema.SCHEMA_VERSION}: "
-            "always load persisted states via restore_state (ADR 0010)"
-        )
-    state.check_protocol()
-    _check_resume_args(
-        state,
-        answer=answer,
-        approved=approved,
-        user_input=user_input,
-        recover=recover,
-        pending_id=pending_id,
-        max_chars=agent.limits.max_input_chars,
-    )
-    _bind_output(state, output_model)
+def _bind(run: _Run, deps: object) -> _Run:
+    """The last step of setting up a run: nothing after it can fail, so a failed setup leaves the state as it was."""
+    state, model = run.state, run.output_model
+    if model is not None and state.output_schema is None:
+        state.output_schema = run.output_schema
+        state.output_model_name = model.__name__
     state.bind_deps(deps)
+    return run
 
 
 def _build_start(
@@ -342,48 +319,40 @@ def _build_start(
     output_model: type[BaseModel] | None,
     sink: _StreamSink | None = None,
 ) -> _Run:
-    state = _new_state(agent, user_input, tenant_id=tenant_id, run_id=run_id, deps=deps, output_model=output_model)
-    return _Run(agent, state, output_model=output_model, stream_sink=sink)
+    _require_text(user_input, "user_input", agent.limits.max_input_chars)
+    fields: dict[str, Any] = {"agent_name": agent.name, "tenant_id": tenant_id}
+    if run_id is not None:
+        fields["run_id"] = run_id
+    state = RunState(**fields)
+    return _bind(_Run(agent, state, output_model=output_model, stream_sink=sink), deps)
 
 
 def _build_resume(
     agent: Agent,
     state: RunState,
+    args: _ResumeInput,
     *,
-    answer: str | None,
-    approved: bool | None,
-    user_input: str | None,
-    recover: bool,
     deps: object,
-    pending_id: str | None,
     output_model: type[BaseModel] | None,
     sink: _StreamSink | None = None,
 ) -> _Run:
-    bound = (state.output_schema, state.output_model_name)
-    _prepare_resume(
-        agent,
-        state,
-        answer=answer,
-        approved=approved,
-        user_input=user_input,
-        recover=recover,
-        deps=deps,
-        pending_id=pending_id,
-        output_model=output_model,
-    )
-    try:
-        return _Run(agent, state, output_model=output_model, stream_sink=sink)
-    except BaseException:  # leave the caller's state as it was: no half-bound model, no deps kept alive
-        state.output_schema, state.output_model_name = bound
-        state.bind_deps(None)
-        raise
+    if state.agent_name != agent.name:
+        raise InvalidStateError(f"Run belongs to agent '{state.agent_name}', not '{agent.name}'")
+    if state.schema_version != state_schema.SCHEMA_VERSION:
+        raise InvalidStateError(
+            f"State has schema version {state.schema_version}, expected {state_schema.SCHEMA_VERSION}: "
+            "always load persisted states via restore_state (ADR 0010)"
+        )
+    state.check_protocol()
+    _check_resume_args(state, args, agent.limits.max_input_chars)
+    _check_output_binding(state, output_model)
+    return _bind(_Run(agent, state, output_model=output_model, stream_sink=sink), deps)
 
 
 def _spawn(run: _Run, body: Coroutine[Any, Any, None], sink: _StreamSink, *, new_run: bool) -> StreamHandle:
     async def _task_body() -> RunState:
-        sink.started = True
         try:
-            if not sink.closed:
+            if sink.start():
                 return await run.guarded(body)
             body.close()  # closed before the task ran: the body never started
             if new_run:  # a new run has nothing to protect: it ends as `cancelled`
@@ -446,18 +415,9 @@ async def resume(
     `deps` are never persisted and must be passed again on every resume.
     A run started with `output_model` needs the same `output_model` on every resume (ADR 0023).
     """
-    run = _build_resume(
-        agent,
-        state,
-        answer=answer,
-        approved=approved,
-        user_input=user_input,
-        recover=recover,
-        deps=deps,
-        pending_id=pending_id,
-        output_model=output_model,
-    )
-    return await run.guarded(run.resume_body(answer=answer, approved=approved, user_input=user_input))
+    args = _ResumeInput(answer=answer, approved=approved, user_input=user_input, recover=recover, pending_id=pending_id)
+    run = _build_resume(agent, state, args, deps=deps, output_model=output_model)
+    return await run.guarded(run.resume_body(args))
 
 
 def stream_start(
@@ -499,19 +459,9 @@ def stream_resume(
 ) -> StreamHandle:
     """Resumes a run, returning a StreamHandle that yields Events and TextDeltas (see `stream_start`)."""
     sink = _StreamSink(queue_size, idle_timeout_s)
-    run = _build_resume(
-        agent,
-        state,
-        answer=answer,
-        approved=approved,
-        user_input=user_input,
-        recover=recover,
-        deps=deps,
-        pending_id=pending_id,
-        output_model=output_model,
-        sink=sink,
-    )
-    return _spawn(run, run.resume_body(answer=answer, approved=approved, user_input=user_input), sink, new_run=False)
+    args = _ResumeInput(answer=answer, approved=approved, user_input=user_input, recover=recover, pending_id=pending_id)
+    run = _build_resume(agent, state, args, deps=deps, output_model=output_model, sink=sink)
+    return _spawn(run, run.resume_body(args), sink, new_run=False)
 
 
 def _stamp_thinking(message: Message, provider_id: str) -> Message:
@@ -525,25 +475,21 @@ def _stamp_thinking(message: Message, provider_id: str) -> Message:
     return message.model_copy(update={"content": blocks})
 
 
+def _check_length(value: str, label: str, max_chars: int) -> None:
+    if len(value) > max_chars:
+        raise ValueError(f"'{label}' is too long ({len(value)} chars, maximum is {max_chars})")
+
+
 def _require_text(value: str | None, label: str, max_chars: int) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"'{label}' must be a non-empty string")
-    if len(value) > max_chars:
-        raise ValueError(f"'{label}' is too long ({len(value)} chars, maximum is {max_chars})")
+    _check_length(value, label, max_chars)
     return value
 
 
-def _check_resume_args(
-    state: RunState,
-    *,
-    answer: str | None,
-    approved: bool | None,
-    user_input: str | None,
-    recover: bool,
-    pending_id: str | None,
-    max_chars: int,
-) -> None:
+def _check_resume_args(state: RunState, args: _ResumeInput, max_chars: int) -> None:
     status = state.status
+    answer, approved, user_input, pending_id = args.answer, args.approved, args.user_input, args.pending_id
     if status.is_waiting:
         if pending_id is None or pending_id != state.pending_id:
             raise InvalidStateError(
@@ -553,10 +499,10 @@ def _check_resume_args(
     elif pending_id is not None:
         raise InvalidStateError(f"'pending_id' is only allowed while the run is waiting, got '{status}'")
     for label, value in (("answer", answer), ("user_input", user_input)):
-        if value is not None and len(value) > max_chars:
-            raise ValueError(f"'{label}' is too long ({len(value)} chars, maximum is {max_chars})")
+        if value is not None:
+            _check_length(value, label, max_chars)
     if status is RunStatus.RUNNING:
-        if not recover:
+        if not args.recover:
             raise InvalidStateError(
                 "Run has status 'running': it is either still running or crashed. "
                 "Only resume after a crash with recover=True."
@@ -564,7 +510,7 @@ def _check_resume_args(
         if answer is not None or approved is not None or user_input is not None:
             raise InvalidStateError("recover=True does not allow additional arguments")
         return
-    if recover:
+    if args.recover:
         raise InvalidStateError(f"recover=True is only allowed when status is 'running', got '{status}'")
     if status is RunStatus.WAITING_FOR_INPUT:
         _require_text(answer, "answer", max_chars)
@@ -601,6 +547,8 @@ class _Run:
         self.agent = agent
         self.state = state
         self.output_model = output_model
+        # From the model itself: a resumed run was checked against the stored schema, a new one is bound after setup.
+        self.output_schema = output_model.model_json_schema() if output_model is not None else None
         self._stream_sink = stream_sink
         self._output_tier = self._pick_output_tier()
         tools = agent.tools
@@ -626,7 +574,7 @@ class _Run:
     def _build_output_instructions(self) -> str:
         """The system prompt suffix for the prompt and tool tiers (built once: the schema never changes in a run)."""
         if self._output_tier == "prompt":
-            schema_json = json.dumps(self.state.output_schema, indent=2)
+            schema_json = json.dumps(self.output_schema, indent=2)
             return f"\n\nYou must return a valid JSON object matching this schema:\n{schema_json}\nOutput JSON only."
         if self._output_tier == "tool":
             return (
@@ -702,7 +650,7 @@ class _Run:
             await self._save()  # run is now visible and recoverable after a crash
             await self._loop()
 
-    async def resume_body(self, *, answer: str | None, approved: bool | None, user_input: str | None) -> None:
+    async def resume_body(self, args: _ResumeInput) -> None:
         state = self.state
         previous = state.status
         batch = state.pending
@@ -721,38 +669,26 @@ class _Run:
             # Completed results are preserved; only genuinely interrupted calls are marked "unknown"
             state.close_open_tool_calls(INTERRUPTED, known=state.batch_done)
             state.batch_done = ()
-            await self._loop()
-            return
-
-        if batch is not None:
-            if not await self._resolve_waiting(batch.waiting, answer=answer, approved=approved, rest=batch.remaining):
+        elif batch is not None:
+            if not await self._resolve_waiting(batch.waiting, args, rest=batch.remaining):
                 return
-            if await self._finish_if_output_submitted():
+            if await self._finish_if_output_submitted() or await self._run_batch(batch.remaining):
                 return
-            if await self._run_batch(batch.remaining):
-                return
-            await self._loop()
-            return
-
-        if user_input is not None and not await self._accept_user_text(user_input):
+        elif args.user_input is not None and not await self._accept_user_text(args.user_input):
             return
         await self._loop()
 
-    async def _resolve_waiting(
-        self, waiting: PendingCall, *, answer: str | None, approved: bool | None, rest: Sequence[ToolCall]
-    ) -> bool:
+    async def _resolve_waiting(self, waiting: PendingCall, args: _ResumeInput, *, rest: Sequence[ToolCall]) -> bool:
         """Resolves the waiting tool call. Returns False if the run ended or paused again."""
-        call_id = waiting.call.id
+        call_id, answer = waiting.call.id, args.answer
         if waiting.kind == "input":
             assert answer is not None  # verified by _check_resume_args
-            decision = await self.agent.hooks.on_user_input(self.state, answer)
-            if decision.action is Action.BLOCK:
-                await self._finish(RunStatus.BLOCKED, decision.reason)
+            if await self._blocked(await self.agent.hooks.on_user_input(self.state, answer)):
                 return False
             self._record(ToolResult(call_id=call_id, content=answer))
             return True
 
-        if approved:
+        if args.approved:
             outcome = await self.executor.execute(waiting.call, self.state, approved=True)
             if isinstance(outcome, PendingCall):
                 await self._pause(outcome, rest)
@@ -781,7 +717,7 @@ class _Run:
             specs = self._specs
             request = await agent.context.build(state, specs)
             if self._output_tier == "native":
-                request = request.model_copy(update={"output_schema": state.output_schema})
+                request = request.model_copy(update={"output_schema": self.output_schema})
             elif self._output_instructions:
                 request = request.model_copy(update={"system": request.system + self._output_instructions})
 
@@ -792,9 +728,7 @@ class _Run:
                     f"Context too large (approx. {size} chars, limit {agent.limits.max_context_chars})",
                 )
                 return
-            decision = await agent.hooks.before_model(state, request)
-            if decision.action is Action.BLOCK:
-                await self._finish(RunStatus.BLOCKED, decision.reason)
+            if await self._blocked(await agent.hooks.before_model(state, request)):
                 return
 
             await self.emit(EventType.MODEL_REQUEST, {"messages": len(request.messages), "tools": len(specs)})
@@ -820,8 +754,7 @@ class _Run:
             state.add_assistant(_stamp_thinking(response.message, provider_id))
 
             decision = await agent.hooks.after_model(state, response)
-            if decision.action is Action.BLOCK:
-                await self._finish(RunStatus.BLOCKED, decision.reason)
+            if await self._blocked(decision):
                 return
             if decision.action is Action.RETRY:
                 if not await self._reject(decision.reason or "Response not accepted"):
@@ -851,25 +784,31 @@ class _Run:
                     return
                 continue
             else:
-                if self.output_model is not None:
-                    raw_json = _extract_json_text(response.message.text or "")
-                    try:
-                        validated = self.output_model.model_validate_json(raw_json)
-                    except ValidationError as exc:
-                        reason = describe_validation(exc, root="(root)")
-                        hint = (
-                            f"Call the '{FINAL_OUTPUT_TOOL_NAME}' tool with the structured output."
-                            if self._output_tier == "tool"
-                            else f"Output must be a valid JSON object matching the required schema: {reason}"
-                        )
-                        if not await self._reject(f"Final output could not be validated: {hint}"):
-                            return
-                        continue
-                    self.state.set_output(validated)
+                problem = self._accept_final_text(response.message.text or "")
+                if problem is not None:
+                    if not await self._reject(problem):
+                        return
+                    continue
                 await self._finish(RunStatus.DONE)
                 return
 
             await self._checkpoint()
+
+    def _accept_final_text(self, text: str) -> str | None:
+        """Stores the structured output found in a final text answer. Returns why it was rejected, or None."""
+        if self.output_model is None:
+            return None
+        try:
+            validated = self.output_model.model_validate_json(_extract_json_text(text))
+        except ValidationError as exc:
+            if self._output_tier == "tool":
+                hint = f"Call the '{FINAL_OUTPUT_TOOL_NAME}' tool with the structured output."
+            else:
+                reason = describe_validation(exc, root="(root)")
+                hint = f"Output must be a valid JSON object matching the required schema: {reason}"
+            return f"Final output could not be validated: {hint}"
+        self.state.set_output(validated)
+        return None
 
     async def _run_batch(self, calls: Sequence[ToolCall]) -> bool:
         """Executes tool calls sequentially. Returns True if the run was paused or finished.
@@ -941,11 +880,16 @@ class _Run:
         return True
 
     async def _accept_user_text(self, text: str) -> bool:
-        decision = await self.agent.hooks.on_user_input(self.state, text)
-        if decision.action is Action.BLOCK:
-            await self._finish(RunStatus.BLOCKED, decision.reason)
+        if await self._blocked(await self.agent.hooks.on_user_input(self.state, text)):
             return False
         self.state.add_user_text(text)
+        return True
+
+    async def _blocked(self, decision: Decision) -> bool:
+        """Ends the run as `blocked` if a hook said so."""
+        if decision.action is not Action.BLOCK:
+            return False
+        await self._finish(RunStatus.BLOCKED, decision.reason)
         return True
 
     # ------------------------------------------------------------ Completion
