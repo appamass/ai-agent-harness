@@ -78,16 +78,14 @@ class Agent:
         else:
             raise ConfigError("Agent.create: provider must be a ModelRouter, ModelProvider, or async callable")
         context = system_prompt if isinstance(system_prompt, ContextBuilder) else ContextBuilder(system_prompt)
-        registry = tools if isinstance(tools, ToolRegistry) else ToolRegistry(tools)
-        pipeline = hooks if isinstance(hooks, HookPipeline) else HookPipeline(hooks)
         return cls(
             name=name,
             router=router,
             context=context,
-            tools=registry,
+            tools=ToolRegistry.of(tools),
             autonomy=autonomy,
             allowed_tools=frozenset(allowed_tools) if allowed_tools is not None else None,
-            hooks=pipeline,
+            hooks=HookPipeline.of(hooks),
             events=events if events is not None else EventBus(),
             checkpoints=checkpoints,
             limits=limits if limits is not None else Limits(),

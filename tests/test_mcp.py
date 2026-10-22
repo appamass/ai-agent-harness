@@ -793,3 +793,12 @@ def test_content_that_is_not_text_is_returned_as_json() -> None:
     result = run_sync(_call_first(tools))
 
     assert "image/png" in str(result) and "AAAA" in str(result)  # not silently an empty string
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0])
+def test_mcp_timeouts_must_be_finite_positive_numbers(value: float) -> None:
+    transport = InMemoryMCPTransport(MockMCPServer("mock"))
+    with pytest.raises(ConfigError, match="timeout_s"):
+        MCPServerConfig(server_name="mock", transport=transport, tool_risks={}, timeout_s=value)
+    with pytest.raises(ConfigError, match="connect_timeout_s"):
+        MCPServerConfig(server_name="mock", transport=transport, tool_risks={}, connect_timeout_s=value)

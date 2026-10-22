@@ -20,18 +20,17 @@ import contextlib
 import json
 import logging
 import os
-import re
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol, cast
+from typing import Any, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from .._version import __version__
 from ..core.errors import ConfigError, ToolError
 from ..core.state import RunState
-from ..core.types import ID_PATTERN, Risk, ToolSpec, TruncationMode
-from .base import BaseTool, canonical_digest, check_truncation_mode
+from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, is_positive_number, sanitize_id
+from .base import BaseTool, canonical_digest, check_truncation_mode, make_tool
 
 log = logging.getLogger("ai_agent_harness.mcp")
 
@@ -152,14 +151,16 @@ class InMemoryMCPTransport:
     async def connect(self) -> None:
         self.connected = True
 
-    async def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+    def _ensure_open(self) -> None:
         if not self.connected or self.closed:
             raise ToolError("InMemoryMCPTransport is not connected or already closed")
+
+    async def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        self._ensure_open()
         return await self.server.handle_request(method, params)
 
     async def send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
-        if not self.connected or self.closed:
-            raise ToolError("InMemoryMCPTransport is not connected or already closed")
+        self._ensure_open()
         await self.server.handle_notification(method, params)
 
     def set_notification_handler(self, handler: Callable[[str], None]) -> None:
@@ -167,6 +168,10 @@ class InMemoryMCPTransport:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+def _closed_error() -> ToolError:
+    return ToolError("MCP transport closed")
 
 
 STOP_TIMEOUT_S = 5.0
@@ -283,7 +288,7 @@ class StdioMCPTransport:
                         # a single odd message must not take the connection down
                         log.warning("MCP stdio reader skipped a message (%s)", type(exc).__name__)
         except asyncio.CancelledError:
-            error = ToolError("MCP transport closed")
+            error = _closed_error()
             raise
         finally:
             self._broken = error
@@ -351,7 +356,7 @@ class StdioMCPTransport:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params or {}})
 
     async def aclose(self) -> None:
-        error = ToolError("MCP transport closed")
+        error = _closed_error()
         self._broken = self._broken or error
         self._fail_pending(error)
         if self._proc is not None:
@@ -465,14 +470,12 @@ class MCPClient:
 
         is_error = bool(res.get("isError", False))
         content_obj = res.get("content", [])
-        text_parts: list[str] = []
-        if isinstance(content_obj, list):
-            content_list = cast(list[object], content_obj)
-            for block_obj in content_list:
-                if isinstance(block_obj, dict):
-                    block = cast(dict[str, Any], block_obj)
-                    if block.get("type") == "text":
-                        text_parts.append(str(block.get("text", "")))
+        blocks = cast(list[object], content_obj) if isinstance(content_obj, list) else []
+        text_parts = [
+            str(block.get("text", ""))
+            for block in (cast(dict[str, Any], b) for b in blocks if isinstance(b, dict))
+            if block.get("type") == "text"
+        ]
         result_text = "\n".join(text_parts) if text_parts else json.dumps(content_obj)
 
         if is_error:
@@ -539,15 +542,15 @@ class MCPServerConfig:
     """Largest accepted message of a `command` server."""
 
     def __post_init__(self) -> None:
-        if not re.fullmatch(ID_PATTERN, self.server_name):
+        if not ID_RE.fullmatch(self.server_name):
             raise ConfigError(f"MCPServerConfig: server_name must match {ID_PATTERN}, got {self.server_name!r}")
         if (self.command is None) == (self.transport is None):
             raise ConfigError("MCPServerConfig: provide either 'command' or 'transport', not both")
-        if self.timeout_s <= 0:
+        if not is_positive_number(self.timeout_s):
             raise ConfigError("MCPServerConfig: timeout_s must be > 0")
         if self.truncation_mode is not None:
             check_truncation_mode(self.truncation_mode, "MCPServerConfig")
-        if self.connect_timeout_s <= 0:
+        if not is_positive_number(self.connect_timeout_s):
             raise ConfigError("MCPServerConfig: connect_timeout_s must be > 0")
         if self.env is not None and self.command is None:
             raise ConfigError("MCPServerConfig: 'env' only applies to a 'command' server")
@@ -562,31 +565,30 @@ def _build_mcp_tool(
     input_model: type[BaseModel],
     risk: Risk,
 ) -> BaseTool[BaseModel]:
-    # Class bodies read these names before they assign their own attributes of the same name
-    server_tool_name, model, tool_risk, raw_schema = definition.name, input_model, risk, definition.input_schema
+    def spec(cls: type[BaseTool[BaseModel]]) -> ToolSpec:
+        # The model sees the server's real schema (enums, bounds, nesting); the local model is only a pre-check
+        return ToolSpec(name=cls.name, description=cls.description, input_schema=definition.input_schema)
 
-    class _MCPToolInstance(BaseTool[BaseModel]):
-        name: ClassVar[str] = exposed_name
-        description: ClassVar[str] = definition.description or f"MCP tool {server_tool_name}"
-        input_model: ClassVar[type[BaseModel]] = model
-        risk: ClassVar[Risk] = tool_risk
-        timeout_s: ClassVar[float] = config.timeout_s
-        untrusted_output: ClassVar[bool] = config.untrusted_output
-        strict_schema: ClassVar[bool] = False  # the server's schema is arbitrary; the server validates
-        max_result_chars: ClassVar[int | None] = config.max_result_chars
-        truncation_mode: ClassVar[TruncationMode | None] = config.truncation_mode
+    async def run(self: BaseTool[BaseModel], args: BaseModel, state: RunState) -> str:
+        # Only what the model set: omitted optional parameters must not arrive at the server as invented nulls
+        return await client.call_tool(definition.name, args.model_dump(mode="json", exclude_unset=True))
 
-        @classmethod
-        def spec(cls) -> ToolSpec:
-            # The model sees the server's real schema (enums, bounds, nesting); the local model is only a pre-check
-            return ToolSpec(name=cls.name, description=cls.description, input_schema=raw_schema)
-
-        async def run(self, args: BaseModel, state: RunState) -> str:
-            # Only what the model set: omitted optional parameters must not arrive at the server as invented nulls
-            return await client.call_tool(server_tool_name, args.model_dump(mode="json", exclude_unset=True))
-
-    _MCPToolInstance.validate_definition()
-    return _MCPToolInstance()
+    return make_tool(
+        BaseTool[BaseModel],
+        "_MCPToolInstance",
+        __module__=__name__,
+        name=exposed_name,
+        description=definition.description or f"MCP tool {definition.name}",
+        input_model=input_model,
+        risk=risk,
+        timeout_s=config.timeout_s,
+        untrusted_output=config.untrusted_output,
+        strict_schema=False,  # the server's schema is arbitrary; the server validates
+        max_result_chars=config.max_result_chars,
+        truncation_mode=config.truncation_mode,
+        spec=classmethod(spec),
+        run=run,
+    )
 
 
 def mcp_tool_digest(definition: MCPToolDefinition) -> str:
@@ -665,6 +667,21 @@ async def load_mcp_tools(
         raise
 
 
+def _check_pin(config: MCPServerConfig, tool_def: MCPToolDefinition) -> None:
+    if config.tool_digests is None:
+        return
+    if tool_def.name not in config.tool_digests:
+        raise ConfigError(
+            f"MCP tool '{tool_def.name}' from server '{config.server_name}' is not in pinned tool_digests."
+        )
+    expected, actual = config.tool_digests[tool_def.name], mcp_tool_digest(tool_def)
+    if actual != expected:
+        raise ConfigError(
+            f"MCP tool '{tool_def.name}' from server '{config.server_name}' failed hash verification: "
+            f"expected {expected}, got {actual}. Description or schema was mutated."
+        )
+
+
 def _wrap_tools(
     config: MCPServerConfig, client: MCPClient, raw_tools: Sequence[MCPToolDefinition]
 ) -> list[BaseTool[BaseModel]]:
@@ -680,22 +697,11 @@ def _wrap_tools(
         tool_risk = config.tool_risks[tool_def.name]
 
         # 2. Rug-pull digest verification of the raw definition, if pinned
-        if config.tool_digests is not None:
-            if tool_def.name not in config.tool_digests:
-                raise ConfigError(
-                    f"MCP tool '{tool_def.name}' from server '{config.server_name}' is not in pinned tool_digests."
-                )
-            expected_digest = config.tool_digests[tool_def.name]
-            actual_digest = mcp_tool_digest(tool_def)
-            if actual_digest != expected_digest:
-                raise ConfigError(
-                    f"MCP tool '{tool_def.name}' from server '{config.server_name}' failed hash verification: "
-                    f"expected {expected_digest}, got {actual_digest}. Description or schema was mutated."
-                )
+        _check_pin(config, tool_def)
 
         # 3. Derive exposed name and input model, construct the BaseTool subclass
         # Server names may contain characters tool names cannot (`github.search`): map them, call by the original
-        exposed_name = f"{config.name_prefix or ''}{re.sub(r'[^A-Za-z0-9_-]', '_', tool_def.name)}"
+        exposed_name = f"{config.name_prefix or ''}{sanitize_id(tool_def.name)}"
         model_name = f"MCP_{config.server_name}_{tool_def.name}_Input"
         if exposed_name in exposed:
             raise ConfigError(f"MCP server '{config.server_name}': two tools map to the name '{exposed_name}'")

@@ -32,9 +32,8 @@ from typing import Final, Protocol
 
 from .core.errors import ConcurrencyError, ConfigError, InvalidStateError
 from .core.state import RunState, RunStatus, restore_state
-from .core.types import ID_PATTERN
+from .core.types import ID_RE
 
-_ID = re.compile(ID_PATTERN)
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 DEFAULT_TABLE: Final = "ai_agent_harness_checkpoints"
@@ -116,7 +115,7 @@ def status_index_name(table: str) -> str:
 
 
 def check_tenant_id(tenant_id: str) -> None:
-    if not _ID.fullmatch(tenant_id):
+    if not ID_RE.fullmatch(tenant_id):
         raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
 
 
@@ -127,7 +126,7 @@ def check_list_limit(limit: int) -> None:
 
 def check_ids(tenant_id: str, run_id: str) -> None:
     for label, value in (("tenant_id", tenant_id), ("run_id", run_id)):
-        if not _ID.fullmatch(value):
+        if not ID_RE.fullmatch(value):
             raise ValueError(f"Invalid {label}: {value!r}")
 
 

@@ -42,7 +42,7 @@ import logging
 import time
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
@@ -51,9 +51,18 @@ from ..core.errors import ConcurrencyError, ConfigError, InvalidStateError, Prov
 from ..core.events import Event, EventType
 from ..core.hooks import Action, Decision
 from ..core.state import CONTINUE_PROMPT, PendingBatch, PendingCall, RunState, RunStatus
-from ..core.types import FINAL_OUTPUT_TOOL_NAME, Message, Risk, StopReason, ThinkingBlock, ToolCall, ToolResult
+from ..core.types import (
+    FINAL_OUTPUT_TOOL_NAME,
+    Message,
+    Risk,
+    StopReason,
+    ThinkingBlock,
+    ToolCall,
+    ToolResult,
+    is_positive_number,
+)
 from ..providers.base import StreamDelta
-from ..tools.base import BaseTool
+from ..tools.base import BaseTool, make_tool
 from ..tools.executor import ToolExecutor, describe_validation
 from .agent import Agent
 
@@ -89,9 +98,9 @@ class _StreamSink:
     """
 
     def __init__(self, queue_size: int, idle_timeout_s: float) -> None:
-        if isinstance(queue_size, bool) or not isinstance(queue_size, int) or queue_size < 1:
+        if not is_positive_number(queue_size, integer=True):
             raise ConfigError("queue_size must be a positive integer")
-        if isinstance(idle_timeout_s, bool) or not isinstance(idle_timeout_s, int | float) or idle_timeout_s <= 0:
+        if not is_positive_number(idle_timeout_s):
             raise ConfigError("idle_timeout_s must be > 0")
         self.queue: asyncio.Queue[StreamItem | None] = asyncio.Queue(maxsize=queue_size)
         self.idle_timeout_s = float(idle_timeout_s)
@@ -250,21 +259,24 @@ class StreamHandle:
         self._sink.cancel(self._task)
 
 
+async def _submit_output(self: BaseTool[BaseModel], args: BaseModel, state: RunState) -> str:
+    state.set_output(args)
+    return "Final output accepted."
+
+
 def _final_output_tool(model: type[BaseModel]) -> BaseTool[BaseModel]:
     """The reserved `final_output` tool: validated like any tool, executed through the gate (ADR 0023)."""
-
-    class _FinalOutputTool(BaseTool[BaseModel]):
-        name: ClassVar[str] = FINAL_OUTPUT_TOOL_NAME
-        description: ClassVar[str] = "Submit the final structured output to complete the task."
-        input_model: ClassVar[type[BaseModel]] = model
-        risk: ClassVar[Risk] = Risk.READ
-        strict_schema: ClassVar[bool] = False  # the caller's own model: any field types are fine
-
-        async def run(self, args: BaseModel, state: RunState) -> str:
-            state.set_output(args)
-            return "Final output accepted."
-
-    return _FinalOutputTool()
+    return make_tool(
+        BaseTool[BaseModel],
+        "_FinalOutputTool",
+        __module__=__name__,
+        name=FINAL_OUTPUT_TOOL_NAME,
+        description="Submit the final structured output to complete the task.",
+        input_model=model,
+        risk=Risk.READ,
+        strict_schema=False,  # the caller's own model: any field types are fine
+        run=_submit_output,
+    )
 
 
 def _extract_json_text(text: str) -> str:
@@ -685,7 +697,7 @@ class _Run:
             assert answer is not None  # verified by _check_resume_args
             if await self._blocked(await self.agent.hooks.on_user_input(self.state, answer)):
                 return False
-            self._record(ToolResult(call_id=call_id, content=answer))
+            self.state.record_result(ToolResult(call_id=call_id, content=answer))
             return True
 
         if args.approved:
@@ -701,7 +713,7 @@ class _Run:
             decision = await self.agent.hooks.on_user_input(self.state, answer)
             if decision.action is Action.CONTINUE:
                 note = f"Approval was denied. Comment: {answer}"
-        self._record(ToolResult(call_id=call_id, content=note, is_error=True))
+        self.state.record_result(ToolResult(call_id=call_id, content=note, is_error=True))
         return True
 
     # ------------------------------------------------------------ Loop
@@ -854,9 +866,6 @@ class _Run:
             return False
         await self._finish(RunStatus.DONE)
         return True
-
-    def _record(self, result: ToolResult) -> None:
-        self.state.batch_done = (*self.state.batch_done, result)
 
     async def _reject(self, reason: str) -> bool:
         """Rejects the last response with feedback. Returns False if retry limit reached (run finished)."""

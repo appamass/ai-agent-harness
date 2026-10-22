@@ -31,6 +31,11 @@ class ToolRegistry:
         if unknown:
             raise ConfigError(f"Pinned digests for tools that are not registered: {', '.join(unknown)}")
 
+    @classmethod
+    def of(cls, tools: ToolRegistry | Iterable[BaseTool[Any]]) -> ToolRegistry:
+        """The registry itself, or a new one holding `tools`."""
+        return tools if isinstance(tools, ToolRegistry) else cls(tools)
+
     def register(self, tool: BaseTool[Any]) -> None:
         if not isinstance(tool, BaseTool):
             raise ConfigError(f"{tool!r} is not a BaseTool")

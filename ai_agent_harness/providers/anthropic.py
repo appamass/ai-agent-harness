@@ -42,6 +42,7 @@ from ..core.types import (
     ToolCall,
     ToolResult,
     Usage,
+    sanitize_id,
 )
 from .base import (
     EMPTY_RESPONSE_NOTE,
@@ -67,7 +68,6 @@ _STOP_REASONS: Final[dict[str, StopReason]] = {
     "refusal": StopReason.REFUSAL,
 }  # everything else (end_turn, stop_sequence, pause_turn, unknown values) ends the turn
 _ERROR_TYPE = re.compile(r"[a-z_]{1,64}")
-_UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]")
 
 
 class AnthropicProvider:
@@ -246,7 +246,7 @@ def _to_api_block(block: Block) -> dict[str, Any] | None:
 
 def _api_id(value: str) -> str:
     """The API accepts only [A-Za-z0-9_-] in tool call IDs; IDs from another provider (failover) may not conform."""
-    return _UNSAFE_ID.sub("_", value)
+    return sanitize_id(value)
 
 
 def _thinking_block(block: ThinkingBlock) -> dict[str, Any] | None:

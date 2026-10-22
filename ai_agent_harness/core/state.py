@@ -31,7 +31,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .errors import InvalidStateError, ProtocolError, SchemaVersionError
-from .types import ID_PATTERN, Block, Message, TextBlock, ToolCall, ToolResult, Usage
+from .types import ID_PATTERN, Block, Message, TextBlock, ToolCall, ToolResult, Usage, is_positive_number
 
 CONTINUE_PROMPT = (
     "Your response was truncated due to the length limit. Continue from the exact point where you stopped."
@@ -210,6 +210,15 @@ class RunState(BaseModel):
             raise InvalidStateError(f"Run has no structured output (status: {self.status})")
         return model.model_validate(self.output)
 
+    @classmethod
+    def standalone(cls) -> RunState:
+        """A throwaway state for bricks used outside a run (`ToolExecutor`, `HookPipeline`)."""
+        return cls(agent_name="standalone")
+
+    def record_result(self, result: ToolResult) -> None:
+        """Adds a finished result of the current batch (persisted in the checkpoint before the batch ends)."""
+        self.batch_done = (*self.batch_done, result)
+
     def clear_output(self) -> None:
         """Drops the structured output of an earlier turn before the run continues."""
         self.output = None
@@ -353,7 +362,7 @@ def restore_state(raw: str | bytes, *, tenant_id: str | None = None, run_id: str
         raise SchemaVersionError("Saved state is not a JSON object")
     fields = cast("dict[str, Any]", data)
     version = fields.get("schema_version", 1)  # states before schema versioning = version 1
-    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+    if not is_positive_number(version, integer=True):
         raise SchemaVersionError(f"Invalid schema version: {version!r}")
     if version > SCHEMA_VERSION:
         raise SchemaVersionError(

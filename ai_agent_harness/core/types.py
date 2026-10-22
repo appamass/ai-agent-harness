@@ -10,6 +10,8 @@ so typos in adapters fail immediately.
 from __future__ import annotations
 
 import json
+import math
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
@@ -17,6 +19,23 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 """Allowed format for tool names, run IDs, and tenant IDs (safe for filenames and APIs)."""
+ID_RE = re.compile(ID_PATTERN)
+_NOT_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def sanitize_id(value: str) -> str:
+    """Replaces every character an ID may not contain with `_` (the length is not changed)."""
+    return _NOT_ID_CHARS.sub("_", value)
+
+
+def is_positive_number(value: object, *, integer: bool = False) -> bool:
+    """True for a finite number > 0 (an `int` when `integer`). Bools are ints in Python and are rejected."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    if isinstance(value, float):  # ints are always finite (and `math.isfinite` would overflow on huge ones)
+        return not integer and math.isfinite(value) and value > 0
+    return value > 0
+
 
 TruncationMode = Literal["head_and_tail", "head"]
 """How an oversized tool result is cut: keep head and tail, or only the head."""

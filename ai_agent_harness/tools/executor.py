@@ -51,9 +51,9 @@ class ToolExecutor:
         max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
         truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE,
     ) -> None:
-        self._registry = registry if isinstance(registry, ToolRegistry) else ToolRegistry(registry)
+        self._registry = ToolRegistry.of(registry)
         self._policy = policy if policy is not None else PermissionPolicy()
-        self._hooks = hooks if isinstance(hooks, HookPipeline) else HookPipeline(hooks)
+        self._hooks = HookPipeline.of(hooks)
         self._emit = emit or noop_emit
         check_truncation_mode(truncation_mode, "ToolExecutor")
         self._max_result_chars = max_result_chars
@@ -64,14 +64,14 @@ class ToolExecutor:
         return [t for t in self._registry if self._policy.check(t.name, t.risk) is not Verdict.DENY]
 
     async def execute(self, call: ToolCall, state: RunState | None = None, *, approved: bool = False) -> ToolOutcome:
-        active_state = state if state is not None else RunState(agent_name="standalone")
+        active_state = state if state is not None else RunState.standalone()
 
         def error(message: str) -> ToolResult:
             return ToolResult(call_id=call.id, content=message, is_error=True)
 
         def fail(message: str) -> ToolResult:
             result = error(message)
-            active_state.batch_done = (*active_state.batch_done, result)
+            active_state.record_result(result)
             return result
 
         # 1. Look up tool
@@ -163,12 +163,12 @@ class ToolExecutor:
             decision = await self._hooks.after_tool(state, invocation, result)
         except asyncio.CancelledError:
             withheld = f"'{invocation.tool_name}' was executed, post-check (after_tool) cancelled — result withheld."
-            state.batch_done = (*state.batch_done, ToolResult(call_id=result.call_id, content=withheld, is_error=True))
+            state.record_result(ToolResult(call_id=result.call_id, content=withheld, is_error=True))
             raise
         if decision.action is Action.BLOCK:
             withheld = f"Result withheld: {decision.reason}"
             result = ToolResult(call_id=result.call_id, content=withheld, is_error=True)
-        state.batch_done = (*state.batch_done, result)
+        state.record_result(result)
         if decision.action is Action.BLOCK:
             await self._emit(EventType.TOOL_BLOCKED, {"tool": invocation.tool_name, "source": "after_tool"})
         await self._emit(EventType.TOOL_FINISHED, {"tool": invocation.tool_name, "is_error": result.is_error})
