@@ -6,7 +6,7 @@ If you are contributing code to *this* repository, the commands and working rule
 ## Three Ways to Adopt This Repository
 
 1. **Use (Dependency):** Pin a release tag ([install line](README.md#install)). Best when building pure Python services that need crash-safe runs, human approval, and fail-closed guardrails. We deliberately do not publish to PyPI ([ADR 0013](docs/adr/0013-package-distribution.md)).
-2. **Copy (Standalone Bricks):** Use or copy individual bricks (they work without `Agent`; copy them together with `core/` and `policy.py`) ([ADR 0019](docs/adr/0019-modular-bricks-and-security-guards.md)). For example: `ToolExecutor` (the 8-step gate), `@tool(risk=…)` (risk-typed functions), `SecretGuard` / `EgressGuard` / `WeakeningGuard`, or `PostgresCheckpointStore`.
+2. **Copy (Standalone Bricks):** Use or copy individual bricks (they work without `Agent`; copy them together with `core/` and `policy.py`; stores also need `persistence.py` and `persistence_sql.py`) ([ADR 0019](docs/adr/0019-modular-bricks-and-security-guards.md)). For example: `ToolExecutor` (the 8-step gate), `@tool(risk=…)` (risk-typed functions), `SecretGuard` / `EgressGuard` / `WeakeningGuard`, or `PostgresCheckpointStore`.
 3. **Rebuild (Invariants in Your Stack):** Re-implement our core guarantees inside LangGraph, Pydantic AI, or your own loop using [`ai-kit/`](ai-kit/skills/ai-agent-harness/SKILL.md).
 
 ## Non-Negotiable Invariants to Preserve

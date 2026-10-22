@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from typing import ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
@@ -602,3 +602,13 @@ async def test_the_provider_deadline_still_applies_after_a_slow_consumer() -> No
 
     with pytest.raises(ProviderError, match="timed out"):
         await asyncio.wait_for(router.stream(_REQUEST, on_delta=slow), timeout=5)
+
+
+def test_fake_provider_refuses_a_bare_delta_as_a_script_item() -> None:
+    with pytest.raises(TypeError, match="Streamed"):
+        FakeProvider([cast(Any, StreamDelta(text="x"))])  # a typo a type checker would catch
+
+
+def test_streamed_refuses_an_unexpected_item() -> None:
+    with pytest.raises(TypeError, match="str"):
+        Streamed(cast(Any, "text"))

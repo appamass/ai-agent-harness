@@ -87,7 +87,10 @@ class SqliteCheckpointStore:
 
         if connection is not None:
             if connection.in_transaction:
-                raise ConfigError("SqliteCheckpointStore: pass the connection before it has an open transaction")
+                raise ConfigError(
+                    "SqliteCheckpointStore: the borrowed connection has an open transaction; pass it before you open "
+                    "one, and not with autocommit=False (WAL mode cannot be set inside a transaction)"
+                )
             self._connection = connection
             self._apply_pragmas()  # may wait up to busy_timeout_ms for another process's write lock
         else:

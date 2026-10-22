@@ -19,6 +19,9 @@ class Streamed:
     """One scripted call that streams exactly these items in order; a scripted exception is raised where it stands."""
 
     def __init__(self, *items: StreamDelta | ModelResponse | BaseException) -> None:
+        for item in items:
+            if not isinstance(item, StreamDelta | ModelResponse | BaseException):
+                raise TypeError(f"Streamed: unexpected item {type(item).__name__}")
         self.items = items
 
 

@@ -78,7 +78,7 @@ def test_the_readme_demo_transcript_matches_the_real_demo(
         position = real.index(line, position) + 1
 
 
-PIN = re.compile(r"ai-agent-harness@v(\d+\.\d+\.\d+)|`@v(\d+\.\d+\.\d+)`")
+PIN = re.compile(r"ai-agent-harness(?:\.git)?@v(\d+\.\d+\.\d+)|@v(\d+\.\d+\.\d+)\b")
 RELEASE = re.compile(r"^## (\d+\.\d+\.\d+) – ", re.MULTILINE)
 
 
@@ -96,7 +96,8 @@ def test_every_release_pin_names_the_newest_release() -> None:
 
 
 INVARIANT_ITEM = re.compile(r"^(\d+)\. \*\*", re.MULTILINE)
-INVARIANT_CITE = re.compile(r"\binvariants? (\d+)", re.IGNORECASE)
+INVARIANT_CITE = re.compile(r"\binvariants?\s+#?(\d+(?:\s*(?:,|and|or)\s*#?\d+)*)", re.IGNORECASE)
+NUMBER = re.compile(r"\d+")
 
 
 def test_cited_invariants_exist_and_the_lists_agree() -> None:
@@ -106,6 +107,19 @@ def test_cited_invariants_exist_and_the_lists_agree() -> None:
     skill = (REPO_ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "SKILL.md").read_text(encoding="utf-8")
     skill_section = skill.split("Non-Negotiable Invariants", 1)[1].split("\n## ", 1)[0]
     assert len(INVARIANT_ITEM.findall(skill_section)) == count  # the copyable kit keeps the same list
-    files = [*REPO_ROOT.glob("docs/**/*.md"), *REPO_ROOT.glob("tests/*.py"), *REPO_ROOT.glob("ai-kit/**/*.md")]
-    cited = {(f.name, int(n)) for f in files for n in INVARIANT_CITE.findall(f.read_text(encoding="utf-8"))}
+    assert f"The {count} Non-Negotiable Invariants" in skill and f"respect the {count} invariants" in skill
+    files = [
+        REPO_ROOT / "README.md",
+        *REPO_ROOT.glob("docs/**/*.md"),
+        *REPO_ROOT.glob("ai-kit/**/*.md"),
+        *REPO_ROOT.glob("tests/*.py"),
+        *REPO_ROOT.glob("ai_agent_harness/**/*.py"),
+    ]
+    cited = {
+        (f.name, int(number))
+        for f in files
+        for group in INVARIANT_CITE.findall(f.read_text(encoding="utf-8"))
+        for number in NUMBER.findall(group)
+    }
+    assert cited, "no invariant is cited anywhere"
     assert all(1 <= number <= count for _, number in cited), sorted(cited)

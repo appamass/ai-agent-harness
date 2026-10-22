@@ -263,5 +263,5 @@ def test_a_borrowed_connection_with_an_open_transaction_is_refused(tmp_path: Pat
     with closing(connection):
         connection.execute("CREATE TABLE caller (x INTEGER)")
         connection.execute("INSERT INTO caller VALUES (1)")
-        with pytest.raises(ConfigError, match="open transaction"):
+        with pytest.raises(ConfigError, match=r"open transaction.*autocommit=False"):
             SqliteCheckpointStore(connection=connection)
