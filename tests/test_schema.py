@@ -36,6 +36,8 @@ from ai_agent_harness.testing import FakeProvider, text_response
 from .conftest import assert_consistent, run_sync
 
 FIXTURE = Path(__file__).parent / "fixtures" / "checkpoint_v1_waiting_for_approval.json"
+FIXTURE_V2 = Path(__file__).parent / "fixtures" / "checkpoint_v2_waiting_for_approval.json"
+FIXTURE_V3 = Path(__file__).parent / "fixtures" / "checkpoint_v3_done_with_output.json"
 
 
 class WriteInput(BaseModel):
@@ -100,6 +102,50 @@ def test_v1_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
     reloaded = run_sync(store.load("customer-1", "fixture-v1"))
     assert reloaded is not None
     assert reloaded.model_dump() == done.model_dump()
+
+
+def test_v2_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
+    """Verifies that real v2 checkpoints load, migrate through v2->v3, and resume cleanly."""
+    (tmp_path / "customer-1").mkdir()
+    shutil.copy(FIXTURE_V2, tmp_path / "customer-1" / "fixture-v2-waiting.json")
+    store = JsonFileCheckpointStore(tmp_path)
+    state = run_sync(store.load("customer-1", "fixture-v2-waiting"))
+    assert state is not None
+    assert state.schema_version == 3
+    assert state.status is RunStatus.WAITING_FOR_APPROVAL
+
+    write = Write()
+    done = run_sync(resume(_agent(write, store), state, approved=True, pending_id=state.pending_id))
+    assert done.status is RunStatus.DONE
+    assert write.written == ["a.py"]
+    assert_consistent(done)
+    reloaded = run_sync(store.load("customer-1", "fixture-v2-waiting"))
+    assert reloaded is not None
+    assert reloaded.model_dump() == done.model_dump()
+
+
+def test_v3_fixture_keeps_its_structured_output_and_demands_the_same_model_on_resume() -> None:
+    """The v3 format added `output_schema`, `output_model_name`, and `output` (ADR 0023)."""
+    from pydantic import BaseModel
+
+    class Weather(BaseModel):
+        city: str
+        celsius: float
+
+    class Other(BaseModel):
+        value: int
+
+    state = restore_state(FIXTURE_V3.read_text(encoding="utf-8"))
+    assert state.schema_version == 3 and state.status is RunStatus.DONE
+    assert state.output_model_name == "Weather"
+    assert state.output_as(Weather) == Weather(city="customer-city", celsius=3.5)
+    assert state.output_schema == Weather.model_json_schema()
+
+    write = Write()
+    with pytest.raises(InvalidStateError, match="output_model"):
+        run_sync(resume(_agent(write), state, user_input="again"))
+    with pytest.raises(InvalidStateError, match="does not match"):
+        run_sync(resume(_agent(write), state, user_input="again", output_model=Other))
 
 
 def test_resume_refuses_a_state_from_another_schema_version() -> None:

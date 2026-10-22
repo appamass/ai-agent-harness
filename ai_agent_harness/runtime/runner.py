@@ -36,20 +36,25 @@ Status transitions:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import time
 from collections.abc import Coroutine, Sequence
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import Any, ClassVar, Literal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from ..core import state as state_schema
-from ..core.errors import ConcurrencyError, InvalidStateError, ProviderError
+from ..core.errors import ConcurrencyError, ConfigError, InvalidStateError, ProviderError
 from ..core.events import Event, EventType
 from ..core.hooks import Action
 from ..core.state import CONTINUE_PROMPT, PendingBatch, PendingCall, RunState, RunStatus
-from ..core.types import Message, StopReason, ThinkingBlock, ToolCall, ToolResult
-from ..tools.executor import ToolExecutor
+from ..core.types import FINAL_OUTPUT_TOOL_NAME, Message, Risk, StopReason, ThinkingBlock, ToolCall, ToolResult
+from ..providers.base import StreamDelta
+from ..tools.base import BaseTool
+from ..tools.executor import ToolExecutor, describe_validation
 from .agent import Agent
 
 log = logging.getLogger("ai_agent_harness.runner")
@@ -60,50 +65,257 @@ INTERRUPTED = (
 )
 
 
-async def start(
+@dataclass(frozen=True)
+class TextDelta:
+    """Incremental text chunk emitted during model streaming.
+
+    Deltas are live, unfiltered model output. `after_model` hooks and guards only see the complete
+    response afterwards, so a response they block has already been shown to the stream consumer
+    (ADR 0025). Do not forward deltas to end users when that matters.
+    """
+
+    text: str
+
+
+StreamItem = Event | TextDelta
+
+
+class _StreamSink:
+    """Bounded hand-over from the run task to the stream consumer.
+
+    While open, a full queue blocks the run (backpressure), but never longer than `idle_timeout_s`:
+    a consumer that stopped reading cancels the run instead of leaking it. Once closed, writes never
+    block, so cancellation and the `CANCELLED` checkpoint cannot hang on a full queue.
+    """
+
+    def __init__(self, queue_size: int, idle_timeout_s: float) -> None:
+        if isinstance(queue_size, bool) or not isinstance(queue_size, int) or queue_size < 1:
+            raise ConfigError("queue_size must be a positive integer")
+        if isinstance(idle_timeout_s, bool) or not isinstance(idle_timeout_s, int | float) or idle_timeout_s <= 0:
+            raise ConfigError("idle_timeout_s must be > 0")
+        self.queue: asyncio.Queue[StreamItem | None] = asyncio.Queue(maxsize=queue_size)
+        self.idle_timeout_s = float(idle_timeout_s)
+        self.closed = False
+        self.started = False  # the run task has begun executing
+
+    def _put_nowait(self, item: StreamItem | None) -> None:
+        with contextlib.suppress(asyncio.QueueFull):
+            self.queue.put_nowait(item)
+
+    def _abandon(self) -> None:
+        """The consumer stopped reading: drop what is buffered and end its iteration."""
+        self.closed = True
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self._put_nowait(None)
+
+    async def put(self, item: StreamItem) -> None:
+        if self.closed:
+            self._put_nowait(item)
+            return
+        try:
+            self.queue.put_nowait(item)  # the common case: room left, no timer needed
+            return
+        except asyncio.QueueFull:
+            pass
+        try:
+            await asyncio.wait_for(self.queue.put(item), self.idle_timeout_s)
+        except TimeoutError:
+            self._abandon()
+            # Treated like a cancellation by `_Run.guarded`: persists `CANCELLED` and ends the task.
+            raise asyncio.CancelledError("stream consumer stopped reading") from None
+
+    async def finish(self) -> None:
+        if self.closed:
+            self._put_nowait(None)
+            return
+        try:
+            await asyncio.wait_for(self.queue.put(None), self.idle_timeout_s)
+        except TimeoutError:
+            self._abandon()
+
+
+class StreamHandle:
+    """Async iterator over run events and incremental text deltas with backpressure and cancellation support.
+
+    Iterate it, or `await` it to get the final `RunState` (unread items are discarded). Use it as `async with`
+    or call `aclose()` to stop early. A bare `break` does not stop the run: it waits for the consumer for
+    `idle_timeout_s` and is then cancelled.
+    """
+
+    def __init__(self, task: asyncio.Task[RunState], sink: _StreamSink, state: RunState) -> None:
+        self._task = task
+        self._sink = sink
+        self._state = state
+        self._closed = False
+        self._getter: asyncio.Future[StreamItem | None] | None = None  # the pending read of `_next_item`
+
+    @property
+    def state(self) -> RunState:
+        """The RunState of the execution."""
+        return self._state
+
+    def __aiter__(self) -> StreamHandle:
+        return self
+
+    async def __anext__(self) -> StreamItem:
+        if self._closed:
+            raise StopAsyncIteration
+        item = await self._next_item()
+        if item is None:
+            self._closed = True
+            if not self._task.cancelled():
+                exc = self._task.exception()
+                if exc is not None:
+                    raise exc
+            raise StopAsyncIteration
+        return item
+
+    async def _next_item(self) -> StreamItem | None:
+        """The next buffered item; None once the run task is done and everything was read.
+
+        Does not rely on the end marker alone: a closed sink may have had to drop it.
+        """
+        queue = self._sink.queue
+        while True:
+            # One getter lives across calls. It is never cancelled while an item could still reach it, so a
+            # consumer that is cancelled (a heartbeat timeout) cannot lose an item to a half-finished read.
+            if self._getter is not None and self._getter.done():
+                item = self._getter.result()
+                self._getter = None
+                return item
+            try:
+                return queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if self._task.done():  # nothing is buffered and nothing more will come
+                self._drop_getter()
+                return None
+            if self._getter is None:
+                self._getter = asyncio.ensure_future(queue.get())
+            waiting: set[asyncio.Future[Any]] = {self._getter, self._task}
+            await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+
+    def _drop_getter(self) -> None:
+        if self._getter is not None:
+            self._getter.cancel()
+            self._getter = None
+
+    async def __aenter__(self) -> StreamHandle:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        await self.aclose()
+
+    def __await__(self) -> Any:
+        return self._result().__await__()
+
+    async def _result(self) -> RunState:
+        """Waits for the run and returns its state, reading (and discarding) what nobody consumed."""
+        async for _ in self:
+            pass
+        return await self._task
+
+    async def aclose(self) -> None:
+        """Cancels the run and waits for cancellation cleanup (persisting RunStatus.CANCELLED)."""
+        if self._closed:
+            return
+        self._closed = True
+        self.cancel()
+        self._drop_getter()
+        if not self._task.done():
+            with contextlib.suppress(asyncio.CancelledError, ConcurrencyError):
+                await self._task
+
+    def done(self) -> bool:
+        """True once the run task has ended (finished, failed, or cancelled)."""
+        return self._task.done()
+
+    def cancel(self) -> None:
+        """Synchronously cancels the running task. Iteration continues until what was buffered is read."""
+        self._sink.closed = True
+        if not self._task.done() and self._sink.started:
+            self._task.cancel()
+        # else: a task cancelled before it ran would skip `guarded`; it sees `closed` when it starts
+
+
+def _final_output_tool(model: type[BaseModel]) -> BaseTool[BaseModel]:
+    """The reserved `final_output` tool: validated like any tool, executed through the gate (ADR 0023)."""
+
+    class _FinalOutputTool(BaseTool[BaseModel]):
+        name: ClassVar[str] = FINAL_OUTPUT_TOOL_NAME
+        description: ClassVar[str] = "Submit the final structured output to complete the task."
+        input_model: ClassVar[type[BaseModel]] = model
+        risk: ClassVar[Risk] = Risk.READ
+        strict_schema: ClassVar[bool] = False  # the caller's own model: any field types are fine
+
+        async def run(self, args: BaseModel, state: RunState) -> str:
+            state.set_output(args)
+            return "Final output accepted."
+
+    return _FinalOutputTool()
+
+
+def _extract_json_text(text: str) -> str:
+    """The JSON object in a model answer: everything from the first `{` to the last `}` (drops fences and prose)."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start : end + 1] if 0 <= start < end else text.strip()
+
+
+def _new_state(
     agent: Agent,
     user_input: str,
     *,
-    tenant_id: str = "default",
-    run_id: str | None = None,
-    deps: object = None,
+    tenant_id: str,
+    run_id: str | None,
+    deps: object,
+    output_model: type[BaseModel] | None,
 ) -> RunState:
-    """Starts a new run. `deps`: runtime dependencies for tools/hooks, never persisted."""
     _require_text(user_input, "user_input", agent.limits.max_input_chars)
     fields: dict[str, Any] = {"agent_name": agent.name, "tenant_id": tenant_id}
     if run_id is not None:
         fields["run_id"] = run_id
     state = RunState(**fields)
+    _bind_output(state, output_model)
     state.bind_deps(deps)
-    run = _Run(agent, state)
-    return await run.guarded(run.start_body(user_input))
+    return state
 
 
-async def resume(
+def _bind_output(state: RunState, output_model: type[BaseModel] | None) -> None:
+    """Ties a run to its `output_model` (ADR 0023). The stored schema only detects a changed model."""
+    if state.output_schema is None:
+        if output_model is not None:
+            state.output_schema = output_model.model_json_schema()
+            state.output_model_name = output_model.__name__
+        return
+    if output_model is None:
+        raise InvalidStateError(
+            f"Run requires structured output ({state.output_model_name}): pass the same output_model "
+            "again on every resume (ADR 0023)"
+        )
+    if output_model.model_json_schema() != state.output_schema:
+        raise InvalidStateError(
+            f"output_model {output_model.__name__} does not match the schema this run was started with"
+        )
+
+
+def _prepare_resume(
     agent: Agent,
     state: RunState,
     *,
-    answer: str | None = None,
-    approved: bool | None = None,
-    user_input: str | None = None,
-    recover: bool = False,
-    deps: object = None,
-    pending_id: str | None = None,
-) -> RunState:
-    """Resumes a run.
-
-    - `waiting_for_input`:    `answer` (response to the clarifying question) and `pending_id`
-    - `waiting_for_approval`: `approved` (True/False) and `pending_id`, optional `answer` as a comment
-    - finished runs:          optional `user_input` (new message); without it, only allowed
-                              when the model still owes a reply (e.g. after `failed`)
-    - `running` in checkpoint (crash): only with `recover=True`
-
-    `pending_id` is `state.pending_id` as it was shown to the human. If the run now waits for a
-    different call (another worker resumed it in the meantime), `InvalidStateError` is raised.
-    Never read it from a state you just loaded to handle a click: it must come from the request
-    the human saw (dialog or button payload), otherwise the check approves whatever is pending now.
-    `deps` are never persisted and must be passed again on every resume.
-    """
+    answer: str | None,
+    approved: bool | None,
+    user_input: str | None,
+    recover: bool,
+    deps: object,
+    pending_id: str | None,
+    output_model: type[BaseModel] | None,
+) -> None:
     if state.agent_name != agent.name:
         raise InvalidStateError(f"Run belongs to agent '{state.agent_name}', not '{agent.name}'")
     if state.schema_version != state_schema.SCHEMA_VERSION:
@@ -121,9 +333,190 @@ async def resume(
         pending_id=pending_id,
         max_chars=agent.limits.max_input_chars,
     )
+    _bind_output(state, output_model)
     state.bind_deps(deps)
-    run = _Run(agent, state)
+
+
+def _build_start(
+    agent: Agent,
+    user_input: str,
+    *,
+    tenant_id: str,
+    run_id: str | None,
+    deps: object,
+    output_model: type[BaseModel] | None,
+    sink: _StreamSink | None = None,
+) -> _Run:
+    state = _new_state(agent, user_input, tenant_id=tenant_id, run_id=run_id, deps=deps, output_model=output_model)
+    return _Run(agent, state, output_model=output_model, stream_sink=sink)
+
+
+def _build_resume(
+    agent: Agent,
+    state: RunState,
+    *,
+    answer: str | None,
+    approved: bool | None,
+    user_input: str | None,
+    recover: bool,
+    deps: object,
+    pending_id: str | None,
+    output_model: type[BaseModel] | None,
+    sink: _StreamSink | None = None,
+) -> _Run:
+    bound = (state.output_schema, state.output_model_name)
+    _prepare_resume(
+        agent,
+        state,
+        answer=answer,
+        approved=approved,
+        user_input=user_input,
+        recover=recover,
+        deps=deps,
+        pending_id=pending_id,
+        output_model=output_model,
+    )
+    try:
+        return _Run(agent, state, output_model=output_model, stream_sink=sink)
+    except BaseException:  # leave the caller's state as it was: no half-bound model, no deps kept alive
+        state.output_schema, state.output_model_name = bound
+        state.bind_deps(None)
+        raise
+
+
+def _spawn(run: _Run, body: Coroutine[Any, Any, None], sink: _StreamSink, *, new_run: bool) -> StreamHandle:
+    async def _task_body() -> RunState:
+        sink.started = True
+        try:
+            if not sink.closed:
+                return await run.guarded(body)
+            body.close()  # closed before the task ran: the body never started
+            if new_run:  # a new run has nothing to protect: it ends as `cancelled`
+                return await run.guarded(_cancelled())
+            # A resumed run was not claimed yet. Finishing it now would overwrite real results of its pending batch
+            # with "Not executed", so the state and the checkpoint stay exactly as they were.
+            run.state.bind_deps(None)
+            return run.state
+        finally:
+            await sink.finish()
+
+    return StreamHandle(asyncio.create_task(_task_body()), sink, run.state)
+
+
+async def _cancelled() -> None:
+    raise asyncio.CancelledError("stream closed before the run started")
+
+
+async def start(
+    agent: Agent,
+    user_input: str,
+    *,
+    tenant_id: str = "default",
+    run_id: str | None = None,
+    deps: object = None,
+    output_model: type[BaseModel] | None = None,
+) -> RunState:
+    """Starts a new run. `deps`: runtime dependencies for tools/hooks, never persisted.
+
+    `output_model`: the run must end with a validated instance of this Pydantic model in `state.output` (ADR 0023).
+    """
+    run = _build_start(agent, user_input, tenant_id=tenant_id, run_id=run_id, deps=deps, output_model=output_model)
+    return await run.guarded(run.start_body(user_input))
+
+
+async def resume(
+    agent: Agent,
+    state: RunState,
+    *,
+    answer: str | None = None,
+    approved: bool | None = None,
+    user_input: str | None = None,
+    recover: bool = False,
+    deps: object = None,
+    pending_id: str | None = None,
+    output_model: type[BaseModel] | None = None,
+) -> RunState:
+    """Resumes a run.
+
+    - `waiting_for_input`:    `answer` (response to the clarifying question) and `pending_id`
+    - `waiting_for_approval`: `approved` (True/False) and `pending_id`, optional `answer` as a comment
+    - finished runs:          optional `user_input` (new message); without it, only allowed
+                              when the model still owes a reply (e.g. after `failed`)
+    - `running` in checkpoint (crash): only with `recover=True`
+
+    `pending_id` is `state.pending_id` as it was shown to the human. If the run now waits for a
+    different call (another worker resumed it in the meantime), `InvalidStateError` is raised.
+    Never read it from a state you just loaded to handle a click: it must come from the request
+    the human saw (dialog or button payload), otherwise the check approves whatever is pending now.
+    `deps` are never persisted and must be passed again on every resume.
+    A run started with `output_model` needs the same `output_model` on every resume (ADR 0023).
+    """
+    run = _build_resume(
+        agent,
+        state,
+        answer=answer,
+        approved=approved,
+        user_input=user_input,
+        recover=recover,
+        deps=deps,
+        pending_id=pending_id,
+        output_model=output_model,
+    )
     return await run.guarded(run.resume_body(answer=answer, approved=approved, user_input=user_input))
+
+
+def stream_start(
+    agent: Agent,
+    user_input: str,
+    *,
+    tenant_id: str = "default",
+    run_id: str | None = None,
+    deps: object = None,
+    output_model: type[BaseModel] | None = None,
+    queue_size: int = 64,
+    idle_timeout_s: float = 300.0,
+) -> StreamHandle:
+    """Starts a new run, returning a StreamHandle that yields Events and TextDeltas.
+
+    A full queue pauses the run (backpressure). A consumer that stops reading for `idle_timeout_s`
+    cancels it. Close the handle (`async with` or `aclose()`) when you stop early.
+    """
+    sink = _StreamSink(queue_size, idle_timeout_s)
+    run = _build_start(
+        agent, user_input, tenant_id=tenant_id, run_id=run_id, deps=deps, output_model=output_model, sink=sink
+    )
+    return _spawn(run, run.start_body(user_input), sink, new_run=True)
+
+
+def stream_resume(
+    agent: Agent,
+    state: RunState,
+    *,
+    answer: str | None = None,
+    approved: bool | None = None,
+    user_input: str | None = None,
+    recover: bool = False,
+    deps: object = None,
+    pending_id: str | None = None,
+    output_model: type[BaseModel] | None = None,
+    queue_size: int = 64,
+    idle_timeout_s: float = 300.0,
+) -> StreamHandle:
+    """Resumes a run, returning a StreamHandle that yields Events and TextDeltas (see `stream_start`)."""
+    sink = _StreamSink(queue_size, idle_timeout_s)
+    run = _build_resume(
+        agent,
+        state,
+        answer=answer,
+        approved=approved,
+        user_input=user_input,
+        recover=recover,
+        deps=deps,
+        pending_id=pending_id,
+        output_model=output_model,
+        sink=sink,
+    )
+    return _spawn(run, run.resume_body(answer=answer, approved=approved, user_input=user_input), sink, new_run=False)
 
 
 def _stamp_thinking(message: Message, provider_id: str) -> Message:
@@ -202,15 +595,61 @@ def _check_resume_args(
 class _Run:
     """A single execution (`start` or `resume`) of a run."""
 
-    def __init__(self, agent: Agent, state: RunState) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        state: RunState,
+        *,
+        output_model: type[BaseModel] | None = None,
+        stream_sink: _StreamSink | None = None,
+    ) -> None:
         self.agent = agent
         self.state = state
+        self.output_model = output_model
+        self._stream_sink = stream_sink
+        self._output_tier = self._pick_output_tier()
+        tools = agent.tools
+        policy = agent.policy
+        if self._output_tier == "tool" and output_model is not None:
+            tools = agent.tools.extended(_final_output_tool(output_model))
+            if policy.allowed_tools is not None:
+                policy = replace(policy, allowed_tools=policy.allowed_tools | {FINAL_OUTPUT_TOOL_NAME})
         self.executor = ToolExecutor(
-            agent.tools, agent.policy, agent.hooks, self.emit, max_result_chars=agent.max_result_chars
+            tools,
+            policy,
+            agent.hooks,
+            self.emit,
+            max_result_chars=agent.max_result_chars,
+            truncation_mode=agent.truncation_mode,
         )
+        self._specs = [tool.spec() for tool in self.executor.visible_tools()]  # fixed for the life of a run
+        self._output_instructions = self._build_output_instructions()
         self._elapsed_base = state.elapsed_s
         self._t0 = time.monotonic()
         self._finishing = False
+
+    def _build_output_instructions(self) -> str:
+        """The system prompt suffix for the prompt and tool tiers (built once: the schema never changes in a run)."""
+        if self._output_tier == "prompt":
+            schema_json = json.dumps(self.state.output_schema, indent=2)
+            return f"\n\nYou must return a valid JSON object matching this schema:\n{schema_json}\nOutput JSON only."
+        if self._output_tier == "tool":
+            return (
+                f"\n\nTo complete the task, you must call the tool '{FINAL_OUTPUT_TOOL_NAME}' "
+                "with the structured output."
+            )
+        return ""
+
+    def _pick_output_tier(self) -> Literal["none", "native", "tool", "prompt"]:
+        """How the final output is requested. Uses what ALL routed models support, so failover stays valid."""
+        if self.output_model is None:
+            return "none"
+        providers = self.agent.router.providers
+        if all(p.capabilities.structured_output for p in providers):
+            return "native"
+        if all(p.capabilities.tools for p in providers):
+            return "tool"
+        return "prompt"
 
     # ------------------------------------------------------------ Frame
 
@@ -247,9 +686,15 @@ class _Run:
             problems = [(e["loc"], e["type"]) for e in exc.errors(include_url=False, include_input=False)]
         else:
             await self.agent.events.emit(event)
+            if self._stream_sink is not None:
+                await self._stream_sink.put(event)
             return
         # Deliberately without traceback: the rejected values are the exact ones that might contain content.
         log.error("Event %s dropped due to invalid data: %s", type_, problems)
+
+    async def _on_text_delta(self, delta: StreamDelta) -> None:
+        if self._stream_sink is not None and delta.text:
+            await self._stream_sink.put(TextDelta(text=delta.text))
 
     def elapsed(self) -> float:
         return self._elapsed_base + (time.monotonic() - self._t0)
@@ -287,6 +732,8 @@ class _Run:
         if batch is not None:
             if not await self._resolve_waiting(batch.waiting, answer=answer, approved=approved, rest=batch.remaining):
                 return
+            if await self._finish_if_output_submitted():
+                return
             if await self._run_batch(batch.remaining):
                 return
             await self._loop()
@@ -315,6 +762,7 @@ class _Run:
             if isinstance(outcome, PendingCall):
                 await self._pause(outcome, rest)
                 return False
+            self._discard_rejected_output(waiting.call, outcome)
             return True
 
         note = "Approval was denied."
@@ -335,8 +783,13 @@ class _Run:
                 await self._finish(RunStatus.LIMIT_REACHED, reason)
                 return
 
-            specs = [tool.spec() for tool in self.executor.visible_tools()]
+            specs = self._specs
             request = await agent.context.build(state, specs)
+            if self._output_tier == "native":
+                request = request.model_copy(update={"output_schema": state.output_schema})
+            elif self._output_instructions:
+                request = request.model_copy(update={"system": request.system + self._output_instructions})
+
             size = request.estimated_chars
             if size > agent.limits.max_context_chars:
                 await self._finish(
@@ -350,7 +803,14 @@ class _Run:
                 return
 
             await self.emit(EventType.MODEL_REQUEST, {"messages": len(request.messages), "tools": len(specs)})
-            response, provider_id = await agent.router.complete(request, self.emit)
+            if self._stream_sink is not None:
+                response, provider_id = await agent.router.stream(
+                    request,
+                    self.emit,
+                    on_delta=self._on_text_delta,
+                )
+            else:
+                response, provider_id = await agent.router.complete(request, self.emit)
             state.step += 1
             state.usage = state.usage + response.usage
             await self.emit(
@@ -388,7 +848,6 @@ class _Run:
                     continue
                 state.add_user_text(CONTINUE_PROMPT)
             elif calls:  # END or TOOL_USE with calls: execute (saves checkpoints itself, see _run_batch)
-                state.consecutive_retries = 0
                 if await self._run_batch(calls):
                     return
                 continue
@@ -397,29 +856,72 @@ class _Run:
                     return
                 continue
             else:
+                if self.output_model is not None:
+                    raw_json = _extract_json_text(response.message.text or "")
+                    try:
+                        validated = self.output_model.model_validate_json(raw_json)
+                    except ValidationError as exc:
+                        reason = describe_validation(exc, root="(root)")
+                        hint = (
+                            f"Call the '{FINAL_OUTPUT_TOOL_NAME}' tool with the structured output."
+                            if self._output_tier == "tool"
+                            else f"Output must be a valid JSON object matching the required schema: {reason}"
+                        )
+                        if not await self._reject(f"Final output could not be validated: {hint}"):
+                            return
+                        continue
+                    self.state.set_output(validated)
                 await self._finish(RunStatus.DONE)
                 return
 
             await self._checkpoint()
 
     async def _run_batch(self, calls: Sequence[ToolCall]) -> bool:
-        """Executes tool calls sequentially. Returns True if the run was paused.
+        """Executes tool calls sequentially. Returns True if the run was paused or finished.
 
         Write-ahead before EVERY tool: the checkpoint contains the planned calls and all results
         completed so far. If the process dies mid-tool, `recover` reports only that tool as
         "outcome unknown" — completed tools keep their actual result. After the batch, state is saved
         again so a crash during the next model call loses nothing either.
         """
+        final_rejected = False
         for index, call in enumerate(calls):
             await self._checkpoint()
             outcome = await self.executor.execute(call, self.state)
             if isinstance(outcome, PendingCall):
                 await self._pause(outcome, calls[index + 1 :])
                 return True
+            if self._discard_rejected_output(call, outcome):
+                final_rejected = True
+            elif await self._finish_if_output_submitted():
+                return True  # `_finish` answers the calls after it: "Not executed: run finished"
         self.state.add_tool_results(self.state.batch_done)
         self.state.batch_done = ()
+        if final_rejected:
+            # An invalid final output counts like any rejected response (the tool error already told the model why).
+            self.state.consecutive_retries += 1
+            if self.state.consecutive_retries > self.agent.limits.max_consecutive_retries:
+                await self._finish(RunStatus.FAILED, "Model repeatedly returned unusable final output")
+                return True
+        else:
+            self.state.consecutive_retries = 0
         await self._checkpoint()
         return False
+
+    def _discard_rejected_output(self, call: ToolCall, outcome: PendingCall | ToolResult) -> bool:
+        """`final_output` stores its output while it runs; the gate may still withhold the result afterwards
+        (`after_tool` hook, cancellation). Only a result that passed the whole gate counts. True if discarded."""
+        if call.name != FINAL_OUTPUT_TOOL_NAME or not isinstance(outcome, ToolResult) or not outcome.is_error:
+            return False
+        self.state.clear_output()
+        return True
+
+    async def _finish_if_output_submitted(self) -> bool:
+        """Ends the run as `done` once the `final_output` tool has stored a validated output."""
+        if self.state.output is None:
+            return False
+        await self._finish(RunStatus.DONE)
+        return True
 
     def _record(self, result: ToolResult) -> None:
         self.state.batch_done = (*self.state.batch_done, result)
@@ -434,8 +936,13 @@ class _Run:
         feedback = f"Your last response was rejected: {reason}"
         calls = state.open_tool_calls()
         if calls:
-            skipped = [ToolResult(call_id=c.id, content=f"Not executed: {reason}", is_error=True) for c in calls]
-            state.add_tool_results(skipped, text=feedback)
+            by_id = {r.call_id: r for r in state.batch_done}
+            results = [
+                by_id.get(c.id) or ToolResult(call_id=c.id, content=f"Not executed: {reason}", is_error=True)
+                for c in calls
+            ]
+            state.batch_done = ()
+            state.add_tool_results(results, text=feedback)
         else:
             state.add_user_text(feedback)
         return True

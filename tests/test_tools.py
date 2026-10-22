@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 from pydantic import BaseModel
 
 from ai_agent_harness import (
     DEFAULT_DENIED_READS,
+    Agent,
     AskUser,
     Autonomy,
     BaseTool,
@@ -23,12 +26,15 @@ from ai_agent_harness import (
     RunState,
     RunStatus,
     SyncTool,
+    ToolCall,
     ToolError,
+    ToolExecutor,
     ToolRegistry,
     start,
+    tool,
 )
 from ai_agent_harness.core import ConfigError, ToolInvocation, ToolResult
-from ai_agent_harness.testing import text_response, tool_response
+from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 from ai_agent_harness.tools.builtin import ReadFileInput
 
 from .conftest import Echo, EmptyInput, PathInput, WriteFile, make_agent, results_of, run_sync
@@ -432,3 +438,190 @@ def test_sync_tool_sees_context_variables_of_the_caller() -> None:
 
     asyncio.run(main())
     assert seen == ["trace-1"]
+
+
+def test_smart_truncation_head_and_tail_preserves_error_summary() -> None:
+    """Smart truncation (head_and_tail) preserves 60% head and 40% tail so traceback/errors are visible."""
+    prefix = "START OF LOGS: " + ("abcdefghij" * 50)  # 515 chars
+    suffix = "FINAL ERROR: ZeroDivisionError: integer division by zero\nExit code 1"
+    full_output = f"{prefix}\n... MIDDLE NOISE ...\n{suffix}"
+
+    @tool(risk=Risk.READ)
+    def run_job() -> str:
+        """Runs a job producing large output."""
+        return full_output
+
+    gate = ToolExecutor([run_job], max_result_chars=200, truncation_mode="head_and_tail")
+    outcome = run_sync(gate.execute(ToolCall(id="c1", name="run_job", arguments={})))
+    assert isinstance(outcome, ToolResult) and not outcome.is_error
+    assert outcome.content.startswith("START OF LOGS:")
+    assert outcome.content.endswith("integer division by zero\nExit code 1")
+    assert "[truncated," in outcome.content
+    assert "chars omitted" in outcome.content
+
+
+def test_smart_truncation_head_only_mode() -> None:
+    """When truncation_mode is 'head', only the beginning of the output is retained."""
+    prefix = "HEAD ONLY DATA: " + ("1234567890" * 30)
+    suffix = "TAIL DATA THAT SHOULD BE DROPPED"
+    full_output = f"{prefix}\n{suffix}"
+
+    @tool(risk=Risk.READ)
+    def fetch_stream() -> str:
+        """Fetches a stream."""
+        return full_output
+
+    gate = ToolExecutor([fetch_stream], max_result_chars=150, truncation_mode="head")
+    outcome = run_sync(gate.execute(ToolCall(id="c2", name="fetch_stream", arguments={})))
+    assert isinstance(outcome, ToolResult) and not outcome.is_error
+    assert outcome.content.startswith("HEAD ONLY DATA:")
+    assert suffix not in outcome.content
+    assert "[truncated," in outcome.content
+
+
+def test_per_tool_max_result_chars_and_truncation_mode_override() -> None:
+    """Individual tools can override max_result_chars and truncation_mode."""
+
+    @tool(risk=Risk.READ, max_result_chars=80, truncation_mode="head")
+    def custom_tool() -> str:
+        """Tool with strict per-tool truncation."""
+        return "A" * 200 + "END_TAIL"
+
+    gate = ToolExecutor([custom_tool], max_result_chars=10_000, truncation_mode="head_and_tail")
+    outcome = run_sync(gate.execute(ToolCall(id="c3", name="custom_tool", arguments={})))
+    assert isinstance(outcome, ToolResult)
+    assert outcome.content.startswith("A" * 80)
+    assert "END_TAIL" not in outcome.content
+    assert "[truncated, 128 chars omitted]" in outcome.content
+
+
+def test_tool_definition_validation_for_truncation() -> None:
+    """Invalid truncation settings are rejected at tool definition time."""
+
+    class BadTool1(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "bad1"
+        description: ClassVar[str] = "bad"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+        max_result_chars: ClassVar[int | None] = 0
+
+        async def run(self, args: EmptyInput, state: RunState) -> str:
+            return "ok"
+
+    with pytest.raises(ConfigError, match="max_result_chars"):
+        BadTool1.validate_definition()
+
+    class BadTool2(BaseTool[EmptyInput]):
+        name: ClassVar[str] = "bad2"
+        description: ClassVar[str] = "bad"
+        input_model: ClassVar[type[BaseModel]] = EmptyInput
+        risk: ClassVar[Risk] = Risk.READ
+        truncation_mode: ClassVar[Any] = "invalid_mode"
+
+        async def run(self, args: EmptyInput, state: RunState) -> str:
+            return "ok"
+
+    with pytest.raises(ConfigError, match="truncation_mode"):
+        BadTool2.validate_definition()
+
+
+def _same_name_tool(**settings: Any) -> BaseTool[Any]:
+    @tool(name="same", risk=Risk.READ, **settings)
+    def same() -> str:
+        """Same."""
+        return "ok"
+
+    return same
+
+
+def test_tool_digest_changes_with_the_truncation_settings_alone() -> None:
+    """Identical tools (same name and body) must differ in the digest when only a truncation setting differs."""
+    base = _same_name_tool().digest()
+    assert _same_name_tool(max_result_chars=500).digest() != base
+    assert _same_name_tool(truncation_mode="head").digest() != base
+    assert _same_name_tool(max_result_chars=500).digest() != _same_name_tool(max_result_chars=501).digest()
+
+
+def test_digest_of_a_plain_tool_matches_the_documented_formula() -> None:
+    """Pins stay valid across releases: SHA-256 over this canonical JSON (UTF-8, no ASCII escapes)."""
+
+    def expected(tool_: BaseTool[Any], description: str) -> str:
+        canonical = json.dumps(
+            {
+                "name": "same",
+                "description": description,
+                "input_schema": tool_.input_model.model_json_schema(),
+                "risk": "read",
+                "timeout_s": 30.0,
+                "untrusted_output": False,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    plain = _same_name_tool()
+    assert plain.digest() == expected(plain, "Same.")
+
+    @tool(name="same", risk=Risk.READ)
+    def umlaut() -> str:
+        """Grüße."""
+        return "ok"
+
+    assert umlaut.digest() == expected(umlaut, "Grüße.")
+
+
+def test_agent_truncation_mode_reaches_the_gate_of_a_run() -> None:
+    @tool(risk=Risk.READ)
+    def big() -> str:
+        """Returns a long text."""
+        return "HEAD" + "x" * 5000 + "TAIL"
+
+    provider = FakeProvider([tool_response(("big", {})), text_response("ok")])
+    agent = Agent.create(provider, tools=[big], max_result_chars=200, truncation_mode="head")
+    state = run_sync(start(agent, "go"))
+
+    content = state.messages[2].tool_results[0].content
+    assert content.startswith("HEAD") and "TAIL" not in content
+
+
+def test_agent_rejects_an_invalid_truncation_mode() -> None:
+    with pytest.raises(ConfigError, match="truncation_mode"):
+        Agent.create(FakeProvider([]), truncation_mode=cast("Any", "tail"))
+
+
+def test_per_tool_limit_can_lower_but_never_raise_the_agent_limit() -> None:
+    @tool(risk=Risk.READ, max_result_chars=1_000_000)
+    def greedy() -> str:
+        """A tool that asks for a larger limit than the agent allows."""
+        return "x" * 5_000
+
+    gate = ToolExecutor([greedy], max_result_chars=300, truncation_mode="head")
+    outcome = run_sync(gate.execute(ToolCall(id="c1", name="greedy", arguments={})))
+
+    assert isinstance(outcome, ToolResult)
+    assert outcome.content.startswith("x" * 300 + "\n")
+    assert "4700 chars omitted" in outcome.content
+
+
+def test_executor_rejects_invalid_truncation_mode() -> None:
+    with pytest.raises(ConfigError, match="truncation_mode"):
+        ToolExecutor([], truncation_mode=cast("Any", "tail"))
+
+
+def test_tool_error_text_is_truncated_and_framed_for_untrusted_tools() -> None:
+    from ai_agent_harness.core import ToolError
+
+    @tool(risk=Risk.READ, untrusted_output=True)
+    def noisy() -> str:
+        """Fails with a huge message."""
+        raise ToolError("E" * 50_000)
+
+    gate = ToolExecutor([noisy], max_result_chars=300)
+    outcome = run_sync(gate.execute(ToolCall(id="c9", name="noisy", arguments={})))
+
+    assert isinstance(outcome, ToolResult)
+    assert outcome.is_error
+    assert outcome.content.startswith("<untrusted")
+    assert len(outcome.content) < 1_000

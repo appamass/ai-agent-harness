@@ -10,11 +10,12 @@ from ..context import ContextBuilder
 from ..core.errors import ConfigError
 from ..core.events import EventBus
 from ..core.hooks import Hook, HookPipeline
+from ..core.types import DEFAULT_MAX_RESULT_CHARS, DEFAULT_TRUNCATION_MODE, FINAL_OUTPUT_TOOL_NAME, TruncationMode
 from ..persistence import CheckpointStore
 from ..policy import Autonomy, Limits, PermissionPolicy
 from ..providers.base import CallableProvider, ModelFn, ModelProvider
 from ..providers.router import ModelRouter
-from ..tools.base import BaseTool
+from ..tools.base import BaseTool, check_truncation_mode
 from ..tools.registry import ToolRegistry
 
 
@@ -30,17 +31,21 @@ class Agent:
     events: EventBus = field(default_factory=EventBus)
     checkpoints: CheckpointStore | None = None  # None = no persistence
     limits: Limits = field(default_factory=Limits)
-    max_result_chars: int = 20_000
+    max_result_chars: int = DEFAULT_MAX_RESULT_CHARS
+    truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE
 
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise ConfigError("Agent.name must not be empty")
+        if FINAL_OUTPUT_TOOL_NAME in self.tools.names():
+            raise ConfigError(f"'{FINAL_OUTPUT_TOOL_NAME}' is a reserved tool name (structured output, ADR 0023)")
         if self.allowed_tools is not None:
             unknown = self.allowed_tools - self.tools.names()
             if unknown:
                 raise ConfigError(f"allowed_tools contains unregistered tools: {sorted(unknown)}")
         if self.max_result_chars < 100:
             raise ConfigError("max_result_chars must be >= 100")
+        check_truncation_mode(self.truncation_mode, "Agent")
 
     @property
     def policy(self) -> PermissionPolicy:
@@ -60,7 +65,8 @@ class Agent:
         events: EventBus | None = None,
         checkpoints: CheckpointStore | None = None,
         limits: Limits | None = None,
-        max_result_chars: int = 20_000,
+        max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
+        truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE,
     ) -> Agent:
         """Shorthand constructor that normalizes a provider, prompt string, tool list, and hook list."""
         if isinstance(provider, ModelRouter):
@@ -86,4 +92,5 @@ class Agent:
             checkpoints=checkpoints,
             limits=limits if limits is not None else Limits(),
             max_result_chars=max_result_chars,
+            truncation_mode=truncation_mode,
         )

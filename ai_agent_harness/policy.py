@@ -9,7 +9,7 @@ Autonomy × Risk:
 | act_with_approval   | allow | approval | approval     |
 | autonomous          | allow | allow    | approval     |
 
-Irreversible actions require human approval at every autonomy level.
+Irreversible actions never run without a human: denied below `act_with_approval`, approval above.
 Tools with `deny` are never even offered to the model.
 """
 

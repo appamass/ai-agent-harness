@@ -40,6 +40,14 @@ class ToolRegistry:
         self._check_pin(tool)
         self._tools[tool.name] = tool
 
+    def extended(self, tool: BaseTool[Any]) -> ToolRegistry:
+        """A copy with one more tool. Only the new tool is validated; the others already were."""
+        copy = ToolRegistry()
+        copy._tools = dict(self._tools)
+        copy._expected_digests = dict(self._expected_digests)
+        copy.register(tool)
+        return copy
+
     def digests(self) -> dict[str, str]:
         """Returns `{tool_name: digest}` for all registered tools, as they are now."""
         return {name: tool.digest() for name, tool in self._tools.items()}

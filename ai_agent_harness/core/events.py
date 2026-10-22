@@ -83,6 +83,10 @@ Emit = Callable[[EventType, dict[str, Any]], Awaitable[None]]
 """Lean emit callback passed to components outside the runner."""
 
 
+async def noop_emit(type_: EventType, data: dict[str, Any]) -> None:
+    """Default `Emit` for components used without a runner."""
+
+
 class EventBus:
     def __init__(self) -> None:
         self._listeners: list[Listener] = []

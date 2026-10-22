@@ -36,7 +36,8 @@ from .guardrails import (
     SecretGuard,
     WeakeningGuard,
 )
-from .persistence import CheckpointStore, InMemoryCheckpointStore, JsonFileCheckpointStore
+from .persistence import CheckpointStore, InMemoryCheckpointStore, JsonFileCheckpointStore, RunInfo
+from .persistence_sqlite import SqliteCheckpointStore
 from .policy import Autonomy, Limits, PermissionPolicy, Verdict
 from .providers import (
     CallableProvider,
@@ -44,18 +45,27 @@ from .providers import (
     ModelProvider,
     ModelRouter,
     RetryPolicy,
+    StreamDelta,
     without_foreign_thinking,
 )
-from .runtime import Agent, resume, start
+from .runtime import Agent, StreamHandle, StreamItem, TextDelta, resume, start, stream_resume, stream_start
 from .tools import (
     DEFAULT_DENIED_READS,
     AskUser,
     BaseTool,
+    InMemoryMCPTransport,
     InputRequest,
+    MCPServerConfig,
+    MCPToolDefinition,
+    MCPToolset,
+    MockMCPServer,
     ReadFile,
+    StdioMCPTransport,
     SyncTool,
     ToolExecutor,
     ToolRegistry,
+    load_mcp_tools,
+    mcp_tool_digest,
     tool,
 )
 
@@ -81,11 +91,16 @@ __all__ = [
     "Hook",
     "HookPipeline",
     "InMemoryCheckpointStore",
+    "InMemoryMCPTransport",
     "InputRequest",
     "JsonFileCheckpointStore",
     "KillSwitch",
     "Limits",
+    "MCPServerConfig",
+    "MCPToolDefinition",
+    "MCPToolset",
     "Message",
+    "MockMCPServer",
     "ModelProvider",
     "ModelRequest",
     "ModelResponse",
@@ -95,12 +110,19 @@ __all__ = [
     "ReadFile",
     "RetryPolicy",
     "Risk",
+    "RunInfo",
     "RunState",
     "RunStatus",
     "SecretGuard",
+    "SqliteCheckpointStore",
+    "StdioMCPTransport",
     "StopReason",
+    "StreamDelta",
+    "StreamHandle",
+    "StreamItem",
     "SyncTool",
     "TextBlock",
+    "TextDelta",
     "ToolCall",
     "ToolError",
     "ToolExecutor",
@@ -111,9 +133,13 @@ __all__ = [
     "Verdict",
     "WeakeningGuard",
     "as_untrusted",
+    "load_mcp_tools",
+    "mcp_tool_digest",
     "restore_state",
     "resume",
     "start",
+    "stream_resume",
+    "stream_start",
     "tool",
     "without_foreign_thinking",
 ]

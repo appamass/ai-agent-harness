@@ -38,11 +38,12 @@ CONTINUE_PROMPT = (
 )
 """User prompt sent by the runner to continue a truncated response (`StopReason.MAX_TOKENS`)."""
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Current version of the serialized state. Increment on every schema change (ADR 0010).
 
 History: 1 — initial version. 2 — `batch_done`, cache/reasoning tokens in `usage`,
-`ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012).
+`ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012). 3 — `output_schema`,
+`output_model_name`, `output` for structured final output (ADR 0023).
 """
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
@@ -56,7 +57,12 @@ def _v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2}
+def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """v3 adds `output_schema`, `output_model_name`, and `output` with None defaults (ADR 0023)."""
+    return data
+
+
+MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3}
 """Migrations from version n to n+1, keyed by n."""
 
 
@@ -97,6 +103,7 @@ class PendingBatch(BaseModel):
 
 
 DepsT = TypeVar("DepsT")
+OutputT = TypeVar("OutputT", bound=BaseModel)
 
 
 def _now() -> datetime:
@@ -119,6 +126,13 @@ class RunState(BaseModel):
         default=(),
         description="Completed results of the current tool batch — survive a crash (write-ahead)",
     )
+    output_schema: dict[str, Any] | None = Field(
+        default=None, description="JSON schema for structured final output (ADR 0023)"
+    )
+    output_model_name: str | None = Field(default=None, description="Class name of required output_model (ADR 0023)")
+    output: dict[str, Any] | None = Field(
+        default=None, description="Validated structured final output as JSON-safe dictionary (ADR 0023)"
+    )
     step: int = Field(default=0, ge=0, description="Number of model calls across the entire run")
     consecutive_retries: int = Field(default=0, ge=0)
     usage: Usage = Field(default_factory=Usage)
@@ -126,6 +140,7 @@ class RunState(BaseModel):
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
     _deps: object = PrivateAttr(default=None)  # never serialized: neither in checkpoints nor in events
+    _output_object: BaseModel | None = PrivateAttr(default=None)  # in-memory cached model instance
 
     # ------------------------------------------------------- Runtime dependencies
 
@@ -185,6 +200,31 @@ class RunState(BaseModel):
             index -= 2
             parts.append(msgs[index].text)
         return "".join(reversed(parts))  # continuation resumes at the exact cutoff point
+
+    def output_as(self, model: type[OutputT]) -> OutputT:
+        """Returns the structured final output validated as `model`.
+
+        Raises `InvalidStateError` if the run produced no structured output.
+        """
+        if self.output is None:
+            raise InvalidStateError(f"Run has no structured output (status: {self.status})")
+        return model.model_validate(self.output)
+
+    def clear_output(self) -> None:
+        """Drops the structured output of an earlier turn before the run continues."""
+        self.output = None
+        self._output_object = None
+
+    @property
+    def output_object(self) -> BaseModel | None:
+        """The in-memory validated Pydantic object from this execution, if available."""
+        return self._output_object
+
+    def set_output(self, output_object: BaseModel) -> None:
+        """Stores a validated structured output: as a JSON-safe dict (for checkpoints) and as the instance."""
+        self.output = output_object.model_dump(mode="json")
+        self._output_object = output_object
+        self._touch()
 
     @property
     def pending_id(self) -> str | None:
@@ -259,6 +299,8 @@ class RunState(BaseModel):
         self.add_tool_results(results)
 
     def set_status(self, status: RunStatus, reason: str | None = None) -> None:
+        if status is not RunStatus.DONE:
+            self.clear_output()  # a structured output belongs to a run that ended as done, never to anything else
         self.status = status
         self.status_reason = reason
         self._touch()

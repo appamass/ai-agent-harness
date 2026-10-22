@@ -34,13 +34,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar, get_type_hints, overload
+from typing import Any, ClassVar, Generic, TypeVar, get_args, get_type_hints, overload
 
 from pydantic import BaseModel, ConfigDict, create_model
 
 from ..core.errors import ConfigError
 from ..core.state import RunState
-from ..core.types import ID_PATTERN, Risk, ToolSpec
+from ..core.types import ID_PATTERN, Risk, ToolSpec, TruncationMode
 
 InputT = TypeVar("InputT", bound=BaseModel)
 _NAME = re.compile(ID_PATTERN)
@@ -68,6 +68,17 @@ def _has_concrete_schema_type(raw: Any) -> bool:
     return all(_has_concrete_schema_type(sub) for sub in nested_props.values())
 
 
+def canonical_digest(payload: dict[str, Any]) -> str:
+    """SHA-256 (64 hex chars) over the canonical JSON form of `payload`: stable across key order and platforms."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def check_truncation_mode(mode: object, where: str) -> None:
+    if mode not in get_args(TruncationMode):
+        raise ConfigError(f"{where}: 'truncation_mode' must be 'head_and_tail' or 'head', got {mode!r}")
+
+
 @dataclass(frozen=True)
 class InputRequest:
     """Return value from a tool to pause the run for a clarifying question.
@@ -88,6 +99,11 @@ class BaseTool(ABC, Generic[InputT]):
     risk: ClassVar[Risk]
     timeout_s: ClassVar[float] = 30.0
     untrusted_output: ClassVar[bool] = False
+    strict_schema: ClassVar[bool] = True
+    """False for tools whose input model comes from elsewhere (MCP servers, the caller's output model): the
+    concrete-type check is skipped there, Pydantic and the server validate anyway."""
+    max_result_chars: ClassVar[int | None] = None
+    truncation_mode: ClassVar[TruncationMode | None] = None
 
     @abstractmethod
     async def run(self, args: InputT, state: RunState) -> ToolOutput: ...
@@ -103,20 +119,19 @@ class BaseTool(ABC, Generic[InputT]):
         Covers name, description, input schema, risk, timeout, and `untrusted_output`. Pin it with
         `ToolRegistry(expected_digests=...)` to notice a changed tool.
         """
-        canonical = json.dumps(
-            {
-                "name": cls.name,
-                "description": cls.description,
-                "input_schema": cls.input_model.model_json_schema(),
-                "risk": cls.risk.value,
-                "timeout_s": float(cls.timeout_s),
-                "untrusted_output": cls.untrusted_output,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        payload: dict[str, Any] = {
+            "name": cls.name,
+            "description": cls.description,
+            "input_schema": cls.input_model.model_json_schema(),
+            "risk": cls.risk.value,
+            "timeout_s": float(cls.timeout_s),
+            "untrusted_output": cls.untrusted_output,
+        }
+        if cls.max_result_chars is not None:
+            payload["max_result_chars"] = cls.max_result_chars
+        if cls.truncation_mode is not None:
+            payload["truncation_mode"] = cls.truncation_mode
+        return canonical_digest(payload)
 
     @classmethod
     def validate_definition(cls) -> None:
@@ -143,7 +158,7 @@ class BaseTool(ABC, Generic[InputT]):
         if schema.get("type") != "object":
             raise ConfigError(f"{where}: 'input_model' must produce a JSON schema of type 'object'")
         defs: dict[str, dict[str, Any]] = schema.get("$defs") or {}
-        for node in (schema, *defs.values()):
+        for node in (schema, *defs.values()) if cls.strict_schema else ():
             props: dict[str, dict[str, Any]] = node.get("properties") or {}
             for field_name, prop in props.items():
                 if not _has_concrete_schema_type(prop):
@@ -158,6 +173,11 @@ class BaseTool(ABC, Generic[InputT]):
             raise ConfigError(f"{where}: 'timeout_s' must be > 0")
         if not isinstance(cls.untrusted_output, bool):
             raise ConfigError(f"{where}: 'untrusted_output' must be a bool")
+        max_chars = cls.max_result_chars
+        if max_chars is not None and (isinstance(max_chars, bool) or not isinstance(max_chars, int) or max_chars <= 0):
+            raise ConfigError(f"{where}: 'max_result_chars' must be a positive integer")
+        if cls.truncation_mode is not None:
+            check_truncation_mode(cls.truncation_mode, where)
 
 
 SYNC_TOOL_THREADS = 16
@@ -209,6 +229,8 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
 ) -> BaseTool[Any]: ...
 
 
@@ -222,6 +244,8 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
 ) -> Callable[[ToolFn], BaseTool[Any]]: ...
 
 
@@ -234,6 +258,8 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
 ) -> BaseTool[Any] | Callable[[ToolFn], BaseTool[Any]]:
     """Turns a typed Python function (sync or async) into a validated `BaseTool` or `SyncTool`.
 
@@ -250,6 +276,8 @@ def tool(
             risk=risk,
             timeout_s=timeout_s,
             untrusted_output=untrusted_output,
+            max_result_chars=max_result_chars,
+            truncation_mode=truncation_mode,
         )
 
     return decorate(fn) if fn is not None else decorate
@@ -263,6 +291,8 @@ def _build_function_tool(
     risk: Risk,
     timeout_s: float,
     untrusted_output: bool,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
 ) -> BaseTool[Any]:
     if not callable(fn):
         raise ConfigError("@tool requires a callable function")
@@ -271,6 +301,8 @@ def _build_function_tool(
     tool_risk = risk
     tool_timeout = timeout_s
     tool_untrusted = untrusted_output
+    tool_max_chars = max_result_chars
+    tool_trunc_mode = truncation_mode
 
     try:
         hints = get_type_hints(fn, localns={"RunState": RunState})
@@ -309,6 +341,8 @@ def _build_function_tool(
             risk: ClassVar[Risk] = tool_risk
             timeout_s: ClassVar[float] = tool_timeout
             untrusted_output: ClassVar[bool] = tool_untrusted
+            max_result_chars: ClassVar[int | None] = tool_max_chars
+            truncation_mode: ClassVar[TruncationMode | None] = tool_trunc_mode
 
             async def run(self, args: BaseModel, state: RunState) -> ToolOutput:
                 kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}
@@ -327,6 +361,8 @@ def _build_function_tool(
         risk: ClassVar[Risk] = tool_risk
         timeout_s: ClassVar[float] = tool_timeout
         untrusted_output: ClassVar[bool] = tool_untrusted
+        max_result_chars: ClassVar[int | None] = tool_max_chars
+        truncation_mode: ClassVar[TruncationMode | None] = tool_trunc_mode
 
         def run_sync(self, args: BaseModel, state: RunState) -> ToolOutput:
             kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}

@@ -18,6 +18,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 """Allowed format for tool names, run IDs, and tenant IDs (safe for filenames and APIs)."""
 
+TruncationMode = Literal["head_and_tail", "head"]
+"""How an oversized tool result is cut: keep head and tail, or only the head."""
+
+DEFAULT_MAX_RESULT_CHARS = 20_000
+DEFAULT_TRUNCATION_MODE: TruncationMode = "head_and_tail"
+
+FINAL_OUTPUT_TOOL_NAME = "final_output"
+"""Reserved tool name the runner offers for structured final output (ADR 0023). Agents cannot register it."""
+
 
 class _Frozen(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -204,6 +213,7 @@ class ModelRequest(_Frozen):
     system: str
     messages: tuple[Message, ...] = Field(min_length=1)
     tools: tuple[ToolSpec, ...] = ()
+    output_schema: dict[str, Any] | None = None
     max_tokens: int = Field(default=4096, gt=0)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
@@ -220,6 +230,8 @@ class ModelRequest(_Frozen):
         Basis for `Limits.max_context_chars` — an estimate, not a tokenizer.
         """
         size = len(self.system) + sum(len(spec.model_dump_json()) for spec in self.tools)
+        if self.output_schema is not None:
+            size += _json_len(self.output_schema)
         for message in self.messages:
             for block in message.content:
                 if isinstance(block, TextBlock):
