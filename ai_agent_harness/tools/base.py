@@ -34,6 +34,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_type_hints, overload
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, create_model
 
@@ -64,6 +65,20 @@ def _has_concrete_schema_type(raw: Any) -> bool:
         return False
     nested_props: dict[str, dict[str, Any]] = prop.get("properties") or {}
     return all(_has_concrete_schema_type(sub) for sub in nested_props.values())
+
+
+_SCHEMAS: WeakKeyDictionary[type[BaseModel], dict[str, Any]] = WeakKeyDictionary()
+
+
+def json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """`model.model_json_schema()`, built once per model class (every run and resume needs it again).
+
+    The result is shared between callers: never change it.
+    """
+    schema = _SCHEMAS.get(model)
+    if schema is None:
+        schema = _SCHEMAS[model] = model.model_json_schema()
+    return schema
 
 
 def check_truncation_mode(mode: object, where: str) -> None:
@@ -102,7 +117,7 @@ class BaseTool(ABC, Generic[InputT]):
 
     @classmethod
     def spec(cls) -> ToolSpec:
-        return ToolSpec(name=cls.name, description=cls.description, input_schema=cls.input_model.model_json_schema())
+        return ToolSpec(name=cls.name, description=cls.description, input_schema=json_schema(cls.input_model))
 
     @classmethod
     def digest(cls) -> str:
@@ -144,7 +159,7 @@ class BaseTool(ABC, Generic[InputT]):
         if input_model is BaseModel:
             raise ConfigError(f"{where}: 'input_model' must be a subclass of BaseModel (even without fields)")
         try:
-            schema = input_model.model_json_schema()
+            schema = json_schema(input_model)
             json.dumps(schema)
         except Exception as exc:
             raise ConfigError(f"{where}: 'input_model' cannot be represented as a JSON schema: {exc}") from exc

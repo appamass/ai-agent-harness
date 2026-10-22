@@ -233,6 +233,8 @@ _URL_IN_TEXT = re.compile(
     r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
     r"|\bjavascript:[^\s<>()\"'\]]+"
 )
+_URL_MARKERS = (":/", ":\\", "mailto:", "data:", "javascript:")
+"""Every `_URL_IN_TEXT` match contains one of these (the pattern is case-sensitive): text without them has no URL."""
 _TRAILING_PUNCT = ".,;:!?'\")"
 _URL_KEY_WORD = re.compile(r"(?:^|[^a-z])(?:url|uri|href|endpoint|webhook)s?(?:$|[^a-z])")
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
@@ -306,6 +308,8 @@ class EgressGuard(Hook):
 
     def check_text(self, text: str) -> str | None:
         """Scans `text` for URLs and returns the first violation reason, or `None`."""
+        if not any(marker in text for marker in _URL_MARKERS):  # cheap: most text holds no URL at all
+            return None
         for match in _URL_IN_TEXT.finditer(text):
             raw_url = match.group(0).rstrip(_TRAILING_PUNCT)
             reason = self.check_url(raw_url)

@@ -625,3 +625,19 @@ def test_tool_error_text_is_truncated_and_framed_for_untrusted_tools() -> None:
     assert outcome.is_error
     assert outcome.content.startswith("<untrusted")
     assert len(outcome.content) < 1_000
+
+
+def test_json_schemas_are_built_once_and_do_not_keep_models_alive() -> None:
+    import gc
+    import weakref
+
+    from ai_agent_harness.tools.base import json_schema
+
+    class Temporary(BaseModel):
+        value: int
+
+    assert json_schema(Temporary) is json_schema(Temporary)
+    alive = weakref.ref(Temporary)
+    del Temporary
+    gc.collect()
+    assert alive() is None

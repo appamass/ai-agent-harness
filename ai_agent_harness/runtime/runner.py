@@ -63,7 +63,7 @@ from ..core.types import (
     is_positive_number,
 )
 from ..providers.base import StreamDelta
-from ..tools.base import BaseTool, make_tool
+from ..tools.base import BaseTool, json_schema, make_tool
 from ..tools.executor import ToolExecutor, describe_validation
 from .agent import Agent
 
@@ -306,7 +306,7 @@ def _check_output_binding(state: RunState, output_model: type[BaseModel] | None)
             f"Run requires structured output ({state.output_model_name}): pass the same output_model "
             "again on every resume (ADR 0023)"
         )
-    if canonical_digest(output_model.model_json_schema()) != state.output_schema_digest:
+    if canonical_digest(json_schema(output_model)) != state.output_schema_digest:
         raise InvalidStateError(
             f"output_model {output_model.__name__} does not match the schema this run was started with"
         )
@@ -561,7 +561,7 @@ class _Run:
         self.state = state
         self.output_model = output_model
         # From the model itself: a resumed run was checked against the stored schema, a new one is bound after setup.
-        self.output_schema = output_model.model_json_schema() if output_model is not None else None
+        self.output_schema = json_schema(output_model) if output_model is not None else None
         self._stream_sink = stream_sink
         self._output_tier = self._pick_output_tier()
         tools = agent.tools
