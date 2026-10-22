@@ -24,10 +24,7 @@ from ai_agent_harness import (
 from ai_agent_harness.core import MIGRATIONS, SCHEMA_VERSION, TextBlock, ThinkingBlock, Usage
 from ai_agent_harness.testing import FakeProvider, text_response
 
-from .conftest import Echo, assert_consistent, make_agent, run_sync
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
+from .conftest import FIXTURES_DIR, Echo, assert_consistent, make_agent, run_sync
 
 # ------------------------------------------------------------------ Usage
 
@@ -133,7 +130,7 @@ def test_v2_fixture_crashed_mid_batch_recovers_with_the_finished_result(tmp_path
     # "customer-1" is the tenant_id recorded inside the immutable v2 fixture file
     (tmp_path / "customer-1").mkdir()
     (tmp_path / "customer-1" / "fixture-v2.json").write_bytes(
-        (FIXTURES / "checkpoint_v2_crashed_mid_batch.json").read_bytes()
+        (FIXTURES_DIR / "checkpoint_v2_crashed_mid_batch.json").read_bytes()
     )
     store = JsonFileCheckpointStore(tmp_path)
     crashed = run_sync(store.load("customer-1", "fixture-v2"))

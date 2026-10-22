@@ -20,7 +20,6 @@ import pytest
 from ai_agent_harness import (
     Agent,
     ContextBuilder,
-    ModelRequest,
     ModelRouter,
     RetryPolicy,
     RunStatus,
@@ -36,21 +35,20 @@ from ai_agent_harness.core.types import (
     ThinkingBlock,
     ToolCall,
     ToolResult,
-    ToolSpec,
 )
 from ai_agent_harness.providers.anthropic import AnthropicProvider
 from ai_agent_harness.providers.base import EMPTY_RESPONSE_NOTE, FOREIGN_THINKING_NOTE
 
-from .conftest import Echo, no_sleep, run_sync
+from .conftest import FIXTURES_DIR, Echo, no_sleep, run_sync
+from .provider_helpers import ECHO_SPEC, complete, load_fixture, request
 
-FIXTURES = Path(__file__).parent / "fixtures" / "anthropic"
+FIXTURES = FIXTURES_DIR / "anthropic"
 API_KEY = "sk-ant-test-key-1234567890"
 MODEL = "claude-haiku-5-5"
 
 
 def fixture(name: str) -> dict[str, Any]:
-    data: dict[str, Any] = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
-    return data
+    return load_fixture("anthropic", name)
 
 
 def ok(name: str, **changes: Any) -> httpx2.Response:
@@ -83,17 +81,6 @@ class Wire:
 
 def provider_for(wire: Wire, **kwargs: Any) -> AnthropicProvider:
     return AnthropicProvider(MODEL, client=wire.client(), **kwargs)
-
-
-ECHO_SPEC = ToolSpec(name="echo", description="Returns 'echo'.", input_schema={"type": "object", "properties": {}})
-
-
-def request(*messages: Message, **kwargs: Any) -> ModelRequest:
-    return ModelRequest(system="You are a test agent.", messages=messages or (Message.user("hi"),), **kwargs)
-
-
-def complete(provider: AnthropicProvider, req: ModelRequest | None = None) -> Any:
-    return run_sync(provider.complete(req or request()))
 
 
 # ------------------------------------------------------------------ Response translation

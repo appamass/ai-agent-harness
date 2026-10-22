@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
+from .conftest import REPO_ROOT
+
 FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
 INLINE_CODE = re.compile(r"`[^`\n]*`")
 LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
@@ -16,11 +17,11 @@ HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*#*\s*$", re.MULTILINE)
 
 def documents() -> list[Path]:
     found = [
-        *ROOT.glob("*.md"),
-        *ROOT.glob("docs/**/*.md"),
-        *ROOT.glob("examples/**/*.md"),
-        *ROOT.glob("tests/**/*.md"),
-        *ROOT.glob("ai-kit/**/*.md"),
+        *REPO_ROOT.glob("*.md"),
+        *REPO_ROOT.glob("docs/**/*.md"),
+        *REPO_ROOT.glob("examples/**/*.md"),
+        *REPO_ROOT.glob("tests/**/*.md"),
+        *REPO_ROOT.glob("ai-kit/**/*.md"),
     ]
     return sorted(found)
 
@@ -48,11 +49,11 @@ def anchors(path: Path) -> set[str]:
 
 
 def test_the_documents_to_check_exist() -> None:
-    names = {p.relative_to(ROOT).as_posix() for p in documents()}
+    names = {p.relative_to(REPO_ROOT).as_posix() for p in documents()}
     assert {"README.md", "AGENTS.md", "docs/guide.md"} <= names
 
 
-@pytest.mark.parametrize("path", documents(), ids=lambda p: p.relative_to(ROOT).as_posix())
+@pytest.mark.parametrize("path", documents(), ids=lambda p: p.relative_to(REPO_ROOT).as_posix())
 def test_relative_links_and_anchors_resolve(path: Path) -> None:
     problems: list[str] = []
     for target in LINK.findall(strip_code(path.read_text(encoding="utf-8"))):
@@ -64,7 +65,7 @@ def test_relative_links_and_anchors_resolve(path: Path) -> None:
             problems.append(f"{target}: no such file")
         elif anchor and destination.suffix == ".md" and anchor not in anchors(destination):
             problems.append(f"{target}: no such heading")
-    assert not problems, f"{path.relative_to(ROOT)}: " + "; ".join(problems)
+    assert not problems, f"{path.relative_to(REPO_ROOT)}: " + "; ".join(problems)
 
 
 def test_the_link_checker_catches_broken_links(tmp_path: Path) -> None:

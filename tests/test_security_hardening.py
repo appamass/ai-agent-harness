@@ -11,15 +11,9 @@ from pydantic import BaseModel, ConfigDict
 from ai_agent_harness import (
     BaseTool,
     EgressGuard,
-    Message,
-    ModelResponse,
     Risk,
     RunState,
     SecretGuard,
-    StopReason,
-    TextBlock,
-    ToolCall,
-    ToolInvocation,
     ToolRegistry,
     WeakeningGuard,
     as_untrusted,
@@ -27,8 +21,9 @@ from ai_agent_harness import (
 )
 from ai_agent_harness.core import ConfigError
 from ai_agent_harness.core.hooks import Action
+from ai_agent_harness.testing import text_response
 
-from .conftest import run_sync
+from .conftest import invocation, run_sync
 
 
 class UrlInput(BaseModel):
@@ -40,13 +35,8 @@ class UrlInput(BaseModel):
     urls: list[str] = []
 
 
-def _invocation(args: UrlInput) -> ToolInvocation:
-    call = ToolCall(id="1", name="fetch", arguments=args.model_dump())
-    return ToolInvocation(call=call, tool_name="fetch", risk=Risk.READ, args=args)
-
-
 def _decide(guard: EgressGuard, args: UrlInput) -> Action:
-    return run_sync(guard.before_tool(RunState(agent_name="a"), _invocation(args))).action
+    return run_sync(guard.before_tool(RunState(agent_name="a"), invocation(args, name="fetch", risk=Risk.READ))).action
 
 
 class TestAsUntrustedCannotBeBrokenOut:
@@ -136,8 +126,7 @@ class TestEgressGuardParsing:
             target: str
 
         guard = EgressGuard(allowed_domains=["api.example.com"], url_keys=["target"])
-        call = ToolCall(id="1", name="fetch", arguments={"target": "evil.com/x"})
-        inv = ToolInvocation(call=call, tool_name="fetch", risk=Risk.READ, args=Custom(target="evil.com/x"))
+        inv = invocation(Custom(target="evil.com/x"), name="fetch", risk=Risk.READ)
         assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is Action.BLOCK
         plain = EgressGuard(allowed_domains=["api.example.com"])
         assert run_sync(plain.before_tool(RunState(agent_name="a"), inv)).action is Action.CONTINUE
@@ -300,28 +289,21 @@ class TestMoreSecretFormats:
         assert SecretGuard().find_secret(text) is None
 
 
-def _response(text: str) -> ModelResponse:
-    return ModelResponse(
-        message=Message(role="assistant", content=(TextBlock(text=text),)),
-        stop_reason=StopReason.END,
-    )
-
-
 class TestSecretGuardChecksModelOutput:
     def test_model_response_with_a_secret_is_blocked_without_echoing_it(self) -> None:
         guard = SecretGuard()
         value = _fake_secrets()["npm"]
-        decision = run_sync(guard.after_model(RunState(agent_name="a"), _response(f"Your key is {value}")))
+        decision = run_sync(guard.after_model(RunState(agent_name="a"), text_response(f"Your key is {value}")))
         assert decision.action is Action.BLOCK
         assert decision.reason is not None and value not in decision.reason
 
     def test_clean_response_continues(self) -> None:
-        decision = run_sync(SecretGuard().after_model(RunState(agent_name="a"), _response("All done.")))
+        decision = run_sync(SecretGuard().after_model(RunState(agent_name="a"), text_response("All done.")))
         assert decision.action is Action.CONTINUE
 
     def test_can_be_switched_off(self) -> None:
         guard = SecretGuard(check_model_output=False)
-        decision = run_sync(guard.after_model(RunState(agent_name="a"), _response(_fake_secrets()["npm"])))
+        decision = run_sync(guard.after_model(RunState(agent_name="a"), text_response(_fake_secrets()["npm"])))
         assert decision.action is Action.CONTINUE
 
 

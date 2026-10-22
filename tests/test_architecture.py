@@ -8,8 +8,9 @@ import sys
 import tokenize
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-HARNESS = ROOT / "ai_agent_harness"
+from .conftest import REPO_ROOT
+
+HARNESS = REPO_ROOT / "ai_agent_harness"
 CORE = HARNESS / "core"
 ALLOWED_THIRD_PARTY = {"pydantic"}
 
@@ -84,8 +85,8 @@ def test_no_unapproved_suppression_comments() -> None:
     """AGENTS.md: No `# type: ignore`, `# noqa`, or `pragma: no cover` without explicit approval."""
     found: dict[str, int] = {}
     for folder in ("ai_agent_harness", "tests"):
-        for path in sorted((ROOT / folder).rglob("*.py")):
-            rel = path.relative_to(ROOT).as_posix()
+        for path in sorted((REPO_ROOT / folder).rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
             tokens = tokenize.generate_tokens(io.StringIO(path.read_text(encoding="utf-8")).readline)
             count = sum(
                 1
@@ -99,7 +100,7 @@ def test_no_unapproved_suppression_comments() -> None:
 
 def test_readme_is_a_short_start_with_the_demo_and_the_proof() -> None:
     """The README is the front door: short, with a no-key demo and a link to the full list of guarantees."""
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     lines = text.splitlines()
     assert len(lines) <= 160, f"README.md has {len(lines)} lines (limit: 160): move detail into docs/"
     assert "examples/repo_assistant.py --demo" in text
@@ -108,7 +109,7 @@ def test_readme_is_a_short_start_with_the_demo_and_the_proof() -> None:
 
 def test_agents_md_stays_concise() -> None:
     """ETH Zurich finding (arXiv:2602.11988) & AGENTS.md: concise context instead of bloated overviews."""
-    lines = (ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
+    lines = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
     assert 40 <= len(lines) <= 100, f"AGENTS.md has {len(lines)} lines (limit: 100)"
 
 

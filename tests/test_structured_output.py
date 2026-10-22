@@ -36,7 +36,7 @@ from ai_agent_harness.core.types import (
 from ai_agent_harness.policy import Limits
 from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 
-from .conftest import assert_consistent, run_sync
+from .conftest import SendMail, assert_consistent, run_sync
 
 
 class CityWeather(BaseModel):
@@ -57,20 +57,6 @@ class LookupTool(BaseTool[LookupInput]):
 
     async def run(self, args: LookupInput, state: RunState) -> str:
         return f"Weather in {args.city}: 21.5C, Sunny"
-
-
-class IrreversibleInput(BaseModel):
-    action: str
-
-
-class IrreversibleTool(BaseTool[IrreversibleInput]):
-    name: ClassVar[str] = "publish_report"
-    description: ClassVar[str] = "Publishes report to public website"
-    input_model: ClassVar[type[BaseModel]] = IrreversibleInput
-    risk: ClassVar[Risk] = Risk.IRREVERSIBLE
-
-    async def run(self, args: IrreversibleInput, state: RunState) -> str:
-        return f"Published: {args.action}"
 
 
 # ------------------------------------------------------------------ Strategy 1: Native structured output
@@ -225,7 +211,7 @@ def test_checkpoint_and_resume_across_approval_preserves_output_model(tmp_path: 
     store = JsonFileCheckpointStore(tmp_path)
     provider = FakeProvider(
         [
-            tool_response(("publish_report", {"action": "deploy"})),
+            tool_response(("send_mail", {})),
             tool_response(
                 (
                     FINAL_OUTPUT_TOOL_NAME,
@@ -237,7 +223,7 @@ def test_checkpoint_and_resume_across_approval_preserves_output_model(tmp_path: 
     )
     agent = Agent.create(
         provider,
-        tools=[IrreversibleTool()],
+        tools=[SendMail()],
         autonomy=Autonomy.ACT_WITH_APPROVAL,  # IRREVERSIBLE requires approval
         checkpoints=store,
     )

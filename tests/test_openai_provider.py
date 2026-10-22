@@ -9,7 +9,6 @@ from __future__ import annotations
 import importlib
 import json
 import sys
-from pathlib import Path
 from typing import Any, ClassVar, cast
 
 import httpx
@@ -35,20 +34,19 @@ from ai_agent_harness.core.types import (
     ThinkingBlock,
     ToolCall,
     ToolResult,
-    ToolSpec,
 )
 from ai_agent_harness.providers.base import EMPTY_RESPONSE_NOTE
 from ai_agent_harness.providers.openai import OpenAIProvider
 
 from .conftest import Echo, no_sleep, run_sync
+from .provider_helpers import ECHO_SPEC, complete, load_fixture, request, stream_items
 
-FIXTURES = Path(__file__).parent / "fixtures" / "openai"
 API_KEY = "sk-openai-test-key-1234567890"
 MODEL = "gpt-4o"
 
 
 def fixture(name: str) -> dict[str, Any]:
-    return cast("dict[str, Any]", json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8")))
+    return load_fixture("openai", name)
 
 
 def ok(name: str, **changes: Any) -> httpx.Response:
@@ -80,17 +78,6 @@ class Wire:
 
 def provider_for(wire: Wire, **kwargs: Any) -> OpenAIProvider:
     return OpenAIProvider(MODEL, client=wire.client(), **kwargs)
-
-
-ECHO_SPEC = ToolSpec(name="echo", description="Returns 'echo'.", input_schema={"type": "object", "properties": {}})
-
-
-def request(*messages: Message, **kwargs: Any) -> ModelRequest:
-    return ModelRequest(system="You are a test agent.", messages=messages or (Message.user("hi"),), **kwargs)
-
-
-def complete(provider: OpenAIProvider, req: ModelRequest | None = None) -> Any:
-    return run_sync(provider.complete(req or request()))
 
 
 # ------------------------------------------------------------------ Configuration & Validation
@@ -486,10 +473,7 @@ def test_streaming_keeps_reasoning_like_the_non_streaming_path() -> None:
     )
     provider = provider_for(wire)
 
-    async def collect() -> list[Any]:
-        return [item async for item in provider.stream(request())]
-
-    items = run_sync(collect())
+    items = stream_items(provider)
     deltas = [i for i in items if isinstance(i, StreamDelta)]
     final = items[-1]
     assert isinstance(final, ModelResponse)
@@ -505,11 +489,8 @@ def test_stream_without_finish_reason_is_a_retryable_error_not_a_complete_answer
     wire = Wire(_sse(_chunk({"role": "assistant", "content": "half an ans"})))  # connection ends mid-answer
     provider = provider_for(wire)
 
-    async def collect() -> list[Any]:
-        return [item async for item in provider.stream(request())]
-
     with pytest.raises(ProviderError, match="finish reason") as info:
-        run_sync(collect())
+        stream_items(provider)
     assert info.value.retryable
 
 
@@ -524,10 +505,7 @@ def test_stream_tool_call_fragments_without_an_index_are_merged_into_one_call() 
     )
     provider = provider_for(wire)
 
-    async def collect() -> list[Any]:
-        return [item async for item in provider.stream(request())]
-
-    final = run_sync(collect())[-1]
+    final = stream_items(provider)[-1]
     calls = [b for b in final.message.content if isinstance(b, ToolCall)]
     assert [(c.id, c.name, c.arguments) for c in calls] == [("c1", "echo", {})]
 
@@ -564,10 +542,7 @@ def test_stream_assembles_tool_calls_in_index_order_with_usage() -> None:
     wire = Wire(_sse(*_tool_call_chunks()))
     provider = provider_for(wire)
 
-    async def collect() -> list[Any]:
-        return [item async for item in provider.stream(request())]
-
-    final = run_sync(collect())[-1]
+    final = stream_items(provider)[-1]
 
     assert final.stop_reason is StopReason.TOOL_USE
     assert [(c.id, c.arguments) for c in final.message.tool_calls] == [("call_a", {"x": 1}), ("call_b", {"a": 2})]
@@ -585,22 +560,15 @@ def test_stream_mixes_missing_and_numeric_indexes_without_merging_calls() -> Non
     ]
     provider = provider_for(Wire(_sse(*chunks)))
 
-    async def collect() -> list[Any]:
-        return [item async for item in provider.stream(request())]
-
-    final = run_sync(collect())[-1]
+    final = stream_items(provider)[-1]
     assert [c.id for c in final.message.tool_calls] == ["c1", "c2"]
 
 
 def test_stream_http_error_becomes_a_provider_error() -> None:
     provider = provider_for(Wire(httpx.Response(429, json={"error": {"code": "rate_limit_exceeded"}})))
 
-    async def collect() -> None:
-        async for _ in provider.stream(request()):
-            pass
-
     with pytest.raises(ProviderError) as info:
-        run_sync(collect())
+        stream_items(provider)
     assert info.value.retryable and "429" in str(info.value)
 
 

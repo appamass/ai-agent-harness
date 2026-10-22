@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -27,7 +26,17 @@ from ai_agent_harness.core.types import Message, ToolCall
 from ai_agent_harness.testing import text_response, tool_response
 from ai_agent_harness.tools.base import ToolOutput
 
-from .conftest import Echo, PathInput, SendMail, WriteFile, assert_consistent, make_agent, results_of, run_sync
+from .conftest import (
+    FIXTURES_DIR,
+    Echo,
+    PathInput,
+    SendMail,
+    WriteFile,
+    assert_consistent,
+    make_agent,
+    results_of,
+    run_sync,
+)
 
 
 def test_ask_user_pauses_and_answer_becomes_tool_result() -> None:
@@ -324,8 +333,7 @@ def test_reused_run_id_and_other_tenant_get_different_pending_ids() -> None:
 
 def test_pending_id_formula_is_stable_for_persisted_states() -> None:
     """The formula is part of the contract (ADR 0014): changing it invalidates every open dialog."""
-    raw = (Path(__file__).parent / "fixtures" / "checkpoint_v1_waiting_for_approval.json").read_text(encoding="utf-8")
-    state = restore_state(raw)
+    state = restore_state((FIXTURES_DIR / "checkpoint_v1_waiting_for_approval.json").read_text(encoding="utf-8"))
     assert state.pending_id == PINNED_V1_PENDING_ID
 
 

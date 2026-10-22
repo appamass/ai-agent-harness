@@ -13,12 +13,10 @@ import pytest
 from ai_agent_harness import (
     Agent,
     Autonomy,
-    ContextBuilder,
     InMemoryCheckpointStore,
     ModelRouter,
     RetryPolicy,
     RunStatus,
-    ToolRegistry,
     start,
 )
 from ai_agent_harness.core.types import Message, ModelRequest
@@ -53,11 +51,11 @@ def test_openai_live_tool_calling() -> None:
     async def scenario() -> None:
         provider = OpenAIProvider(OPENAI_MODEL)
         try:
-            agent = Agent(
+            agent = Agent.create(
+                ModelRouter(provider, retry=RetryPolicy(max_attempts=1)),
+                "You are a test agent. Always call the echo tool when asked.",
                 name="openai_live_agent",
-                router=ModelRouter(provider, retry=RetryPolicy(max_attempts=1)),
-                context=ContextBuilder("You are a test agent. Always call the echo tool when asked."),
-                tools=ToolRegistry([Echo()]),
+                tools=[Echo()],
                 autonomy=Autonomy.ACT_WITH_APPROVAL,
                 checkpoints=InMemoryCheckpointStore(),
             )

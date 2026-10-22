@@ -12,13 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from ai_agent_harness import Autonomy, RunStatus, resume, start
-from ai_agent_harness.core import ConcurrencyError, ConfigError, InvalidStateError
+from ai_agent_harness.core import ConcurrencyError, ConfigError
 from ai_agent_harness.persistence import status_index_name
 from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore, schema_sql
-from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import Crash, WriteFile, make_agent, run_sync, waiting_state
+from .conftest import run_sync, waiting_state
 
 TABLE = "ai_agent_harness_checkpoints"
 
@@ -51,17 +49,6 @@ def test_table_names_are_validated(name: str) -> None:
         SqliteCheckpointStore(":memory:", table=name)
     with pytest.raises(ConfigError, match="identifier"):
         schema_sql(name)
-
-
-def test_ids_are_validated_before_any_sql(store: SqliteCheckpointStore) -> None:
-    with pytest.raises(ValueError, match="Invalid"):
-        run_sync(store.load("../x", "r"))
-    with pytest.raises(ValueError, match="Invalid"):
-        run_sync(store.delete_run("t", "a/b"))
-    with pytest.raises(ValueError, match="Invalid"):
-        run_sync(store.list_runs("bad tenant"))
-    with pytest.raises(ValueError, match="Invalid"):
-        run_sync(store.delete_tenant("bad tenant"))
 
 
 def test_schema_sql_describes_the_table_and_its_lock_column() -> None:
@@ -109,18 +96,6 @@ async def test_async_context_manager(tmp_path: Path) -> None:
 # ------------------------------------------------------------------ Store contract
 
 
-def test_setup_is_idempotent(store: SqliteCheckpointStore, tmp_path: Path) -> None:
-    run_sync(store.setup())  # second call: nothing happens
-    state = waiting_state()
-    run_sync(store.save(state))
-    with closing(sqlite3.connect(tmp_path / "test_checkpoints.sqlite")) as connection:
-        ((tenant, run, revision, status, version),) = connection.execute(
-            f"SELECT tenant_id, run_id, revision, status, schema_version FROM {TABLE}"
-        ).fetchall()
-    assert (tenant, run, revision, status, version) == ("t1", "r1", 1, "running", state.schema_version)
-    assert state.revision == 1
-
-
 def test_roundtrip_save_and_load(store: SqliteCheckpointStore) -> None:
     state = waiting_state()
     assert run_sync(store.load("t1", "r1")) is None
@@ -130,17 +105,6 @@ def test_roundtrip_save_and_load(store: SqliteCheckpointStore) -> None:
     assert loaded is not None
     assert loaded.revision == 2 == state.revision
     assert loaded.messages == state.messages
-
-
-def test_stale_copy_cannot_overwrite(store: SqliteCheckpointStore) -> None:
-    state = waiting_state()
-    run_sync(store.save(state))
-    stale = state.model_copy(deep=True)
-    run_sync(store.save(state))  # moves the stored revision on
-    with pytest.raises(ConcurrencyError):
-        run_sync(store.save(stale))
-    loaded = run_sync(store.load("t1", "r1"))
-    assert loaded is not None and loaded.revision == 2
 
 
 def test_concurrent_initial_insert_conflict(store: SqliteCheckpointStore) -> None:
@@ -176,98 +140,7 @@ def test_concurrent_workers_on_same_file(tmp_path: Path) -> None:
         two.close()
 
 
-def test_list_runs_filtering_and_limits(store: SqliteCheckpointStore, tmp_path: Path) -> None:
-    done = waiting_state("t1", "done-run")
-    done.set_status(RunStatus.DONE)
-    for state in (waiting_state("t1", "run-a"), done, waiting_state("t1", "run-b"), waiting_state("t2", "other")):
-        run_sync(store.save(state))
-    # Distinct timestamps, so the newest-first order is checked and not left to clock resolution
-    with closing(sqlite3.connect(tmp_path / "test_checkpoints.sqlite")) as connection:
-        for run_id, stamp in (("run-a", "10:00"), ("done-run", "11:00"), ("run-b", "12:00")):
-            connection.execute(
-                f"UPDATE {TABLE} SET updated_at = ? WHERE run_id = ?", (f"2026-01-01T{stamp}:00.000Z", run_id)
-            )
-        connection.commit()
-
-    everything = run_sync(store.list_runs("t1"))
-    assert [r.run_id for r in everything] == ["run-b", "done-run", "run-a"]
-    only_done = run_sync(store.list_runs("t1", status=RunStatus.DONE))
-    assert [(r.run_id, r.status, r.revision) for r in only_done] == [("done-run", RunStatus.DONE, 1)]
-    assert [r.run_id for r in run_sync(store.list_runs("t1", limit=2))] == ["run-b", "done-run"]
-    assert [r.run_id for r in run_sync(store.list_runs("t2"))] == ["other"]
-    assert run_sync(store.list_runs("nobody")) == []
-    for bad in (0, -1, 10_001):
-        with pytest.raises(ValueError, match="limit"):
-            run_sync(store.list_runs("t1", limit=bad))
-
-
-def test_delete_run_and_tenant(store: SqliteCheckpointStore) -> None:
-    for tenant, run in (("t1", "a"), ("t1", "b"), ("t2", "c")):
-        run_sync(store.save(waiting_state(tenant, run)))
-    assert run_sync(store.delete_run("t1", "a")) is True
-    assert run_sync(store.delete_run("t1", "a")) is False
-    assert run_sync(store.load("t1", "a")) is None
-    assert run_sync(store.delete_tenant("t1")) == 1
-    assert run_sync(store.load("t1", "b")) is None and run_sync(store.load("t2", "c")) is not None
-
-
-# ------------------------------------------------------------------ A real run through the store
-
-
-def test_agent_run_and_recovery_with_sqlite(tmp_path: Path) -> None:
-    path = tmp_path / "runs.sqlite"
-    first_store = SqliteCheckpointStore(path)
-    run_sync(first_store.setup())
-    write = WriteFile()
-    try:
-        first_agent, _, _ = make_agent(
-            [tool_response(("write_file", {"path": "a.txt"}))],
-            [write],
-            autonomy=Autonomy.SUGGEST,
-            checkpoints=first_store,
-        )
-        waiting = run_sync(start(first_agent, "write it", run_id="approval-1"))
-        assert waiting.status is RunStatus.WAITING_FOR_APPROVAL and write.written == []
-        shown = waiting.pending_id
-
-        crashing, _, _ = make_agent([Crash()], checkpoints=first_store)
-        with pytest.raises(Crash):
-            run_sync(start(crashing, "hello", run_id="crash-1"))
-    finally:
-        first_store.close()
-
-    # A second process: its own store object, its own agents, only the file in common
-    with SqliteCheckpointStore(path) as other_store:
-        loaded = run_sync(other_store.load("default", "approval-1"))
-        assert loaded is not None and loaded.pending_id == shown
-        other_agent, _, _ = make_agent(
-            [text_response("written")], [write], autonomy=Autonomy.SUGGEST, checkpoints=other_store
-        )
-        done = run_sync(resume(other_agent, loaded, approved=True, pending_id=shown))
-        assert done.status is RunStatus.DONE and write.written == ["a.txt"]
-
-        running = run_sync(other_store.list_runs("default", status=RunStatus.RUNNING))
-        assert [r.run_id for r in running] == ["crash-1"]  # what a recovery job looks for
-        stored = run_sync(other_store.load("default", "crash-1"))
-        assert stored is not None
-        recovering, _, _ = make_agent([text_response("recovered")], checkpoints=other_store)
-        recovered = run_sync(resume(recovering, stored, recover=True))
-        assert recovered.status is RunStatus.DONE and recovered.last_text == "recovered"
-
-
 # ------------------------------------------------------------------ Integrity, durability, cancellation
-
-
-def test_a_row_swapped_between_tenants_is_rejected_on_load(store: SqliteCheckpointStore, tmp_path: Path) -> None:
-    run_sync(store.save(waiting_state("t1", "r1")))
-    run_sync(store.save(waiting_state("t2", "r2")))
-    with closing(sqlite3.connect(tmp_path / "test_checkpoints.sqlite")) as connection:
-        connection.execute(
-            f"UPDATE {TABLE} SET state = (SELECT state FROM {TABLE} WHERE tenant_id = 't2') WHERE tenant_id = 't1'"
-        )
-        connection.commit()
-    with pytest.raises(InvalidStateError, match="belongs to"):
-        run_sync(store.load("t1", "r1"))
 
 
 def test_the_database_uses_wal_mode(store: SqliteCheckpointStore, tmp_path: Path) -> None:

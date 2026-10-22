@@ -15,11 +15,12 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
+from .conftest import REPO_ROOT
+
 DOC_FILES = (
-    ROOT / "README.md",
-    ROOT / "docs" / "guide.md",
-    ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "references" / "adopt-in-x.md",
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "docs" / "guide.md",
+    REPO_ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "references" / "adopt-in-x.md",
 )
 BLOCK = re.compile(r"^```python\n(# executable\n.*?)^```", re.MULTILINE | re.DOTALL)
 
@@ -61,7 +62,7 @@ def test_the_readme_demo_transcript_matches_the_real_demo(
 ) -> None:
     from .conftest import load_example
 
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     match = re.search(r"```text\n(.*?)```", readme, re.DOTALL)
     assert match is not None, "README.md has no ```text block with the demo transcript"
     monkeypatch.setattr("builtins.input", lambda _prompt="": "y")

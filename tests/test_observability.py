@@ -10,7 +10,7 @@ import logging
 from typing import Any, cast
 
 import pytest
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
@@ -44,6 +44,18 @@ def otel_setup() -> tuple[TracerProvider, InMemorySpanExporter]:
     return provider, exporter
 
 
+def make_listener(
+    otel_setup: tuple[TracerProvider, InMemorySpanExporter], **kwargs: Any
+) -> tuple[OpenTelemetryListener, InMemorySpanExporter]:
+    """Build a listener on the fixture's tracer; `kwargs` go to `OpenTelemetryListener`."""
+    provider, exporter = otel_setup
+    return OpenTelemetryListener(provider.get_tracer("test_harness"), **kwargs), exporter
+
+
+def spans_named(exporter: InMemorySpanExporter, prefix: str) -> list[ReadableSpan]:
+    return [s for s in exporter.get_finished_spans() if s.name.startswith(prefix)]
+
+
 def test_missing_dependency_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
     import ai_agent_harness.observability as obs
 
@@ -55,9 +67,7 @@ def test_missing_dependency_raises_config_error(monkeypatch: pytest.MonkeyPatch)
 def test_full_agent_run_span_hierarchy_and_gen_ai_attributes(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     @tool(risk=Risk.READ)
     def fetch_weather(city: str) -> str:
@@ -91,9 +101,9 @@ def test_full_agent_run_span_hierarchy_and_gen_ai_attributes(
     assert len(spans) == 4
 
     # Group spans by name
-    run_spans = [s for s in spans if s.name.startswith("run ")]
-    model_spans = [s for s in spans if s.name.startswith("chat ")]
-    tool_spans = [s for s in spans if s.name.startswith("execute_tool ")]
+    run_spans = spans_named(exporter, "run ")
+    model_spans = spans_named(exporter, "chat ")
+    tool_spans = spans_named(exporter, "execute_tool ")
 
     assert len(run_spans) == 1
     assert len(model_spans) == 2
@@ -142,9 +152,7 @@ def test_full_agent_run_span_hierarchy_and_gen_ai_attributes(
 def test_tool_failure_marks_span_as_error(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     @tool(risk=Risk.READ)
     def fail_tool() -> str:
@@ -158,8 +166,7 @@ def test_tool_failure_marks_span_as_error(
 
     run_sync(start(agent, "run fail tool"))
 
-    spans = exporter.get_finished_spans()
-    tool_spans = [s for s in spans if s.name.startswith("execute_tool ")]
+    tool_spans = spans_named(exporter, "execute_tool ")
     assert len(tool_spans) == 1
     t_span = tool_spans[0]
     assert t_span.attributes is not None
@@ -170,9 +177,7 @@ def test_tool_failure_marks_span_as_error(
 def test_tool_blocked_creates_blocked_span(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     @tool(risk=Risk.IRREVERSIBLE)
     def drop_table() -> str:
@@ -186,8 +191,7 @@ def test_tool_blocked_creates_blocked_span(
 
     run_sync(start(agent, "drop everything"))
 
-    spans = exporter.get_finished_spans()
-    tool_spans = [s for s in spans if s.name.startswith("execute_tool ")]
+    tool_spans = spans_named(exporter, "execute_tool ")
     assert len(tool_spans) == 1
     t_span = tool_spans[0]
     assert t_span.attributes is not None
@@ -199,9 +203,7 @@ def test_tool_blocked_creates_blocked_span(
 def test_provider_retry_and_failover_recorded_as_span_events(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     ev_req = Event(
         type=EventType.MODEL_REQUEST,
@@ -259,9 +261,7 @@ def test_provider_retry_and_failover_recorded_as_span_events(
 def test_approval_and_checkpoint_events_recorded_on_run_span(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     ev_start = Event(type=EventType.RUN_STARTED, run_id="r2", tenant_id="t1", step=0, data={"agent": "tester"})
     ev_appr = Event(
@@ -293,9 +293,7 @@ def test_zero_sensitive_data_leakage_in_spans(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
     """Verifies invariant: never leak raw prompts, tool arguments, or secrets in OTel spans (ADR 0011)."""
-    provider, exporter = otel_setup
-    tracer = provider.get_tracer("test_harness")
-    listener = OpenTelemetryListener(tracer)
+    listener, exporter = make_listener(otel_setup)
 
     secret_prompt = "MY_SUPER_SECRET_PROMPT_98765"
     secret_arg = "TOP_SECRET_CREDENTIAL_XYZ"
@@ -367,10 +365,9 @@ def test_genai_metrics_are_recorded(otel_setup: tuple[TracerProvider, InMemorySp
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
-    provider, _ = otel_setup
     reader = InMemoryMetricReader()
     meter = MeterProvider(metric_readers=[reader]).get_meter("test_harness")
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"), meter=meter)
+    listener, _ = make_listener(otel_setup, meter=meter)
 
     resp = text_response("hello").model_copy(
         update={"model": "test-model", "usage": Usage(input_tokens=100, output_tokens=25)}
@@ -397,13 +394,12 @@ def test_genai_metrics_are_recorded(otel_setup: tuple[TracerProvider, InMemorySp
 def test_non_standard_attributes_use_the_harness_prefix(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"))
+    listener, exporter = make_listener(otel_setup)
     agent, _, _ = make_agent([text_response("hello")], [])
     agent.events.subscribe(listener)
     run_sync(start(agent, "hi"))
 
-    model_span = next(s for s in exporter.get_finished_spans() if s.name.startswith("chat "))
+    model_span = spans_named(exporter, "chat ")[0]
     assert model_span.attributes is not None
     names = set(model_span.attributes)
     assert {"harness.request.messages", "gen_ai.provider.name"} <= names
@@ -411,8 +407,7 @@ def test_non_standard_attributes_use_the_harness_prefix(
 
 
 def test_open_runs_are_bounded(otel_setup: tuple[TracerProvider, InMemorySpanExporter]) -> None:
-    provider, exporter = otel_setup
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"), max_open_runs=2)
+    listener, exporter = make_listener(otel_setup, max_open_runs=2)
 
     async def started(run_id: str) -> None:
         await listener(Event(type=EventType.RUN_STARTED, run_id=run_id, tenant_id="t", step=0, data={"agent": "a"}))
@@ -420,7 +415,7 @@ def test_open_runs_are_bounded(otel_setup: tuple[TracerProvider, InMemorySpanExp
     for run_id in ("r1", "r2", "r3"):
         run_sync(started(run_id))
 
-    ended = [s for s in exporter.get_finished_spans() if s.name == "run a"]
+    ended = spans_named(exporter, "run a")
     assert len(ended) == 1  # the oldest run was ended as abandoned instead of leaking
     assert ended[0].status.status_code is StatusCode.ERROR
     assert ended[0].attributes is not None
@@ -442,8 +437,7 @@ def _event(type_: EventType, run: str = "r", **data: object) -> Event:
 def test_a_failed_run_is_an_error_span_and_a_waiting_run_records_what_it_waits_for(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"))
+    listener, exporter = make_listener(otel_setup)
     events = (
         _event(EventType.RUN_STARTED, "failed-run", agent="x"),
         _event(EventType.RUN_FINISHED, "failed-run", status="failed"),
@@ -466,8 +460,7 @@ def test_a_failed_run_is_an_error_span_and_a_waiting_run_records_what_it_waits_f
 def test_a_resume_without_an_open_span_creates_one_and_open_children_end_on_finish(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"))
+    listener, exporter = make_listener(otel_setup)
     events = (
         _event(EventType.RUN_RESUMED, **{"from": "waiting_for_approval"}),
         _event(EventType.MODEL_REQUEST, messages=1, tools=0),
@@ -490,8 +483,7 @@ def test_a_resume_without_an_open_span_creates_one_and_open_children_end_on_fini
 def test_zero_valued_optional_usage_is_not_recorded(
     otel_setup: tuple[TracerProvider, InMemorySpanExporter],
 ) -> None:
-    provider, exporter = otel_setup
-    listener = OpenTelemetryListener(provider.get_tracer("test_harness"))
+    listener, exporter = make_listener(otel_setup)
     usage = {"input_tokens": 1, "output_tokens": 2, "cache_read_tokens": 0, "reasoning_tokens": 0}
     events = (
         _event(EventType.RUN_STARTED, agent="x"),
@@ -502,7 +494,7 @@ def test_zero_valued_optional_usage_is_not_recorded(
     for event in events:
         run_sync(listener.handle(event))
 
-    chat = next(s for s in exporter.get_finished_spans() if s.name.startswith("chat"))
+    chat = spans_named(exporter, "chat")[0]
     attributes = chat.attributes or {}
     assert attributes["gen_ai.usage.input_tokens"] == 1
     assert "gen_ai.usage.cache_read_input_tokens" not in attributes

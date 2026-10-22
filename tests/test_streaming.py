@@ -25,7 +25,6 @@ from ai_agent_harness import (
     Autonomy,
     BaseTool,
     Capabilities,
-    ContextBuilder,
     Event,
     EventType,
     InMemoryCheckpointStore,
@@ -40,16 +39,15 @@ from ai_agent_harness import (
     StreamDelta,
     StreamHandle,
     TextDelta,
-    ToolRegistry,
     resume,
     start,
     stream_resume,
     stream_start,
 )
-from ai_agent_harness.core.errors import ConfigError, ProviderError
+from ai_agent_harness.core.errors import ConcurrencyError, ConfigError, ProviderError
 from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 
-from .conftest import no_sleep
+from .conftest import Crash, WriteFile, make_agent, no_sleep
 
 
 class SimpleEchoInput(BaseModel):
@@ -82,29 +80,44 @@ class IrreversibleTool(BaseTool[ApprovalActionInput]):
         return f"remediated: {args.action_name}"
 
 
+_REQUEST = ModelRequest(system="s", messages=(Message.user("hi"),))
+
+
+async def _collect(stream: StreamHandle) -> tuple[list[EventType], list[str]]:
+    """Reads the stream to its end: the event types and the text deltas, in order."""
+    events: list[EventType] = []
+    deltas: list[str] = []
+    async for item in stream:
+        if isinstance(item, Event):
+            events.append(item.type)
+        elif isinstance(item, TextDelta):
+            deltas.append(item.text)
+    return events, deltas
+
+
+async def _wait_done(stream: StreamHandle) -> None:
+    for _ in range(100):
+        if stream.done():
+            break
+        await asyncio.sleep(0.05)
+
+
+async def _saved_status(store: InMemoryCheckpointStore, stream: StreamHandle) -> RunStatus:
+    saved = await store.load("default", stream.state.run_id)
+    assert saved is not None
+    return saved.status
+
+
 @pytest.mark.anyio
 async def test_stream_basic_text_deltas_and_events() -> None:
     store = InMemoryCheckpointStore()
     provider = FakeProvider([text_response("Hello brave new streaming world")])
-    agent = Agent(
-        name="stream_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("You are helpful."),
-        tools=ToolRegistry([]),
-        checkpoints=store,
-    )
+    agent = Agent.create(provider, "You are helpful.", name="stream_agent", checkpoints=store)
 
     stream = stream_start(agent, "Hi there")
     assert isinstance(stream, StreamHandle)
 
-    deltas: list[str] = []
-    events: list[EventType] = []
-
-    async for item in stream:
-        if isinstance(item, TextDelta):
-            deltas.append(item.text)
-        elif isinstance(item, Event):
-            events.append(item.type)
+    events, deltas = await _collect(stream)
 
     assert "".join(deltas) == "Hello brave new streaming world"
     assert EventType.RUN_STARTED in events
@@ -118,9 +131,7 @@ async def test_stream_basic_text_deltas_and_events() -> None:
     state.check_protocol()
 
     # Verify state saved in checkpoint store
-    saved = await store.load("default", state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.DONE
+    assert await _saved_status(store, stream) is RunStatus.DONE
 
 
 @pytest.mark.anyio
@@ -142,13 +153,7 @@ async def test_stream_mid_stream_cancellation_persists_cancelled() -> None:
             yield StreamDelta(text="Third part ")
             yield text_response("Full text")
 
-    agent = Agent(
-        name="cancel_agent",
-        router=ModelRouter(PausingStreamingProvider()),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-        checkpoints=store,
-    )
+    agent = Agent.create(PausingStreamingProvider(), "Prompt", name="cancel_agent", checkpoints=store)
 
     deltas_received: list[str] = []
     stream = stream_start(agent, "Start stream")
@@ -170,9 +175,7 @@ async def test_stream_mid_stream_cancellation_persists_cancelled() -> None:
     assert state.last_message.role == "user"
 
     # Checkpoint store also reflects CANCELLED
-    saved = await store.load("default", state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.CANCELLED
+    assert await _saved_status(store, stream) is RunStatus.CANCELLED
 
 
 @pytest.mark.anyio
@@ -187,23 +190,10 @@ async def test_stream_mid_stream_provider_failure_persists_failed() -> None:
             ]
         ]
     )
-    agent = Agent(
-        name="crash_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-        checkpoints=store,
-    )
+    agent = Agent.create(provider, "Prompt", name="crash_agent", checkpoints=store)
 
     stream = stream_start(agent, "Test fail")
-    deltas: list[str] = []
-    events: list[EventType] = []
-
-    async for item in stream:
-        if isinstance(item, TextDelta):
-            deltas.append(item.text)
-        elif isinstance(item, Event):
-            events.append(item.type)
+    events, deltas = await _collect(stream)
 
     assert deltas == ["Chunk before crash "]
     assert EventType.RUN_FINISHED in events
@@ -214,21 +204,14 @@ async def test_stream_mid_stream_provider_failure_persists_failed() -> None:
     # Invariant: protocol must be strictly valid
     state.check_protocol()
 
-    saved = await store.load("default", state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.FAILED
+    assert await _saved_status(store, stream) is RunStatus.FAILED
 
 
 @pytest.mark.anyio
 async def test_stream_backpressure_with_slow_consumer() -> None:
     # A tiny queue_size=2 ensures backpressure is exercised
     provider = FakeProvider([text_response("one two three four five six seven eight nine ten")])
-    agent = Agent(
-        name="slow_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-    )
+    agent = Agent.create(provider, "Prompt", name="slow_agent")
 
     stream = stream_start(agent, "Test backpressure", queue_size=2)
     consumed_deltas: list[str] = []
@@ -253,23 +236,10 @@ async def test_stream_with_tool_execution() -> None:
             text_response("Tool executed successfully."),
         ]
     )
-    agent = Agent(
-        name="tool_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([SimpleEchoTool()]),
-        checkpoints=store,
-    )
+    agent = Agent.create(provider, "Prompt", name="tool_agent", tools=[SimpleEchoTool()], checkpoints=store)
 
     stream = stream_start(agent, "Run tool")
-    events: list[EventType] = []
-    deltas: list[str] = []
-
-    async for item in stream:
-        if isinstance(item, Event):
-            events.append(item.type)
-        elif isinstance(item, TextDelta):
-            deltas.append(item.text)
+    events, deltas = await _collect(stream)
 
     assert EventType.TOOL_STARTED in events
     assert EventType.TOOL_FINISHED in events
@@ -290,21 +260,18 @@ async def test_stream_pause_and_stream_resume() -> None:
             text_response("Remediation complete."),
         ]
     )
-    agent = Agent(
+    agent = Agent.create(
+        provider,
+        "Prompt",
         name="approval_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([IrreversibleTool()]),
+        tools=[IrreversibleTool()],
         autonomy=Autonomy.ACT_WITH_APPROVAL,
         checkpoints=store,
     )
 
     # Initial stream pauses for approval
     stream1 = stream_start(agent, "Do rollback")
-    events1: list[EventType] = []
-    async for item in stream1:
-        if isinstance(item, Event):
-            events1.append(item.type)
+    events1, _ = await _collect(stream1)
 
     state1 = stream1.state
     assert state1.status is RunStatus.WAITING_FOR_APPROVAL
@@ -313,14 +280,7 @@ async def test_stream_pause_and_stream_resume() -> None:
 
     # Resume the stream with approval
     stream2 = stream_resume(agent, state1, approved=True, pending_id=state1.pending_id)
-    events2: list[EventType] = []
-    deltas2: list[str] = []
-
-    async for item in stream2:
-        if isinstance(item, Event):
-            events2.append(item.type)
-        elif isinstance(item, TextDelta):
-            deltas2.append(item.text)
+    _, deltas2 = await _collect(stream2)
 
     state2 = stream2.state
     assert state2.status is RunStatus.DONE
@@ -336,18 +296,9 @@ async def test_stream_structured_output() -> None:
         verdict: str
 
     provider = FakeProvider([text_response('{"score": 98, "verdict": "excellent"}')])
-    agent = Agent(
-        name="struct_agent",
-        router=ModelRouter(provider),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-    )
+    agent = Agent.create(provider, "Prompt", name="struct_agent")
 
-    stream = stream_start(agent, "Evaluate", output_model=FinalScore)
-    async for _ in stream:
-        pass
-
-    state = stream.state
+    state = await stream_start(agent, "Evaluate", output_model=FinalScore)
     assert state.status is RunStatus.DONE
     typed_output = state.output_as(FinalScore)
     assert typed_output.score == 98
@@ -358,28 +309,11 @@ async def test_stream_structured_output() -> None:
 # ------------------------------------------------------------------ Review fixes: closing and abandoning a stream
 
 
-class _ManyDeltasProvider:
-    """Streams far more deltas than any queue holds, then waits: the run is blocked on a full queue."""
-
-    id = "many"
-    capabilities = Capabilities(tools=True)
-
-    async def complete(self, request: ModelRequest) -> ModelResponse:
-        return text_response("done")
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
-        for i in range(500):
-            yield StreamDelta(text=f"w{i} ")
-        yield text_response("done")
-
-
 def _many_agent(store: InMemoryCheckpointStore) -> Agent:
-    return Agent(
-        name="many_agent",
-        router=ModelRouter(_ManyDeltasProvider()),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-        checkpoints=store,
+    """Streams far more deltas than any queue holds: the run is blocked on a full queue."""
+    deltas = [StreamDelta(text=f"w{i} ") for i in range(500)]
+    return Agent.create(
+        FakeProvider([[*deltas, text_response("done")]]), "Prompt", name="many_agent", checkpoints=store
     )
 
 
@@ -392,9 +326,7 @@ async def test_aclose_with_full_queue_and_stalled_consumer_does_not_hang() -> No
     await asyncio.wait_for(stream.aclose(), timeout=3)
 
     assert stream.state.status is RunStatus.CANCELLED
-    saved = await store.load("default", stream.state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.CANCELLED
+    assert await _saved_status(store, stream) is RunStatus.CANCELLED
     stream.state.check_protocol()
 
 
@@ -405,15 +337,10 @@ async def test_consumer_that_stops_reading_without_closing_cancels_the_run() -> 
     async for _ in stream:
         break  # abandons the stream, never calls aclose()
 
-    for _ in range(100):
-        if stream.done():
-            break
-        await asyncio.sleep(0.05)
+    await _wait_done(stream)
 
     assert stream.done(), "the run task must not leak"
-    saved = await store.load("default", stream.state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.CANCELLED
+    assert await _saved_status(store, stream) is RunStatus.CANCELLED
 
 
 @pytest.mark.anyio
@@ -422,10 +349,7 @@ async def test_stream_handle_cancel_with_full_queue_does_not_hang() -> None:
     stream = stream_start(_many_agent(store), "go", queue_size=2)
     await asyncio.sleep(0.1)
     stream.cancel()
-    for _ in range(100):
-        if stream.done():
-            break
-        await asyncio.sleep(0.05)
+    await _wait_done(stream)
     assert stream.done()
     assert stream.state.status is RunStatus.CANCELLED
 
@@ -452,26 +376,17 @@ async def test_router_stream_enforces_request_timeout() -> None:
             yield text_response("never")
 
     router = ModelRouter(Stalling(), retry=RetryPolicy(max_attempts=1, request_timeout_s=0.1), sleep=no_sleep)
-    request = ModelRequest(system="s", messages=(Message.user("hi"),))
     with pytest.raises(ProviderError, match="timed out"):
-        await asyncio.wait_for(router.stream(request), timeout=3)
+        await asyncio.wait_for(router.stream(_REQUEST), timeout=3)
 
 
 @pytest.mark.anyio
 async def test_stream_and_plain_run_end_in_the_same_state() -> None:
     def make() -> Agent:
-        return Agent(
-            name="parity",
-            router=ModelRouter(FakeProvider([text_response("same answer")])),
-            context=ContextBuilder("Prompt"),
-            tools=ToolRegistry([]),
-        )
+        return Agent.create(FakeProvider([text_response("same answer")]), "Prompt", name="parity")
 
     plain = await start(make(), "hello")
-    handle = stream_start(make(), "hello")
-    async for _ in handle:
-        pass
-    streamed = handle.state
+    streamed = await stream_start(make(), "hello")
 
     assert streamed.status is plain.status is RunStatus.DONE
     assert [m.text for m in streamed.messages] == [m.text for m in plain.messages]
@@ -503,9 +418,7 @@ async def test_aclose_right_after_start_still_persists_cancelled() -> None:
     await asyncio.wait_for(stream.aclose(), timeout=3)  # the task has not even started yet
 
     assert stream.state.status is RunStatus.CANCELLED
-    saved = await store.load("default", stream.state.run_id)
-    assert saved is not None
-    assert saved.status is RunStatus.CANCELLED
+    assert await _saved_status(store, stream) is RunStatus.CANCELLED
 
 
 @pytest.mark.anyio
@@ -520,24 +433,12 @@ async def test_awaiting_the_handle_returns_the_final_state_without_iterating() -
 
 @pytest.mark.anyio
 async def test_slow_consumer_does_not_count_against_the_provider_timeout() -> None:
-    class Fast:
-        id = "fast"
-        capabilities = Capabilities(tools=True)
-
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            return text_response("a b c")
-
-        async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
-            for word in ("a ", "b ", "c"):
-                yield StreamDelta(text=word)
-            yield text_response("a b c")
-
     async def slow(_: StreamDelta) -> None:
         await asyncio.sleep(0.15)  # 3 x 0.15 s > request_timeout_s
 
-    router = ModelRouter(Fast(), retry=RetryPolicy(max_attempts=1, request_timeout_s=0.3))
-    request = ModelRequest(system="s", messages=(Message.user("hi"),))
-    response, provider_id = await router.stream(request, on_delta=slow)
+    fast = FakeProvider([text_response("a b c")], id="fast")  # streams "a ", "b ", "c", then the answer
+    router = ModelRouter(fast, retry=RetryPolicy(max_attempts=1, request_timeout_s=0.3))
+    response, provider_id = await router.stream(_REQUEST, on_delta=slow)
 
     assert response.message.text == "a b c"
     assert provider_id == "fast"
@@ -548,8 +449,6 @@ async def test_slow_consumer_does_not_count_against_the_provider_timeout() -> No
 
 @pytest.mark.anyio
 async def test_stream_resume_closed_before_it_starts_leaves_a_waiting_run_untouched() -> None:
-    from .conftest import WriteFile, make_agent
-
     store = InMemoryCheckpointStore()
     write = WriteFile()
     agent, _, _ = make_agent(
@@ -576,8 +475,6 @@ async def test_stream_resume_closed_before_it_starts_leaves_a_waiting_run_untouc
 
 @pytest.mark.anyio
 async def test_stream_resume_recover_closed_before_it_starts_keeps_the_outcome_unknown_marker() -> None:
-    from .conftest import Crash, make_agent
-
     store = InMemoryCheckpointStore()
     crashing, _, _ = make_agent([Crash()], checkpoints=store)
     with pytest.raises(Crash):
@@ -610,12 +507,7 @@ async def test_a_cancelled_read_does_not_swallow_the_next_item() -> None:
                 yield StreamDelta(text=word)
             yield text_response("a b c")
 
-    agent = Agent(
-        name="words",
-        router=ModelRouter(Words()),
-        context=ContextBuilder("Prompt"),
-        tools=ToolRegistry([]),
-    )
+    agent = Agent.create(Words(), "Prompt", name="words")
     handle = stream_start(agent, "go")
     seen: list[str] = []
     while True:
@@ -633,59 +525,37 @@ async def test_a_cancelled_read_does_not_swallow_the_next_item() -> None:
 
 @pytest.mark.anyio
 async def test_a_consumer_stalling_longer_than_the_provider_deadline_is_not_a_provider_timeout() -> None:
-    class OneChunk:
-        id = "one"
-        capabilities = Capabilities(tools=True)
-
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            return text_response("hi")
-
-        async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
-            yield StreamDelta(text="hi")
-            yield text_response("hi")
-
     async def stalled(_: StreamDelta) -> None:
         await asyncio.sleep(0.4)  # longer than request_timeout_s
 
-    router = ModelRouter(OneChunk(), retry=RetryPolicy(max_attempts=1, request_timeout_s=0.1))
-    response, _ = await router.stream(ModelRequest(system="s", messages=(Message.user("hi"),)), on_delta=stalled)
+    one_chunk = FakeProvider([[StreamDelta(text="hi"), text_response("hi")]], id="one")
+    router = ModelRouter(one_chunk, retry=RetryPolicy(max_attempts=1, request_timeout_s=0.1))
+    response, _ = await router.stream(_REQUEST, on_delta=stalled)
     assert response.message.text == "hi"
 
 
 @pytest.mark.anyio
 async def test_reasoning_only_deltas_do_not_block_retry_and_failover() -> None:
-    attempts = {"n": 0}
-
-    class Flaky:
-        id = "flaky"
-        capabilities = Capabilities(tools=True)
-
-        async def complete(self, request: ModelRequest) -> ModelResponse:
-            return text_response("ok")
-
-        async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
-            attempts["n"] += 1
-            yield StreamDelta(thinking="pondering")
-            if attempts["n"] == 1:
-                raise ProviderError("dropped", retryable=True, provider_id="flaky")
-            yield text_response("ok")
+    flaky = FakeProvider(
+        [
+            [StreamDelta(thinking="pondering"), ProviderError("dropped", retryable=True, provider_id="flaky")],
+            [StreamDelta(thinking="pondering"), text_response("ok")],
+        ],
+        id="flaky",
+    )
 
     seen: list[StreamDelta] = []
 
     async def collect(delta: StreamDelta) -> None:
         seen.append(delta)
 
-    router = ModelRouter(Flaky(), retry=RetryPolicy(max_attempts=2, base_delay_s=0.0, max_delay_s=0.0), sleep=no_sleep)
-    response, _ = await router.stream(ModelRequest(system="s", messages=(Message.user("hi"),)), on_delta=collect)
-    assert response.message.text == "ok" and attempts["n"] == 2
+    router = ModelRouter(flaky, retry=RetryPolicy(max_attempts=2, base_delay_s=0.0, max_delay_s=0.0), sleep=no_sleep)
+    response, _ = await router.stream(_REQUEST, on_delta=collect)
+    assert response.message.text == "ok" and len(flaky.requests) == 2
 
 
 @pytest.mark.anyio
 async def test_the_stream_consumer_sees_an_error_of_the_run() -> None:
-    from ai_agent_harness.core.errors import ConcurrencyError
-
-    from .conftest import WriteFile
-
     store = InMemoryCheckpointStore()
     agent = Agent.create(
         FakeProvider([tool_response(("write_file", {"path": "a"}))]),
@@ -699,8 +569,7 @@ async def test_the_stream_consumer_sees_an_error_of_the_run() -> None:
 
     handle = stream_resume(agent, stale, approved=True, pending_id=stale.pending_id)
     with pytest.raises(ConcurrencyError):
-        async for _ in handle:
-            pass
+        await handle
 
 
 @pytest.mark.anyio
@@ -734,7 +603,6 @@ async def test_the_provider_deadline_still_applies_after_a_slow_consumer() -> No
         await asyncio.sleep(0.05)
 
     router = ModelRouter(HangsAfterOneChunk(), retry=RetryPolicy(max_attempts=1, request_timeout_s=0.3), sleep=no_sleep)
-    request = ModelRequest(system="s", messages=(Message.user("hi"),))
 
     with pytest.raises(ProviderError, match="timed out"):
-        await asyncio.wait_for(router.stream(request, on_delta=slow), timeout=5)
+        await asyncio.wait_for(router.stream(_REQUEST, on_delta=slow), timeout=5)

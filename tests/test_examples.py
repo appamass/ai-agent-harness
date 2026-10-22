@@ -18,9 +18,9 @@ from ai_agent_harness import RunState, RunStatus, resume, start
 from ai_agent_harness.core import InvalidStateError
 from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 
-from .conftest import Crash, load_example, run_sync
+from .conftest import REPO_ROOT, Crash, load_example, results_of, run_sync
 
-EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "repo_assistant.py"
+EXAMPLE = REPO_ROOT / "examples" / "repo_assistant.py"
 
 
 @pytest.fixture(scope="module")
@@ -129,10 +129,6 @@ def test_resuming_an_unknown_or_finished_run_fails_clearly(example: Any, project
 # ------------------------------------------------------------------ Safety of the tools
 
 
-def results(state: RunState) -> list[Any]:
-    return [r for m in state.messages for r in m.tool_results]
-
-
 def test_secrets_cannot_be_read_even_if_the_model_asks(example: Any, project: Path, tmp_path: Path) -> None:
     agent, _ = agent_for(
         example,
@@ -146,7 +142,7 @@ def test_secrets_cannot_be_read_even_if_the_model_asks(example: Any, project: Pa
     )
     state = run_sync(example.run_question(agent, "Show me the token.", approve))
     assert state.status is RunStatus.DONE
-    assert [r.is_error for r in results(state)] == [True, True]
+    assert [r.is_error for r in results_of(state)] == [True, True]
     assert "do-not-leak" not in state.model_dump_json()
 
 
@@ -193,7 +189,7 @@ def test_a_bad_note_name_is_rejected_before_any_approval(example: Any, project: 
 
     state = run_sync(example.run_question(agent, "Save it.", record_and_approve))
     assert state.status is RunStatus.DONE and asked == []
-    assert results(state)[0].is_error and not (tmp_path / "evil.md").exists()
+    assert results_of(state)[0].is_error and not (tmp_path / "evil.md").exists()
 
 
 def test_kill_switch_stops_the_run_before_the_model_is_called(example: Any, project: Path, tmp_path: Path) -> None:
@@ -306,8 +302,8 @@ def test_ctrl_c_at_the_approval_prompt_exits_promptly() -> None:
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=EXAMPLE.parent.parent,
-        env={**os.environ, "PYTHONPATH": str(EXAMPLE.parent.parent)},
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
     )
     assert process.stdin is not None and process.stdout is not None
     try:
