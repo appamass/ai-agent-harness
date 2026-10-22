@@ -112,17 +112,15 @@ class SqliteCheckpointStore:
         if connection is not None:
             self._connection = connection
         else:
-            db_target = database if database is not None else "checkpoints.sqlite"
-            db_str = str(db_target)
-            if db_str != ":memory:" and not db_str.startswith("file:"):
-                db_path = Path(db_target).resolve()
+            target = str(database if database is not None else "checkpoints.sqlite")
+            if target != ":memory:" and not target.startswith("file:"):
+                db_path = Path(target).resolve()
                 try:
                     db_path.parent.mkdir(parents=True, exist_ok=True)
                 except OSError as exc:
                     raise ConfigError(f"Database directory is not usable: {db_path.parent}") from exc
-                self._connection = sqlite3.connect(db_path, check_same_thread=False)
-            else:
-                self._connection = sqlite3.connect(db_str, check_same_thread=False)
+                target = str(db_path)
+            self._connection = sqlite3.connect(target, check_same_thread=False)
 
         with self._lock:
             self._connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")

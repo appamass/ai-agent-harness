@@ -63,14 +63,16 @@ class MCPToolDefinition:
     input_schema: dict[str, Any] = field(default_factory=dict[str, Any])
 
 
+PROTOCOL_VERSION = "2024-11-05"
+"""The MCP protocol revision this client speaks (and the mock server answers with)."""
+
+
 class MockMCPServer:
     """Deterministic in-memory mock MCP server for testing tools, errors, and rug-pulls."""
 
     def __init__(self, name: str = "mock-server") -> None:
         self.name = name
         self.tools: dict[str, tuple[MCPToolDefinition, MCPHandler]] = {}
-        self.simulate_timeout: bool = False
-        self.simulate_protocol_error: bool = False
         self._listeners: list[Callable[[str], None]] = []
 
     def add_listener(self, listener: Callable[[str], None]) -> None:
@@ -92,14 +94,9 @@ class MockMCPServer:
         self.tools[name] = (MCPToolDefinition(name=name, description=description, input_schema=input_schema), handler)
 
     async def handle_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        if method == "tools/call" and self.simulate_timeout:
-            await asyncio.sleep(60.0)
-        if self.simulate_protocol_error:
-            raise ToolError("Simulated MCP protocol error")
-
         if method == "initialize":
             return {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": self.name, "version": "1.0.0"},
             }
@@ -141,8 +138,6 @@ class MockMCPServer:
         raise ToolError(f"Unsupported MCP method: {method}")
 
     async def handle_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
-        if method == "notifications/initialized":
-            return
         log.debug("Mock MCP server received notification: %s", method)
 
 
@@ -342,8 +337,6 @@ class StdioMCPTransport:
             raise ToolError("MCP server is not reading its input") from exc
 
     async def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
-        if self._broken is not None:
-            raise self._broken
         self._request_id += 1
         req_id = self._request_id
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -424,7 +417,7 @@ class MCPClient:
         init_res = await self._transport.send_request(
             "initialize",
             {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
                 "clientInfo": {"name": "ai-agent-harness", "version": __version__},
             },

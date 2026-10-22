@@ -261,24 +261,25 @@ class OpenTelemetryListener:
         span.set_status(StatusCode.ERROR, description=f"Tool blocked by {source}")
         span.end()
 
-    def _on_approval_requested(self, event: Event) -> None:
+    def _run_event(self, event: Event, name: str, attrs: dict[str, str | int]) -> None:
         span = self._run_spans.get(event.run_id)
         if span is not None:
-            span.add_event(
-                "harness.approval_requested",
-                {"tool": str(event.data.get("tool", "")), "risk": str(event.data.get("risk", ""))},
-            )
+            span.add_event(name, attrs)
+
+    def _on_approval_requested(self, event: Event) -> None:
+        self._run_event(
+            event,
+            "harness.approval_requested",
+            {"tool": str(event.data.get("tool", "")), "risk": str(event.data.get("risk", ""))},
+        )
 
     def _on_input_requested(self, event: Event) -> None:
-        span = self._run_spans.get(event.run_id)
-        if span is not None:
-            span.add_event("harness.input_requested", {"tool": str(event.data.get("tool", ""))})
+        self._run_event(event, "harness.input_requested", {"tool": str(event.data.get("tool", ""))})
 
     def _on_checkpoint_saved(self, event: Event) -> None:
-        raw_rev = event.data.get("revision")
-        span = self._run_spans.get(event.run_id)
-        if span is not None and isinstance(raw_rev, int):
-            span.add_event("harness.checkpoint_saved", {"revision": raw_rev})
+        revision = event.data.get("revision")
+        if isinstance(revision, int):
+            self._run_event(event, "harness.checkpoint_saved", {"revision": revision})
 
     def _end_children(self, run_id: str, description: str) -> None:
         """Ends the tool and model spans still open for a run, marked as abandoned."""

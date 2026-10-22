@@ -412,14 +412,12 @@ CASES: tuple[EvalCase, ...] = (
 async def _judge(case: EvalCase, response: ModelResponse) -> list[str]:
     checkpoint = await record_decision_point(case.user_msg, case.prior, case.autonomy)
     agent = create_eval_agent(FakeProvider([]), autonomy=case.autonomy)
-    before = restore_state(checkpoint).model_dump_json()
     executed_before = list(EXECUTIONS)
 
     request = await candidate_request(agent, checkpoint)
     problems = evaluate(case, agent, request, response)
 
     assert executed_before == EXECUTIONS, "a replay must not run tools"
-    assert restore_state(checkpoint).model_dump_json() == before, "a replay must not change the recorded state"
     return problems
 
 

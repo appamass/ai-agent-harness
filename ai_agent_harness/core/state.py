@@ -289,14 +289,14 @@ class RunState(BaseModel):
         self.messages.append(Message(role="user", content=tuple(blocks)))
         self._touch()
 
-    def close_open_tool_calls(self, reason: str, known: Sequence[ToolResult] = ()) -> None:
-        """Answer open calls: keep known results and fill the rest as errors with `reason`."""
+    def close_open_tool_calls(self, reason: str, known: Sequence[ToolResult] = (), text: str | None = None) -> None:
+        """Answer open calls: keep known results and fill the rest as errors with `reason`. `text` rides along."""
         calls = self.open_tool_calls()
         if not calls:
             return
         by_id = {r.call_id: r for r in known}
         results = [by_id.get(c.id) or ToolResult(call_id=c.id, content=reason, is_error=True) for c in calls]
-        self.add_tool_results(results)
+        self.add_tool_results(results, text=text)
 
     def set_status(self, status: RunStatus, reason: str | None = None) -> None:
         if status is not RunStatus.DONE:

@@ -179,8 +179,12 @@ def test_mcp_tool_error_from_server_is_handled_safely() -> None:
 
 def test_mcp_timeout_is_handled_cleanly() -> None:
     server = MockMCPServer("mock")
-    server.register_tool("hanging_tool", "Hangs indefinitely", {}, lambda args: "done")
-    server.simulate_timeout = True
+
+    async def hang(args: dict[str, Any]) -> str:
+        await asyncio.sleep(60.0)
+        return "done"
+
+    server.register_tool("hanging_tool", "Hangs indefinitely", {}, hang)
 
     tools = run_sync(
         load_mcp_tools(

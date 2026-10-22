@@ -109,30 +109,25 @@ class _StreamSink:
             self.queue.get_nowait()
         self._put_nowait(None)
 
-    async def put(self, item: StreamItem) -> None:
-        if self.closed:
+    async def _deliver(self, item: StreamItem | None) -> bool:
+        """Queues `item`. False if the consumer stopped reading (the sink was abandoned instead)."""
+        if self.closed or not self.queue.full():  # the common case: no timer needed
             self._put_nowait(item)
-            return
-        try:
-            self.queue.put_nowait(item)  # the common case: room left, no timer needed
-            return
-        except asyncio.QueueFull:
-            pass
+            return True
         try:
             await asyncio.wait_for(self.queue.put(item), self.idle_timeout_s)
         except TimeoutError:
             self._abandon()
+            return False
+        return True
+
+    async def put(self, item: StreamItem) -> None:
+        if not await self._deliver(item):
             # Treated like a cancellation by `_Run.guarded`: persists `CANCELLED` and ends the task.
-            raise asyncio.CancelledError("stream consumer stopped reading") from None
+            raise asyncio.CancelledError("stream consumer stopped reading")
 
     async def finish(self) -> None:
-        if self.closed:
-            self._put_nowait(None)
-            return
-        try:
-            await asyncio.wait_for(self.queue.put(None), self.idle_timeout_s)
-        except TimeoutError:
-            self._abandon()
+        await self._deliver(None)
 
 
 class StreamHandle:
@@ -899,9 +894,7 @@ class _Run:
         self.state.batch_done = ()
         if final_rejected:
             # An invalid final output counts like any rejected response (the tool error already told the model why).
-            self.state.consecutive_retries += 1
-            if self.state.consecutive_retries > self.agent.limits.max_consecutive_retries:
-                await self._finish(RunStatus.FAILED, "Model repeatedly returned unusable final output")
+            if not await self._count_retry("Model repeatedly returned unusable final output"):
                 return True
         else:
             self.state.consecutive_retries = 0
@@ -929,22 +922,22 @@ class _Run:
     async def _reject(self, reason: str) -> bool:
         """Rejects the last response with feedback. Returns False if retry limit reached (run finished)."""
         state = self.state
-        state.consecutive_retries += 1
-        if state.consecutive_retries > self.agent.limits.max_consecutive_retries:
-            await self._finish(RunStatus.FAILED, f"Model repeatedly returned unusable responses: {reason}")
+        if not await self._count_retry(f"Model repeatedly returned unusable responses: {reason}"):
             return False
         feedback = f"Your last response was rejected: {reason}"
-        calls = state.open_tool_calls()
-        if calls:
-            by_id = {r.call_id: r for r in state.batch_done}
-            results = [
-                by_id.get(c.id) or ToolResult(call_id=c.id, content=f"Not executed: {reason}", is_error=True)
-                for c in calls
-            ]
+        if state.open_tool_calls():
+            state.close_open_tool_calls(f"Not executed: {reason}", known=state.batch_done, text=feedback)
             state.batch_done = ()
-            state.add_tool_results(results, text=feedback)
         else:
             state.add_user_text(feedback)
+        return True
+
+    async def _count_retry(self, failure: str) -> bool:
+        """Counts one unusable response. False if the retry limit is reached (the run finished as failed)."""
+        self.state.consecutive_retries += 1
+        if self.state.consecutive_retries > self.agent.limits.max_consecutive_retries:
+            await self._finish(RunStatus.FAILED, failure)
+            return False
         return True
 
     async def _accept_user_text(self, text: str) -> bool:
