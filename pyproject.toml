@@ -1,6 +1,6 @@
 [project]
 name = "ai-agent-harness"
-version = "0.7.0"
+version = "0.8.0"
 description = "Model-agnostic Python harness for AI agents: human approval, guardrails, crash-safe runs"
 readme = "README.md"
 license = "MIT"
@@ -41,19 +41,29 @@ Issues = "https://github.com/appamass/ai-agent-harness/issues"
 Changelog = "https://github.com/appamass/ai-agent-harness/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# Model provider adapter (ai_agent_harness.providers.anthropic). The core never imports it.
+# Model provider adapters. The core never imports them.
 anthropic = ["anthropic>=1.15,<2"]
+openai = ["openai>=1.40,<2"]
 # Checkpoint store for several workers (ai_agent_harness.persistence_postgres). The core never imports it.
 postgres = ["psycopg[binary,pool]>=3.2,<4"]
-# cryptography only for doc tests (Use Case 01); anthropic so the adapter is type-checked and tested in CI
+# adapters (anthropic, openai, psycopg) are type-checked and tested in CI; anyio runs the async tests
 dev = [
   "pytest>=8",
+  "anyio>=4",  # the async tests use its pytest plugin (`@pytest.mark.anyio`)
+  "pytest-timeout>=2",  # a hang becomes a failing test instead of a stuck run
   "mypy>=1.10",
   "pyright>=1.1.380",
   "ruff>=0.5",
-  "cryptography>=42",
   "anthropic>=1.15,<2",
+  "openai>=1.40,<2",
   "psycopg[binary,pool]>=3.2,<4",
+  "opentelemetry-api>=1.20,<2",
+  "opentelemetry-sdk>=1.20,<2",
+]
+# OpenTelemetry listener (ai_agent_harness.observability). The core never imports it.
+opentelemetry = [
+  "opentelemetry-api>=1.20,<2",
+  "opentelemetry-sdk>=1.20,<2",
 ]
 
 [build-system]
@@ -70,6 +80,7 @@ ai_agent_harness = ["py.typed"]
 testpaths = ["tests"]
 # Tests marked "live" call a real model API and cost money: they are opt-in (`pytest -m live`), never part of a default run.
 addopts = "-ra --strict-markers -m 'not live'"
+timeout = 60
 markers = ["live: calls a real model API (needs an API key, costs money); run with `pytest -m live`"]
 filterwarnings = ["error"]
 
@@ -107,3 +118,5 @@ pythonVersion = "3.11"
 typeCheckingMode = "strict"
 # Runtime checks against external code (adapters, tools, hooks) are intentional even when static types make them look redundant
 reportUnnecessaryIsInstance = false
+
+
