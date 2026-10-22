@@ -34,21 +34,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, LiteralString
 
 from .core.errors import ConcurrencyError, ConfigError
 from .core.state import RunState, RunStatus, restore_state
-from .persistence import (
-    DEFAULT_TABLE,
-    RunInfo,
-    WriteRecord,
-    check_ids,
-    check_list_limit,
-    check_tenant_id,
-    settle_write,
-    sql_identifier,
-    status_index_name,
-)
+from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, settle_write
+from .persistence_sql import DEFAULT_TABLE, WriteRecord, sql_identifier, statements, status_index_name
 
 try:
     import psycopg
@@ -56,6 +47,9 @@ try:
     from psycopg_pool import AsyncConnectionPool
 except ImportError as exc:
     raise ConfigError("The Postgres store needs the driver: pip install 'ai-agent-harness[postgres]'") from exc
+
+
+_SQL = statements("%s", "now()")
 
 
 def _create_statements(schema: str, table: str) -> list[sql.Composed]:
@@ -117,19 +111,13 @@ class PostgresCheckpointStore:
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
-        query = sql.SQL("SELECT state FROM {table} WHERE tenant_id = %s AND run_id = %s").format(table=self._qualified)
+        query = self._sql(_SQL.load)
         async with self._connection() as connection:
             row = await (await connection.execute(query, (tenant_id, run_id))).fetchone()
         return restore_state(str(row[0]), tenant_id=tenant_id, run_id=run_id) if row is not None else None
 
     async def _write(self, record: WriteRecord) -> None:
-        query = sql.SQL(
-            "INSERT INTO {table} AS c (tenant_id, run_id, revision, status, schema_version, state, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, now()) "
-            "ON CONFLICT (tenant_id, run_id) DO UPDATE SET revision = EXCLUDED.revision, status = EXCLUDED.status, "
-            "schema_version = EXCLUDED.schema_version, state = EXCLUDED.state, updated_at = now() "
-            "WHERE c.revision = %s RETURNING c.revision"
-        ).format(table=self._qualified)
+        query = self._sql(_SQL.upsert)
         async with self._connection() as connection:
             row = await (await connection.execute(query, record.params)).fetchone()
         if row is None:  # the row exists with another revision: someone saved in the meantime
@@ -144,16 +132,10 @@ class PostgresCheckpointStore:
         check_tenant_id(tenant_id)
         check_list_limit(limit)
         if status is None:
-            query = sql.SQL(
-                "SELECT run_id, status, revision, updated_at FROM {table} WHERE tenant_id = %s "
-                "ORDER BY updated_at DESC, run_id LIMIT %s"
-            ).format(table=self._qualified)
+            query = self._sql(_SQL.list_all)
             params: tuple[Any, ...] = (tenant_id, limit)
         else:
-            query = sql.SQL(
-                "SELECT run_id, status, revision, updated_at FROM {table} WHERE tenant_id = %s AND status = %s "
-                "ORDER BY updated_at DESC, run_id LIMIT %s"
-            ).format(table=self._qualified)
+            query = self._sql(_SQL.list_status)
             params = (tenant_id, str(status), limit)
         async with self._connection() as connection:
             records = await (await connection.execute(query, params)).fetchall()
@@ -162,7 +144,7 @@ class PostgresCheckpointStore:
     async def delete_run(self, tenant_id: str, run_id: str) -> bool:
         """Deletes one run (retention policy, right to erasure). Returns whether a run existed."""
         check_ids(tenant_id, run_id)
-        query = sql.SQL("DELETE FROM {table} WHERE tenant_id = %s AND run_id = %s").format(table=self._qualified)
+        query = self._sql(_SQL.delete_run)
         async with self._connection() as connection:
             cursor = await connection.execute(query, (tenant_id, run_id))
             return cursor.rowcount > 0
@@ -170,12 +152,15 @@ class PostgresCheckpointStore:
     async def delete_tenant(self, tenant_id: str) -> int:
         """Deletes all runs of a tenant (for example when an account is closed). Returns how many were deleted."""
         check_tenant_id(tenant_id)
-        query = sql.SQL("DELETE FROM {table} WHERE tenant_id = %s").format(table=self._qualified)
+        query = self._sql(_SQL.delete_tenant)
         async with self._connection() as connection:
             cursor = await connection.execute(query, (tenant_id,))
             return cursor.rowcount
 
     # ------------------------------------------------------------------ Connections
+
+    def _sql(self, template: LiteralString) -> sql.Composed:
+        return sql.SQL(template).format(table=self._qualified)
 
     @asynccontextmanager
     async def _connection(self) -> AsyncGenerator[psycopg.AsyncConnection[Any]]:

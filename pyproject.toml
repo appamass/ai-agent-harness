@@ -111,6 +111,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "PLR", "PT011", "PT018", "PLC0415", "BLE001", "TRY"]
+# Statements are built from fixed text; table names pass `sql_identifier` (ADR 0018, ADR 0020)
+"ai_agent_harness/persistence_sql.py" = ["S608"]
 
 [tool.pyright]
 include = ["ai_agent_harness", "examples", "tests"]
@@ -118,5 +120,3 @@ pythonVersion = "3.11"
 typeCheckingMode = "strict"
 # Runtime checks against external code (adapters, tools, hooks) are intentional even when static types make them look redundant
 reportUnnecessaryIsInstance = false
-
-

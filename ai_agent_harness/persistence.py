@@ -19,10 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import json
 import os
-import re
 import tempfile
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -33,10 +31,8 @@ from typing import Final, Protocol
 from .core.errors import ConcurrencyError, ConfigError, InvalidStateError
 from .core.state import RunState, RunStatus, restore_state
 from .core.types import ID_RE
+from .persistence_sql import WriteRecord
 
-_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
-
-DEFAULT_TABLE: Final = "ai_agent_harness_checkpoints"
 MAX_LIST_LIMIT: Final = 10_000
 
 try:  # POSIX file locks; without fcntl (Windows), JsonFileCheckpointStore refuses to start
@@ -61,57 +57,6 @@ class RunInfo:
     status: RunStatus
     revision: int
     updated_at: datetime
-
-
-@dataclass(frozen=True)
-class WriteRecord:
-    """One checkpoint write for the SQL stores: the new row values plus the revision the row must still have."""
-
-    tenant_id: str
-    run_id: str
-    expected: int
-    new_revision: int
-    payload: str
-    status: str
-    schema_version: int
-
-    @classmethod
-    def from_state(cls, state: RunState) -> WriteRecord:
-        new_revision = state.revision + 1
-        return cls(
-            tenant_id=state.tenant_id,
-            run_id=state.run_id,
-            expected=state.revision,
-            new_revision=new_revision,
-            payload=state.model_copy(update={"revision": new_revision}).model_dump_json(),
-            status=str(state.status),
-            schema_version=state.schema_version,
-        )
-
-    @property
-    def params(self) -> tuple[str, str, int, str, int, str, int]:
-        """Values in the order of the stores' upsert statement; the last one is the expected revision."""
-        return (
-            self.tenant_id,
-            self.run_id,
-            self.new_revision,
-            self.status,
-            self.schema_version,
-            self.payload,
-            self.expected,
-        )
-
-
-def sql_identifier(value: str, what: str) -> str:
-    """Table and schema names go into DDL text, so only plain lower-case identifiers are accepted."""
-    if not _IDENTIFIER.fullmatch(value):
-        raise ConfigError(f"Invalid {what} identifier {value!r}: use 1-63 lower-case letters, digits, or underscores")
-    return value
-
-
-def status_index_name(table: str) -> str:
-    """Names are cut at 63 characters: a short hash keeps long tables with a shared prefix from sharing an index."""
-    return f"{table[:30]}_{hashlib.sha256(table.encode()).hexdigest()[:8]}_status_idx"
 
 
 def check_tenant_id(tenant_id: str) -> None:
@@ -165,9 +110,9 @@ class InMemoryCheckpointStore:
             stored = self._data.get(key)
             if stored is not None and stored[0] != state.revision:
                 raise ConcurrencyError(f"Run {state.run_id} was modified concurrently")
-            new_revision = state.revision + 1
-            self._data[key] = (new_revision, state.model_copy(update={"revision": new_revision}).model_dump_json())
-            state.revision = new_revision
+            record = WriteRecord.from_state(state)
+            self._data[key] = (record.new_revision, record.payload)
+            state.revision = record.new_revision
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)

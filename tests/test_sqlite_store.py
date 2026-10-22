@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from ai_agent_harness.core import ConcurrencyError, ConfigError
-from ai_agent_harness.persistence import status_index_name
+from ai_agent_harness.persistence_sql import status_index_name
 from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore, schema_sql
 
 from .conftest import run_sync, waiting_state
