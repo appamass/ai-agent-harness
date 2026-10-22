@@ -11,13 +11,22 @@ import re
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit
 
 from .core.errors import ConfigError
 from .core.hooks import CONTINUE, Decision, Hook, ToolInvocation
 from .core.state import RunState
 from .core.types import ModelRequest, ModelResponse, Risk, ToolResult
+
+_T = TypeVar("_T")
+
+
+def _at_least_one(items: tuple[_T, ...], guard: str) -> tuple[_T, ...]:
+    if not items:
+        raise ValueError(f"{guard} requires at least one pattern")
+    return items
+
 
 DEFAULT_PROTECTED: tuple[str, ...] = (
     "tests",
@@ -104,9 +113,7 @@ class ProtectedPaths(Hook):
         extra_keys: Iterable[str] = (),
         root: str | Path | None = None,
     ) -> None:
-        self._patterns = tuple(p.casefold().strip("/") for p in patterns)
-        if not self._patterns:
-            raise ValueError("ProtectedPaths requires at least one pattern")
+        self._patterns = _at_least_one(tuple(p.casefold().strip("/") for p in patterns), "ProtectedPaths")
         self._extra_keys = frozenset(k.casefold() for k in extra_keys)
         self._root: Path | None = None
         if root is not None:
@@ -177,10 +184,7 @@ class SecretGuard(Hook):
         check_user_input: bool = False,
         check_model_output: bool = True,
     ) -> None:
-        compiled = tuple((name, re.compile(expr)) for name, expr in patterns)
-        if not compiled:
-            raise ValueError("SecretGuard requires at least one pattern")
-        self._patterns = compiled
+        self._patterns = _at_least_one(tuple((name, re.compile(expr)) for name, expr in patterns), "SecretGuard")
         self._check_user_input = check_user_input
         self._check_model_output = check_model_output
 
@@ -198,34 +202,29 @@ class SecretGuard(Hook):
             cleaned = pattern.sub(replacement, cleaned)
         return cleaned
 
+    def _check(self, texts: Iterable[str], blocked: str) -> Decision:
+        """Blocks with `blocked` and the category of the first secret found in `texts` (never the secret itself)."""
+        for text in texts:
+            kind = self.find_secret(text)
+            if kind is not None:
+                return Decision.block(f"{blocked}: contains potential secret ({kind})")
+        return CONTINUE
+
     async def on_user_input(self, state: RunState, text: str) -> Decision:
         if not self._check_user_input:
             return CONTINUE
-        kind = self.find_secret(text)
-        if kind is not None:
-            return Decision.block(f"User input blocked: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([text], "User input blocked")
 
     async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
         if not self._check_model_output:
             return CONTINUE
-        kind = self.find_secret(response.message.text)
-        if kind is not None:
-            return Decision.block(f"Model response blocked: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([response.message.text], "Model response blocked")
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        for value in _all_strings(invocation.args.model_dump()):
-            kind = self.find_secret(value)
-            if kind is not None:
-                return Decision.block(f"Tool arguments blocked: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check(_all_strings(invocation.args.model_dump()), "Tool arguments blocked")
 
     async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
-        kind = self.find_secret(result.content)
-        if kind is not None:
-            return Decision.block(f"Tool output withheld: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([result.content], "Tool output withheld")
 
 
 _URL_IN_TEXT = re.compile(
@@ -375,10 +374,7 @@ class WeakeningGuard(Hook):
     """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
 
     def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
-        compiled = tuple(re.compile(p, re.IGNORECASE) for p in patterns)
-        if not compiled:
-            raise ValueError("WeakeningGuard requires at least one pattern")
-        self._patterns = compiled
+        self._patterns = _at_least_one(tuple(re.compile(p, re.IGNORECASE) for p in patterns), "WeakeningGuard")
 
     def check_text(self, text: str) -> str | None:
         """Returns the first matched check-weakening directive in `text`, or `None`."""

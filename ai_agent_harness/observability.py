@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 from ._version import __version__
 from .core.errors import ConfigError
@@ -30,6 +31,11 @@ except ImportError:
         from opentelemetry.trace import Span, SpanKind, StatusCode, Tracer
 
 log = logging.getLogger("ai_agent_harness.run")
+
+
+def _is_int(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool)
+
 
 _USAGE_ATTRIBUTES = (
     # (usage key, span attribute, only recorded when > 0)
@@ -88,38 +94,29 @@ class OpenTelemetryListener:
         self._run_spans: dict[str, Span] = {}
         self._model_spans: dict[str, tuple[Span, float]] = {}  # run_id -> (span, monotonic start)
         self._tool_spans: dict[tuple[str, str], Span] = {}
+        self._handlers: dict[EventType, Callable[[Event], None]] = {
+            EventType.RUN_STARTED: self._on_run_started,
+            EventType.RUN_RESUMED: self._on_run_resumed,
+            EventType.MODEL_REQUEST: self._on_model_request,
+            EventType.MODEL_RESPONSE: self._on_model_response,
+            EventType.PROVIDER_RETRY: self._on_provider_retry,
+            EventType.PROVIDER_FAILOVER: self._on_provider_failover,
+            EventType.TOOL_STARTED: self._on_tool_started,
+            EventType.TOOL_FINISHED: self._on_tool_finished,
+            EventType.TOOL_BLOCKED: self._on_tool_blocked,
+            EventType.APPROVAL_REQUESTED: self._on_approval_requested,
+            EventType.INPUT_REQUESTED: self._on_input_requested,
+            EventType.CHECKPOINT_SAVED: self._on_checkpoint_saved,
+            EventType.RUN_FINISHED: self._on_run_finished,
+        }
 
     async def __call__(self, event: Event) -> None:
         await self.handle(event)
 
     async def handle(self, event: Event) -> None:
-        match event.type:
-            case EventType.RUN_STARTED:
-                self._on_run_started(event)
-            case EventType.RUN_RESUMED:
-                self._on_run_resumed(event)
-            case EventType.MODEL_REQUEST:
-                self._on_model_request(event)
-            case EventType.MODEL_RESPONSE:
-                self._on_model_response(event)
-            case EventType.PROVIDER_RETRY:
-                self._on_provider_retry(event)
-            case EventType.PROVIDER_FAILOVER:
-                self._on_provider_failover(event)
-            case EventType.TOOL_STARTED:
-                self._on_tool_started(event)
-            case EventType.TOOL_FINISHED:
-                self._on_tool_finished(event)
-            case EventType.TOOL_BLOCKED:
-                self._on_tool_blocked(event)
-            case EventType.APPROVAL_REQUESTED:
-                self._on_approval_requested(event)
-            case EventType.INPUT_REQUESTED:
-                self._on_input_requested(event)
-            case EventType.CHECKPOINT_SAVED:
-                self._on_checkpoint_saved(event)
-            case EventType.RUN_FINISHED:
-                self._on_run_finished(event)
+        handler = self._handlers.get(event.type)
+        if handler is not None:
+            handler(event)
 
     def _start(self, name: str, kind: SpanKind, event: Event, *, child: bool = True) -> Span:
         """Starts a span with the attributes every harness span carries; `child` attaches it to the run span."""
@@ -159,7 +156,7 @@ class OpenTelemetryListener:
         span.set_attribute("gen_ai.operation.name", "chat")
         for key, attribute in (("messages", "harness.request.messages"), ("tools", "harness.request.tools")):
             value = event.data.get(key)
-            if isinstance(value, int):
+            if _is_int(value):
                 span.set_attribute(attribute, value)
         self._model_spans[event.run_id] = (span, time.monotonic())
 
@@ -170,6 +167,7 @@ class OpenTelemetryListener:
         span, started = entry
         provider = str(event.data.get("provider", "unknown"))
         model = str(event.data.get("model", "unknown"))
+        chat = {"gen_ai.operation.name": "chat", "gen_ai.provider.name": provider, "gen_ai.response.model": model}
         span.update_name(f"chat {model}")
         span.set_attribute("gen_ai.provider.name", provider)
         span.set_attribute("gen_ai.response.model", model)
@@ -182,30 +180,16 @@ class OpenTelemetryListener:
             usage = cast("dict[str, object]", usage_raw)
             for key, attribute, positive_only in _USAGE_ATTRIBUTES:
                 value = usage.get(key)
-                if isinstance(value, int) and (value > 0 or not positive_only):
+                if _is_int(value) and (value > 0 or not positive_only):
                     span.set_attribute(attribute, value)
-            self._record_token_usage(usage, provider, model)
+            for token_type in ("input", "output"):
+                value = usage.get(f"{token_type}_tokens")
+                if _is_int(value):
+                    self._token_usage.record(value, {**chat, "gen_ai.token.type": token_type})
 
-        self._operation_duration.record(
-            time.monotonic() - started,
-            {"gen_ai.operation.name": "chat", "gen_ai.provider.name": provider, "gen_ai.response.model": model},
-        )
+        self._operation_duration.record(time.monotonic() - started, chat)
         span.set_status(StatusCode.OK)
         span.end()
-
-    def _record_token_usage(self, usage: dict[str, object], provider: str, model: str) -> None:
-        for token_type, key in (("input", "input_tokens"), ("output", "output_tokens")):
-            value = usage.get(key)
-            if isinstance(value, int) and not isinstance(value, bool):
-                self._token_usage.record(
-                    value,
-                    {
-                        "gen_ai.operation.name": "chat",
-                        "gen_ai.provider.name": provider,
-                        "gen_ai.response.model": model,
-                        "gen_ai.token.type": token_type,
-                    },
-                )
 
     def _on_provider_retry(self, event: Event) -> None:
         self._add_model_event(event, "gen_ai.retry", ("provider", str), ("attempt", int), ("delay_s", float))
@@ -223,11 +207,9 @@ class OpenTelemetryListener:
             value = event.data.get(key)
             if kind is str and value is not None:
                 attrs[key] = str(value)
-            elif kind is float and isinstance(value, int | float) and not isinstance(value, bool):
+            elif kind is float and (_is_int(value) or isinstance(value, float)):
                 attrs[key] = float(value)
-            elif (kind is int and isinstance(value, int) and not isinstance(value, bool)) or (
-                kind is bool and isinstance(value, bool)
-            ):
+            elif (kind is int and _is_int(value)) or (kind is bool and isinstance(value, bool)):
                 attrs[key] = value
         entry[0].add_event(name, attrs)
 
