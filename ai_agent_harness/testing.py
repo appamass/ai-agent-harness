@@ -7,22 +7,22 @@ Do not use in production code.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import AsyncIterator, Iterator, Sequence
+from typing import Any, cast
 
 from .core.types import Message, ModelRequest, ModelResponse, StopReason, TextBlock, ToolCall, Usage
-from .providers.base import Capabilities
+from .providers.base import Capabilities, StreamDelta
 
 
 class FakeProvider:
     def __init__(
         self,
-        script: Sequence[ModelResponse | BaseException],
+        script: Sequence[ModelResponse | BaseException | Sequence[StreamDelta | ModelResponse | BaseException]],
         *,
         id: str = "fake",
         capabilities: Capabilities | None = None,
     ) -> None:
-        self._script = list(script)
+        self._script: list[Any] = list(script)
         self._id = id
         self._capabilities = capabilities or Capabilities(tools=True, vision=True)
         self.requests: list[ModelRequest] = []
@@ -39,7 +39,7 @@ class FakeProvider:
     def remaining(self) -> int:
         return len(self._script)
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    def _next_item(self, request: ModelRequest) -> Any:
         self.requests.append(request)
         if not self._script:
             raise AssertionError(f"FakeProvider '{self._id}': script is empty, unexpected call")
@@ -47,6 +47,40 @@ class FakeProvider:
         if isinstance(item, BaseException):
             raise item
         return item
+
+    @staticmethod
+    def _events(item: Any) -> Iterator[StreamDelta | ModelResponse]:
+        """What a script item makes the provider emit; scripted exceptions are raised in order."""
+        if isinstance(item, ModelResponse):
+            yield from _word_deltas(item)
+            yield item
+            return
+        if not isinstance(item, (list, tuple)):
+            raise TypeError(f"unexpected script item {type(item).__name__}")
+        for sub in cast(Sequence[object], item):
+            if isinstance(sub, BaseException):
+                raise sub
+            if isinstance(sub, (StreamDelta, ModelResponse)):
+                yield sub
+
+    async def complete(self, request: ModelRequest) -> ModelResponse:
+        item = self._next_item(request)
+        if isinstance(item, ModelResponse):
+            return item
+        for event in self._events(item):
+            if isinstance(event, ModelResponse):
+                return event
+        raise AssertionError(f"FakeProvider '{self._id}': scripted sequence did not contain ModelResponse")
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
+        for event in self._events(self._next_item(request)):
+            yield event
+
+
+def _word_deltas(response: ModelResponse) -> Iterator[StreamDelta]:
+    words = response.message.text.split(" ") if response.message.text else []
+    for i, word in enumerate(words):
+        yield StreamDelta(text=word if i == len(words) - 1 else word + " ")
 
 
 def text_response(text: str, *, stop: StopReason = StopReason.END, tokens: int = 10) -> ModelResponse:

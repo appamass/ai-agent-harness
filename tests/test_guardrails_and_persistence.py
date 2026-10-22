@@ -122,12 +122,21 @@ class TestProtectedPaths:
         assert "protected" in results_of(state)[0].content
 
 
-@pytest.fixture(params=["memory", "file", "postgres"])
+@pytest.fixture(params=["memory", "file", "postgres", "sqlite"])
 def store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[CheckpointStore]:
     if request.param == "memory":
         yield InMemoryCheckpointStore()
     elif request.param == "file":
         yield JsonFileCheckpointStore(tmp_path / "cp")
+    elif request.param == "sqlite":
+        from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore
+
+        sqlite_store = SqliteCheckpointStore(tmp_path / "checkpoints.sqlite")
+        run_sync(sqlite_store.setup())
+        try:
+            yield sqlite_store
+        finally:
+            sqlite_store.close()
     else:  # needs HARNESS_TEST_POSTGRES_DSN, skipped otherwise
         with fresh_postgres_schema() as (dsn, schema):
             from ai_agent_harness.persistence_postgres import PostgresCheckpointStore

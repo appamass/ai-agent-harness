@@ -1,0 +1,37 @@
+{
+  "id": "chatcmpl-fixture-tools",
+  "object": "chat.completion",
+  "created": 1729600000,
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_abc123",
+            "type": "function",
+            "function": {
+              "name": "echo",
+              "arguments": "{\"message\": \"hello\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 40,
+    "completion_tokens": 20,
+    "total_tokens": 60,
+    "prompt_tokens_details": {
+      "cached_tokens": 10
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}

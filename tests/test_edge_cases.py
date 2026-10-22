@@ -29,7 +29,7 @@ from ai_agent_harness import (
 from ai_agent_harness.core import InvalidStateError
 from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import Echo, EmptyInput, WriteFile, assert_consistent, make_agent, results_of, run_sync
+from .conftest import Crash, Echo, EmptyInput, WriteFile, assert_consistent, make_agent, results_of, run_sync
 
 
 def test_checkpoint_is_saved_after_every_step() -> None:
@@ -255,10 +255,6 @@ def test_crash_during_tool_execution_is_reported_as_unknown_after_recover(tmp_pa
     assert state.status is RunStatus.DONE
     assert CrashingSend.executed == 1  # not automatically re-executed
     assert "unknown" in provider.requests[0].messages[-1].tool_results[0].content
-
-
-class Crash(BaseException):
-    """Hard process termination (bypasses all `except Exception` handlers)."""
 
 
 class CrashAfterSideEffect(BaseTool[EmptyInput]):

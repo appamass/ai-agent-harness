@@ -78,6 +78,17 @@ async def no_sleep(_: float) -> None:
     return None
 
 
+class Crash(BaseException):
+    """Hard process termination: not an `Exception`, so the runner does not turn it into a status."""
+
+
+def waiting_state(tenant: str = "t1", run: str = "r1") -> RunState:
+    """A minimal valid state for store tests: one user message."""
+    state = RunState(agent_name="a", tenant_id=tenant, run_id=run)
+    state.add_user_text("hi")
+    return state
+
+
 class EmptyInput(BaseModel):
     pass
 

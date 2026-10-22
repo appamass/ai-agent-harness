@@ -1,4 +1,4 @@
-"""PostgresCheckpointStore. Database tests need `HARNESS_TEST_POSTGRES_DSN` (CONTRIBUTING.md); the rest always runs."""
+"""PostgresCheckpointStore. Database tests need `HARNESS_TEST_POSTGRES_DSN` (AGENTS.md); the rest always runs."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from ai_agent_harness import Autonomy, RunState, RunStatus, resume, start
+from ai_agent_harness import Autonomy, RunStatus, resume, start
 from ai_agent_harness.core import ConcurrencyError, ConfigError, InvalidStateError
 from ai_agent_harness.persistence_postgres import PostgresCheckpointStore, schema_sql
 from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import WriteFile, fresh_postgres_schema, make_agent, run_sync
+from .conftest import Crash, WriteFile, fresh_postgres_schema, make_agent, run_sync, waiting_state
 
 TABLE = "ai_agent_harness_checkpoints"
 
@@ -42,12 +42,6 @@ def rows(database: tuple[str, str], query: LiteralString, *params: object) -> li
         statement = sql.SQL(query).format(table=sql.Identifier(schema, TABLE))
         cursor = connection.execute(statement, params)
         return cursor.fetchall() if cursor.description else []
-
-
-def waiting_state(tenant: str = "t1", run: str = "r1") -> RunState:
-    state = RunState(agent_name="a", tenant_id=tenant, run_id=run)
-    state.add_user_text("hi")
-    return state
 
 
 # ------------------------------------------------------------------ Without a database
@@ -279,10 +273,6 @@ def test_an_approval_resumes_in_another_process(database: tuple[str, str], store
     done = run_sync(resume(other_agent, loaded, approved=True, pending_id=shown))
     assert done.status is RunStatus.DONE and write.written == ["a.txt"]
     assert [r.status for r in run_sync(store.list_runs("default"))] == [RunStatus.DONE]
-
-
-class Crash(BaseException):  # like a killed process: the runner does not turn it into a status
-    pass
 
 
 def test_a_crashed_run_is_recovered_from_the_database(

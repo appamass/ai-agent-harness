@@ -119,9 +119,9 @@ def test_arguments_error_excludes_arguments() -> None:
 # ------------------------------------------------------------------ Schema v2
 
 
-def test_schema_is_v2_with_a_migration_from_v1() -> None:
-    assert SCHEMA_VERSION == 2
-    assert 1 in MIGRATIONS
+def test_schema_is_v3_with_migrations() -> None:
+    assert SCHEMA_VERSION == 3
+    assert 1 in MIGRATIONS and 2 in MIGRATIONS
 
 
 def test_v2_fixture_crashed_mid_batch_recovers_with_the_finished_result(tmp_path: Path) -> None:

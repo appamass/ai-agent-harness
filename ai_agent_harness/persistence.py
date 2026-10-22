@@ -9,8 +9,9 @@ Guarantees of both implementations:
 `JsonFileCheckpointStore` writes atomically (temporary file + `os.replace` + fsync),
 does not block the event loop, and locks across processes via `fcntl`. It needs a POSIX system
 (Linux, macOS): without `fcntl` (e.g. Windows) it raises `ConfigError` instead of running without locks.
-For multi-server deployments, implement the same protocol backed by a database
-(e.g. `UPDATE ... WHERE revision = :expected`). Custom stores must always load states via
+`SqliteCheckpointStore` (one host, stdlib) and `PostgresCheckpointStore` (several workers) use one conditional
+upsert (`INSERT ... ON CONFLICT DO UPDATE ... WHERE revision = :expected RETURNING revision`).
+Custom stores must always load states via
 `restore_state` (schema version, migration, protocol check) — never directly via `model_validate`.
 """
 
@@ -18,19 +19,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
 import tempfile
 from collections.abc import Generator
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
 from .core.errors import ConcurrencyError, ConfigError, InvalidStateError
-from .core.state import RunState, restore_state
+from .core.state import RunState, RunStatus, restore_state
 from .core.types import ID_PATTERN
 
 _ID = re.compile(ID_PATTERN)
+_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
+
+DEFAULT_TABLE: Final = "ai_agent_harness_checkpoints"
+MAX_LIST_LIMIT: Final = 10_000
 
 try:  # POSIX file locks; without fcntl (Windows), JsonFileCheckpointStore refuses to start
     import fcntl
@@ -46,15 +54,81 @@ class CheckpointStore(Protocol):
     async def load(self, tenant_id: str, run_id: str) -> RunState | None: ...
 
 
+@dataclass(frozen=True)
+class RunInfo:
+    """Metadata of a stored run, for approval queues and recovery jobs. Content stays in the state itself."""
+
+    run_id: str
+    status: RunStatus
+    revision: int
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class WriteRecord:
+    """One checkpoint write for the SQL stores: the new row values plus the revision the row must still have."""
+
+    tenant_id: str
+    run_id: str
+    expected: int
+    new_revision: int
+    payload: str
+    status: str
+    schema_version: int
+
+    @classmethod
+    def from_state(cls, state: RunState) -> WriteRecord:
+        new_revision = state.revision + 1
+        return cls(
+            tenant_id=state.tenant_id,
+            run_id=state.run_id,
+            expected=state.revision,
+            new_revision=new_revision,
+            payload=state.model_copy(update={"revision": new_revision}).model_dump_json(),
+            status=str(state.status),
+            schema_version=state.schema_version,
+        )
+
+    @property
+    def params(self) -> tuple[str, str, int, str, int, str, int]:
+        """Values in the order of the stores' upsert statement; the last one is the expected revision."""
+        return (
+            self.tenant_id,
+            self.run_id,
+            self.new_revision,
+            self.status,
+            self.schema_version,
+            self.payload,
+            self.expected,
+        )
+
+
+def sql_identifier(value: str, what: str) -> str:
+    """Table and schema names go into DDL text, so only plain lower-case identifiers are accepted."""
+    if not _IDENTIFIER.fullmatch(value):
+        raise ConfigError(f"Invalid {what} identifier {value!r}: use 1-63 lower-case letters, digits, or underscores")
+    return value
+
+
+def status_index_name(table: str) -> str:
+    """Names are cut at 63 characters: a short hash keeps long tables with a shared prefix from sharing an index."""
+    return f"{table[:30]}_{hashlib.sha256(table.encode()).hexdigest()[:8]}_status_idx"
+
+
+def check_tenant_id(tenant_id: str) -> None:
+    if not _ID.fullmatch(tenant_id):
+        raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
+
+
+def check_list_limit(limit: int) -> None:
+    if not 1 <= limit <= MAX_LIST_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+
+
 def check_ids(tenant_id: str, run_id: str) -> None:
     for label, value in (("tenant_id", tenant_id), ("run_id", run_id)):
         if not _ID.fullmatch(value):
             raise ValueError(f"Invalid {label}: {value!r}")
-
-
-def _restore(raw: str, tenant_id: str, run_id: str) -> RunState:
-    # Check version, migrate, validate, verify key and protocol
-    return restore_state(raw, tenant_id=tenant_id, run_id=run_id)
 
 
 async def settle_write(write: asyncio.Future[None], state: RunState, new_revision: int) -> None:
@@ -99,7 +173,7 @@ class InMemoryCheckpointStore:
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
         stored = self._data.get((tenant_id, run_id))
-        return _restore(stored[1], tenant_id, run_id) if stored else None
+        return restore_state(stored[1], tenant_id=tenant_id, run_id=run_id) if stored else None
 
 
 class JsonFileCheckpointStore:
@@ -127,7 +201,7 @@ class JsonFileCheckpointStore:
         check_ids(tenant_id, run_id)
         path = self._path(tenant_id, run_id)
         raw = await asyncio.to_thread(lambda: path.read_text(encoding="utf-8") if path.exists() else None)
-        return _restore(raw, tenant_id, run_id) if raw is not None else None
+        return restore_state(raw, tenant_id=tenant_id, run_id=run_id) if raw is not None else None
 
     def _path(self, tenant_id: str, run_id: str) -> Path:
         path = (self._root / tenant_id / f"{run_id}.json").resolve()

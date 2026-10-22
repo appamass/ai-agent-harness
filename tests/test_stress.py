@@ -32,6 +32,7 @@ import tempfile
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -59,6 +60,7 @@ from ai_agent_harness import (
     Risk,
     RunState,
     RunStatus,
+    SqliteCheckpointStore,
     StopReason,
     ToolCall,
     ToolError,
@@ -71,14 +73,10 @@ from ai_agent_harness import (
 from ai_agent_harness.core import ProviderError, TextBlock, ThinkingBlock, Usage
 from ai_agent_harness.runtime.runner import INTERRUPTED
 
-from .conftest import POSTGRES_DSN_ENV, fresh_postgres_schema
+from .conftest import POSTGRES_DSN_ENV, Crash, fresh_postgres_schema, no_sleep
 
 SCENARIOS = int(os.environ.get("HARNESS_STRESS", "300"))
 TOOL_NAMES = ("echo", "write", "mail", "flaky", "crashy", "ask_user", "ghost")  # ghost = unknown tool
-
-
-class Crash(BaseException):
-    """Hard process termination: not an `Exception`, so it bypasses all error handlers."""
 
 
 @dataclass
@@ -297,10 +295,6 @@ class ChaosProvider:
         return ModelResponse(message=Message(role="assistant", content=tuple(blocks)), stop_reason=stop, usage=usage)
 
 
-async def _no_sleep(_: float) -> None:
-    return None
-
-
 def _build_agent(rng: random.Random, tracker: Tracker, store: CheckpointStore, autonomy: Autonomy) -> Agent:
     ids = itertools.count()  # unique call IDs across both providers
     tools: list[BaseTool[Any]] = [
@@ -317,7 +311,7 @@ def _build_agent(rng: random.Random, tracker: Tracker, store: CheckpointStore, a
             ChaosProvider(rng, "p1", ids),
             [ChaosProvider(rng, "p2", ids)],
             RetryPolicy(max_attempts=2, base_delay_s=0.0, max_delay_s=0.0, request_timeout_s=1),
-            sleep=_no_sleep,
+            sleep=no_sleep,
         ),
         context=ContextBuilder("stress"),
         tools=ToolRegistry(tools),
@@ -390,7 +384,16 @@ async def run_scenario(seed: int, stats: Counter[str] | None = None) -> None:
     rng = random.Random(seed)
     tracker = Tracker()
     with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-        store: CheckpointStore = JsonFileCheckpointStore(tmp) if rng.random() < 0.5 else InMemoryCheckpointStore()
+        roll = rng.random()
+        if roll < 0.33:
+            store: CheckpointStore = JsonFileCheckpointStore(tmp)
+        elif roll < 0.66:
+            sqlite_store = SqliteCheckpointStore(Path(tmp) / "stress.sqlite")
+            await sqlite_store.setup()
+            stack.callback(sqlite_store.close)
+            store = sqlite_store
+        else:
+            store = InMemoryCheckpointStore()
         if os.environ.get(POSTGRES_DSN_ENV) and seed % 4 == 0:  # every fourth scenario runs on a real PostgreSQL
             from ai_agent_harness.persistence_postgres import PostgresCheckpointStore
 

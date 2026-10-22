@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-fixture-max-tokens",
+  "object": "chat.completion",
+  "created": 1729600000,
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "This response was truncated because"
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 10,
+    "total_tokens": 30
+  }
+}

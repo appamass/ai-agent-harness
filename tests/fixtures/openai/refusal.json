@@ -1,0 +1,21 @@
+{
+  "id": "chatcmpl-fixture-refusal",
+  "object": "chat.completion",
+  "created": 1729600000,
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "I cannot fulfill this request."
+      },
+      "finish_reason": "content_filter"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 15,
+    "completion_tokens": 8,
+    "total_tokens": 23
+  }
+}

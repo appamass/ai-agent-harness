@@ -38,8 +38,8 @@ from ai_agent_harness.core.types import (
     ToolResult,
     ToolSpec,
 )
-from ai_agent_harness.providers.anthropic import EMPTY_RESPONSE_NOTE, AnthropicProvider
-from ai_agent_harness.providers.base import FOREIGN_THINKING_NOTE
+from ai_agent_harness.providers.anthropic import AnthropicProvider
+from ai_agent_harness.providers.base import EMPTY_RESPONSE_NOTE, FOREIGN_THINKING_NOTE
 
 from .conftest import Echo, no_sleep, run_sync
 

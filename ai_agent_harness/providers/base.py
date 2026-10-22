@@ -5,8 +5,8 @@ response back into `ModelResponse`. Provider SDKs are imported only inside adapt
 
 Adapter contract — violations are bugs in the adapter, not in the harness:
 
-- Raise API errors as `ProviderError`: `retryable=True` for rate limits (429),
-  overload (5xx, 529), and network errors; `retryable=False` for everything else
+- Raise API errors as `ProviderError`: `retryable=True` for timeouts and conflicts (408, 409), rate limits (429),
+  overload (5xx, 529), and network errors (`is_retryable_status`); `retryable=False` for everything else
   (400, auth, invalid request). The router handles retry, backoff, and fallback.
 - Map provider stop reasons to `StopReason`; map unknown values to `END`.
 - Pass `ThinkingBlock.provider_data` through unchanged — but **only own blocks**:
@@ -31,13 +31,35 @@ Adapter contract — violations are bugs in the adapter, not in the harness:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
-from typing import Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from typing import Final, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
 from ..core.errors import ConfigError
 from ..core.types import Block, Message, ModelRequest, ModelResponse, StopReason, TextBlock, ThinkingBlock
+
+EMPTY_RESPONSE_NOTE: Final = "(empty response)"
+"""Sent instead of an assistant message that has no content left (the APIs reject empty messages)."""
+
+SDK_TIMEOUT_S: Final = 600.0
+"""Explicit SDK timeout: lifts the SDK's refusal of big requests; the router owns the real request deadline."""
+
+_RETRYABLE_STATUS = frozenset({408, 409, 429})
+
+
+def is_retryable_status(status: int) -> bool:
+    """Shared HTTP classification for adapters: rate limits, conflicts, timeouts, and server errors are retryable."""
+    return status in _RETRYABLE_STATUS or status >= 500
+
+
+@dataclass(frozen=True)
+class StreamDelta:
+    """Incremental chunk produced by a streaming model provider."""
+
+    text: str = ""
+    thinking: str = ""
 
 
 class Capabilities(BaseModel):
@@ -47,6 +69,7 @@ class Capabilities(BaseModel):
 
     tools: bool = True
     vision: bool = False
+    structured_output: bool = False
 
 
 @runtime_checkable
@@ -103,6 +126,12 @@ class CallableProvider:
                 stop_reason=StopReason.END,
             )
         return result
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
+        res = await self.complete(request)
+        if res.message.text:
+            yield StreamDelta(text=res.message.text)
+        yield res
 
 
 FOREIGN_THINKING_NOTE = "(Reasoning from another model omitted)"

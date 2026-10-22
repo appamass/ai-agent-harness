@@ -26,6 +26,7 @@ Choices that follow from the contract and the API (ADR 0017):
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 from typing import Any, Final, Literal, cast
 
 from ..core.errors import ConfigError, ProviderError
@@ -42,16 +43,20 @@ from ..core.types import (
     ToolResult,
     Usage,
 )
-from .base import Capabilities, without_foreign_thinking
+from .base import (
+    EMPTY_RESPONSE_NOTE,
+    SDK_TIMEOUT_S,
+    Capabilities,
+    StreamDelta,
+    is_retryable_status,
+    without_foreign_thinking,
+)
 
 try:
     import anthropic
     from anthropic import types as api
 except ImportError as exc:
     raise ConfigError("The Anthropic adapter needs the SDK: pip install 'ai-agent-harness[anthropic]'") from exc
-
-EMPTY_RESPONSE_NOTE: Final = "(empty response)"
-"""Sent instead of an assistant message that has no content left (the API rejects empty messages)."""
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
@@ -62,9 +67,7 @@ _STOP_REASONS: Final[dict[str, StopReason]] = {
     "refusal": StopReason.REFUSAL,
 }  # everything else (end_turn, stop_sequence, pause_turn, unknown values) ends the turn
 _ERROR_TYPE = re.compile(r"[a-z_]{1,64}")
-_RETRYABLE_STATUS = frozenset({408, 409, 429})
 _UNSAFE_ID = re.compile(r"[^A-Za-z0-9_-]")
-_SDK_TIMEOUT_S: Final = 600.0
 
 
 class AnthropicProvider:
@@ -118,28 +121,47 @@ class AnthropicProvider:
             await self._client.close()
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
+        self._reject_unsupported(request)
+        response: object = None
+        failure: ProviderError | None = None
+        try:
+            # An explicit timeout lifts the SDK's refusal of big non-streaming requests (the router owns the real one)
+            parameters = self._parameters(request)
+            response = cast("object", await self._client.messages.create(**parameters, timeout=SDK_TIMEOUT_S))
+        except anthropic.APIError as exc:
+            failure = self._translate(exc)
+        if failure is not None:
+            # Raised outside the except block on purpose: the SDK exception echoes the response body and must not
+            # stay reachable through __cause__ or __context__
+            raise failure
+        return _to_response(self._checked(response))
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:
+        self._reject_unsupported(request)
+        final_msg: object = None
+        failure: ProviderError | None = None
+        try:
+            parameters = self._parameters(request)
+            async with self._client.messages.stream(**parameters, timeout=SDK_TIMEOUT_S) as stream_ctx:
+                async for text in stream_ctx.text_stream:
+                    if text:
+                        yield StreamDelta(text=text)
+                final_msg = cast(object, await stream_ctx.get_final_message())
+        except anthropic.APIError as exc:
+            failure = self._translate(exc)
+        if failure is not None:
+            raise failure
+        yield _to_response(self._checked(final_msg))
+
+    def _reject_unsupported(self, request: ModelRequest) -> None:
         if request.temperature is not None:
             raise ProviderError(
                 "AnthropicProvider does not support 'temperature': current Claude models reject non-default sampling",
                 retryable=False,
                 provider_id=self._id,
             )
-        response: object = None
-        failure: ProviderError | None = None
-        try:
-            # An explicit timeout lifts the SDK's refusal of big non-streaming requests (the router owns the real one)
-            parameters = self._parameters(request)
-            response = cast("object", await self._client.messages.create(**parameters, timeout=_SDK_TIMEOUT_S))
-        except anthropic.APIStatusError as exc:
-            failure = self._status_error(exc)
-        except anthropic.APIConnectionError:  # includes timeouts
-            failure = ProviderError("Anthropic API connection failed", retryable=True, provider_id=self._id)
-        except anthropic.APIError:
-            failure = ProviderError("Anthropic API returned an invalid response", retryable=False, provider_id=self._id)
-        if failure is not None:
-            # Raised outside the except block on purpose: the SDK exception echoes the response body and must not
-            # stay reachable through __cause__ or __context__
-            raise failure
+
+    def _checked(self, response: object) -> api.Message:
         # The SDK does not validate responses strictly: check the parts we rely on once, here at the boundary
         if not (
             isinstance(response, api.Message)
@@ -147,7 +169,14 @@ class AnthropicProvider:
             and isinstance(response.usage, api.Usage)
         ):
             raise ProviderError("Anthropic API returned an unexpected result", retryable=False, provider_id=self._id)
-        return _to_response(response)
+        return response
+
+    def _translate(self, exc: anthropic.APIError) -> ProviderError:
+        if isinstance(exc, anthropic.APIStatusError):
+            return self._status_error(exc)
+        if isinstance(exc, anthropic.APIConnectionError):  # includes timeouts
+            return ProviderError("Anthropic API connection failed", retryable=True, provider_id=self._id)
+        return ProviderError("Anthropic API returned an invalid response", retryable=False, provider_id=self._id)
 
     def _status_error(self, exc: anthropic.APIStatusError) -> ProviderError:
         status = exc.status_code
@@ -159,8 +188,9 @@ class AnthropicProvider:
                 value: object = cast("dict[str, object]", detail).get("type")
                 if isinstance(value, str) and _ERROR_TYPE.fullmatch(value):
                     kind = value
-        retryable = status in _RETRYABLE_STATUS or status >= 500
-        return ProviderError(f"Anthropic API error {status} ({kind})", retryable=retryable, provider_id=self._id)
+        return ProviderError(
+            f"Anthropic API error {status} ({kind})", retryable=is_retryable_status(status), provider_id=self._id
+        )
 
     def _parameters(self, request: ModelRequest) -> dict[str, Any]:
         parameters: dict[str, Any] = {
