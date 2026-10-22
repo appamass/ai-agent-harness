@@ -76,8 +76,9 @@ def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
 def _v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
     """v4 stores the digest of the output model's JSON schema instead of the schema itself (ADR 0023)."""
     schema = data.pop("output_schema", None)
-    digest = canonical_digest(cast("dict[str, Any]", schema)) if isinstance(schema, dict) else None
-    data["output_schema_digest"] = digest
+    if schema is not None and not isinstance(schema, dict):  # v3 rejected this too: never load it as unbound
+        raise SchemaVersionError("Saved state has an invalid output_schema")
+    data["output_schema_digest"] = canonical_digest(cast("dict[str, Any]", schema)) if schema is not None else None
     return data
 
 

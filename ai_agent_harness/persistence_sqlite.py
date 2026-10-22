@@ -56,7 +56,10 @@ def schema_sql(table: str = DEFAULT_TABLE) -> str:
 
 
 class SqliteCheckpointStore:
-    """`CheckpointStore` backed by SQLite. Pass a file path or an open `sqlite3.Connection`."""
+    """`CheckpointStore` backed by SQLite. Pass a file path or an open `sqlite3.Connection`.
+
+    A borrowed connection is shared: every write of the store commits it, including the caller's own open changes.
+    """
 
     def __init__(
         self,
@@ -83,8 +86,10 @@ class SqliteCheckpointStore:
         )
 
         if connection is not None:
+            if connection.in_transaction:
+                raise ConfigError("SqliteCheckpointStore: pass the connection before it has an open transaction")
             self._connection = connection
-            self._apply_pragmas()
+            self._apply_pragmas()  # may wait up to busy_timeout_ms for another process's write lock
         else:
             target = str(database if database is not None else "checkpoints.sqlite")
             if target != ":memory:" and not target.startswith("file:"):

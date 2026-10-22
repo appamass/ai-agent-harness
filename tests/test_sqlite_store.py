@@ -256,3 +256,12 @@ def test_a_borrowed_connection_gets_its_settings_before_the_caller_opens_a_trans
         run_sync(store.setup())
         run_sync(store.save(waiting_state()))
         assert run_sync(store.load("t1", "r1")) is not None
+
+
+def test_a_borrowed_connection_with_an_open_transaction_is_refused(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "busy.sqlite", check_same_thread=False)
+    with closing(connection):
+        connection.execute("CREATE TABLE caller (x INTEGER)")
+        connection.execute("INSERT INTO caller VALUES (1)")
+        with pytest.raises(ConfigError, match="open transaction"):
+            SqliteCheckpointStore(connection=connection)

@@ -31,6 +31,11 @@ class FakeProvider:
         capabilities: Capabilities | None = None,
     ) -> None:
         self._script: list[ModelResponse | BaseException | Streamed] = list(script)
+        for item in self._script:
+            if not isinstance(item, ModelResponse | BaseException | Streamed):
+                raise TypeError(
+                    f"FakeProvider: unexpected script item {type(item).__name__} (wrap streams in Streamed)"
+                )
         self._id = id
         self._capabilities = capabilities or Capabilities(tools=True, vision=True)
         self.requests: list[ModelRequest] = []

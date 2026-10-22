@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from ai_agent_harness import (
     Agent,
@@ -98,7 +99,6 @@ def test_v2_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
 @pytest.mark.parametrize("fixture", [FIXTURE_V3, FIXTURE_V4], ids=["v3", "v4"])
 def test_a_fixture_keeps_its_structured_output_and_demands_the_same_model_on_resume(fixture: Path) -> None:
     """The v3 format added `output_schema`, `output_model_name`, and `output`; v4 keeps only the schema's digest."""
-    from pydantic import BaseModel
 
     class Weather(BaseModel):
         city: str
@@ -118,6 +118,37 @@ def test_a_fixture_keeps_its_structured_output_and_demands_the_same_model_on_res
         run_sync(resume(_agent(write), state, user_input="again"))
     with pytest.raises(InvalidStateError, match="does not match"):
         run_sync(resume(_agent(write), state, user_input="again", output_model=Other))
+
+
+def test_the_migrated_v3_fixture_resumes_with_its_own_output_model() -> None:
+    class Weather(BaseModel):
+        city: str
+        celsius: float
+
+    state = load_fixture(FIXTURE_V3)
+    answer = text_response('{"city": "Bern", "celsius": 2.0}')
+    agent = Agent(name="fixture", router=ModelRouter(FakeProvider([answer])), context=ContextBuilder("s"))
+    done = run_sync(resume(agent, state, user_input="again", output_model=Weather))
+    assert done.status is RunStatus.DONE  # the digest of the migrated schema matches the model
+    assert done.output_as(Weather) == Weather(city="Bern", celsius=2.0)
+
+
+@pytest.mark.parametrize("value", ["garbage", [1, 2], 5])
+def test_a_v3_state_with_an_invalid_output_schema_is_rejected(value: object) -> None:
+    raw = json.loads(FIXTURE_V3.read_text(encoding="utf-8"))
+    raw["output_schema"] = value
+    with pytest.raises(SchemaVersionError, match="output_schema"):
+        restore_state(json.dumps(raw))
+
+
+@pytest.mark.parametrize("drop", [True, False])
+def test_a_v3_state_without_an_output_schema_stays_unbound(drop: bool) -> None:
+    raw = json.loads(FIXTURE_V3.read_text(encoding="utf-8"))
+    if drop:
+        del raw["output_schema"]
+    else:
+        raw["output_schema"] = None
+    assert restore_state(json.dumps(raw)).output_schema_digest is None
 
 
 def test_resume_refuses_a_state_from_another_schema_version() -> None:

@@ -246,6 +246,19 @@ def test_checkpoint_and_resume_across_approval_preserves_output_model(tmp_path: 
     assert_consistent(resumed)
 
 
+def test_a_resumed_native_run_sends_the_schema_it_started_with() -> None:
+    provider = FakeProvider(
+        [text_response("not json yet"), text_response('{"city": "Bern", "temperature_c": 1.0, "condition": "Fog"}')],
+        capabilities=Capabilities(tools=True, structured_output=True),
+    )
+    agent = Agent.create(provider, limits=Limits(max_consecutive_retries=0))
+    failed = run_sync(start(agent, "Weather", output_model=CityWeather))
+    assert failed.status is RunStatus.FAILED
+    done = run_sync(resume(agent, failed, user_input="again", output_model=CityWeather))
+    assert done.status is RunStatus.DONE
+    assert [r.output_schema for r in provider.requests] == [CityWeather.model_json_schema()] * 2
+
+
 def test_tool_fallback_direct_json_text_accepted() -> None:
     provider = FakeProvider(
         [text_response('{"city": "Graz", "temperature_c": 18.0, "condition": "Sunny"}')],
