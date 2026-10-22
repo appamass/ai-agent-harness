@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import inspect
 import json
 import threading
@@ -73,12 +74,12 @@ _SCHEMAS: WeakKeyDictionary[type[BaseModel], dict[str, Any]] = WeakKeyDictionary
 def json_schema(model: type[BaseModel]) -> dict[str, Any]:
     """`model.model_json_schema()`, built once per model class (every run and resume needs it again).
 
-    The result is shared between callers: never change it.
+    Every caller gets its own copy: a hook or adapter that edits a schema cannot change it for the others.
     """
     schema = _SCHEMAS.get(model)
     if schema is None:
         schema = _SCHEMAS[model] = model.model_json_schema()
-    return schema
+    return copy.deepcopy(schema)
 
 
 def check_truncation_mode(mode: object, where: str) -> None:

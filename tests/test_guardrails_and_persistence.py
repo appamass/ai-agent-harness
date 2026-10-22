@@ -21,14 +21,12 @@ from ai_agent_harness.core import (
     ConfigError,
     InvalidStateError,
     ProtocolError,
-    ToolCall,
-    ToolInvocation,
 )
 from ai_agent_harness.core.hooks import Action
 from ai_agent_harness.persistence import CheckpointStore
 from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import Echo, PathInput, WriteFile, make_agent, results_of, run_sync
+from .conftest import Echo, PathInput, WriteFile, invocation, make_agent, results_of, run_sync
 
 
 class NestedInput(BaseModel):
@@ -65,8 +63,7 @@ def test_ordinary_keys_and_nested_field_names_are_not_paths() -> None:
 
 
 def decide(guard: ProtectedPaths, args: BaseModel, risk: Risk = Risk.WRITE) -> Action:
-    invocation = ToolInvocation(call=ToolCall(id="1", name="w"), tool_name="w", risk=risk, args=args)
-    return run_sync(guard.before_tool(RunState(agent_name="t"), invocation)).action
+    return run_sync(guard.before_tool(RunState(agent_name="t"), invocation(args, risk=risk))).action
 
 
 class TestProtectedPaths:

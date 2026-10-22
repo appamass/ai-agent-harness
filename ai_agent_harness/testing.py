@@ -77,14 +77,9 @@ class FakeProvider:
             yield sub
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
-        item = self._next_item(request)
-        if isinstance(item, ModelResponse):
-            return item
-        for sub in item.items:
-            if isinstance(sub, BaseException):
-                raise sub
-            if isinstance(sub, ModelResponse):
-                return sub
+        for event in self._events(self._next_item(request)):
+            if isinstance(event, ModelResponse):
+                return event
         raise AssertionError(f"FakeProvider '{self._id}': scripted sequence did not contain ModelResponse")
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[StreamDelta | ModelResponse]:

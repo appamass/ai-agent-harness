@@ -633,11 +633,29 @@ def test_json_schemas_are_built_once_and_do_not_keep_models_alive() -> None:
 
     from ai_agent_harness.tools.base import json_schema
 
+    built: list[int] = []
+
     class Temporary(BaseModel):
         value: int
 
-    assert json_schema(Temporary) is json_schema(Temporary)
+        @classmethod
+        def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            built.append(1)
+            return super().model_json_schema(*args, **kwargs)
+
+    assert json_schema(Temporary) == json_schema(Temporary)
+    assert len(built) == 1
     alive = weakref.ref(Temporary)
     del Temporary
     gc.collect()
     assert alive() is None
+
+
+def test_a_changed_schema_does_not_change_the_cached_one() -> None:
+    from ai_agent_harness.tools.base import json_schema
+
+    class Shared(BaseModel):
+        value: int
+
+    json_schema(Shared)["properties"]["value"]["type"] = "string"  # a hook or adapter editing its copy
+    assert json_schema(Shared)["properties"]["value"]["type"] == "integer"

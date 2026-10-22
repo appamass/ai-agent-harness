@@ -169,8 +169,7 @@ class OpenTelemetryListener:
         model = str(event.data.get("model", "unknown"))
         chat = {"gen_ai.operation.name": "chat", "gen_ai.provider.name": provider, "gen_ai.response.model": model}
         span.update_name(f"chat {model}")
-        span.set_attribute("gen_ai.provider.name", provider)
-        span.set_attribute("gen_ai.response.model", model)
+        span.set_attributes(chat)
         stop_reason = event.data.get("stop_reason")
         if stop_reason is not None:
             span.set_attribute("gen_ai.response.finish_reasons", [str(stop_reason)])
@@ -260,7 +259,7 @@ class OpenTelemetryListener:
 
     def _on_checkpoint_saved(self, event: Event) -> None:
         revision = event.data.get("revision")
-        if isinstance(revision, int):
+        if _is_int(revision):
             self._run_event(event, "harness.checkpoint_saved", {"revision": revision})
 
     def _end_children(self, run_id: str, description: str) -> None:

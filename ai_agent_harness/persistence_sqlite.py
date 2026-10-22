@@ -185,8 +185,12 @@ class SqliteCheckpointStore:
         """Runs of one tenant, newest first."""
         check_tenant_id(tenant_id)
         check_list_limit(limit)
-        params: tuple[Any, ...] = (tenant_id, limit) if status is None else (tenant_id, str(status), limit)
-        query = self._sql(_SQL.list_all) if status is None else self._sql(_SQL.list_status)
+        if status is None:
+            query = self._sql(_SQL.list_all)
+            params: tuple[Any, ...] = (tenant_id, limit)
+        else:
+            query = self._sql(_SQL.list_status)
+            params = (tenant_id, str(status), limit)
         rows, _ = await asyncio.to_thread(self._run, query, params)
         return [
             RunInfo(
