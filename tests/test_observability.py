@@ -499,3 +499,21 @@ def test_zero_valued_optional_usage_is_not_recorded(
     assert attributes["gen_ai.usage.input_tokens"] == 1
     assert "gen_ai.usage.cache_read_input_tokens" not in attributes
     assert "harness.usage.reasoning_tokens" not in attributes
+
+
+def test_bools_are_not_recorded_as_counters(otel_setup: tuple[TracerProvider, InMemorySpanExporter]) -> None:
+    """`True` is an int in Python: it must not show up as a message count or token count."""
+    listener, exporter = make_listener(otel_setup)
+    usage = {"input_tokens": True, "output_tokens": 5, "cache_read_tokens": True}
+    for type_, data in (
+        (EventType.MODEL_REQUEST, {"messages": True, "tools": 2}),
+        (EventType.MODEL_RESPONSE, {"provider": "p", "model": "m", "usage": usage}),
+    ):
+        run_sync(listener.handle(Event(type=type_, run_id="r1", tenant_id="t1", step=1, data=data)))
+
+    (span,) = exporter.get_finished_spans()
+    attributes = dict(span.attributes or {})
+    assert attributes["harness.request.tools"] == 2
+    assert attributes["gen_ai.usage.output_tokens"] == 5
+    for absent in ("harness.request.messages", "gen_ai.usage.input_tokens", "gen_ai.usage.cache_read_input_tokens"):
+        assert absent not in attributes

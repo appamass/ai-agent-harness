@@ -227,3 +227,32 @@ def test_the_busy_timeout_setting_is_honored(tmp_path: Path) -> None:
         finally:
             release.set()
             holder.join()
+
+
+def test_settings_apply_on_first_use_and_again_after_a_locked_database(tmp_path: Path) -> None:
+    """The constructor never waits for a lock; the first call honors `busy_timeout_ms` and retries the settings."""
+    path = tmp_path / "late.sqlite"
+    with closing(sqlite3.connect(path, isolation_level=None)) as other:
+        other.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        store = SqliteCheckpointStore(path, busy_timeout_ms=300)
+        assert time.monotonic() - started < 0.2
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            run_sync(store.setup())
+        assert time.monotonic() - started < 2
+        other.execute("COMMIT")
+    with store:
+        run_sync(store.setup())
+    with closing(sqlite3.connect(path)) as check:
+        assert check.execute("PRAGMA journal_mode").fetchone() == ("wal",)  # the settings ran after all
+
+
+def test_a_borrowed_connection_gets_its_settings_before_the_caller_opens_a_transaction(tmp_path: Path) -> None:
+    connection = sqlite3.connect(tmp_path / "borrowed.sqlite", check_same_thread=False)
+    with closing(connection), SqliteCheckpointStore(connection=connection, busy_timeout_ms=1234) as store:
+        assert connection.execute("PRAGMA busy_timeout").fetchone() == (1234,)
+        connection.execute("CREATE TABLE caller (x INTEGER)")
+        connection.execute("INSERT INTO caller VALUES (1)")  # the caller's transaction is open now
+        run_sync(store.setup())
+        run_sync(store.save(waiting_state()))
+        assert run_sync(store.load("t1", "r1")) is not None

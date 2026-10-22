@@ -74,7 +74,8 @@ class SqliteCheckpointStore:
             raise ConfigError("SqliteCheckpointStore needs at most one of database or connection")
 
         self._table = sql_identifier(table, "table")
-        # Applied on first use in a worker thread: `journal_mode = WAL` can wait for another process's write lock
+        # Own connections apply these on first use in a worker thread (`journal_mode = WAL` can wait for another
+        # process's write lock). A borrowed connection gets them now, while the caller has no transaction open.
         self._pragmas: tuple[str, ...] = (
             f"PRAGMA busy_timeout = {int(busy_timeout_ms)}",
             "PRAGMA journal_mode = WAL",
@@ -83,6 +84,7 @@ class SqliteCheckpointStore:
 
         if connection is not None:
             self._connection = connection
+            self._apply_pragmas()
         else:
             target = str(database if database is not None else "checkpoints.sqlite")
             if target != ":memory:" and not target.startswith("file:"):
@@ -94,6 +96,12 @@ class SqliteCheckpointStore:
                 target = str(db_path)
             self._connection = sqlite3.connect(target, check_same_thread=False)
 
+    def _apply_pragmas(self) -> None:
+        """Runs the settings once; after a failure (for example a locked database) the next call tries again."""
+        for pragma in self._pragmas:
+            self._connection.execute(pragma)
+        self._pragmas = ()
+
     def _sql(self, template: str) -> str:
         return template.format(table=self._table)  # validated by `sql_identifier`
 
@@ -102,9 +110,7 @@ class SqliteCheckpointStore:
         if self._closed:
             raise ConfigError("SqliteCheckpointStore is closed")
         with self._lock:
-            for pragma in self._pragmas:
-                self._connection.execute(pragma)
-            self._pragmas = ()
+            self._apply_pragmas()
             cursor = self._connection.execute(query, params)
             rows = cursor.fetchall()
             if commit:
