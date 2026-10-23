@@ -2,7 +2,10 @@
 
 **A small Python harness for AI agents where the model proposes and your code decides.**
 
-It runs the agent loop and enforces the rules around it. Every run ends with a status. Tools run only through one gate. Irreversible actions
+A harness is the loop between a model and its tools. Most harnesses make that loop work; this one also decides whether each call may run.
+It is not a coding agent like Claude Code or Codex. It is the base for agents inside your own Python services.
+
+Every run ends with a status. Tools run only through one gate. Irreversible actions
 never run without a human. State survives crashes and several workers. Events carry only metadata.
 You bring the model, the tools, and the policy.
 
