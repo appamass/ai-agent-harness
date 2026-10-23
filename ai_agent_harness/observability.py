@@ -126,6 +126,16 @@ class OpenTelemetryListener:
         handler = self._handlers.get(event.type)
         if handler is not None:
             handler(event)
+        else:
+            self._on_other_event(event)
+
+    def _on_other_event(self, event: Event) -> None:
+        """Event types without a handler (such as `CONTEXT_COMPACTED`) become a span event on the run span.
+
+        Event data is metadata only (ADR 0011), so its scalar values can be attached as they are.
+        """
+        attrs = {key: value for key, value in event.data.items() if isinstance(value, str | int | float | bool)}
+        self._run_event(event, f"harness.{event.type}", attrs)
 
     def _start(self, name: str, kind: SpanKind, event: Event, *, child: bool = True) -> Span:
         """Starts a span with the attributes every harness span carries; `child` attaches it to the run span."""
@@ -251,7 +261,7 @@ class OpenTelemetryListener:
         span.set_status(StatusCode.ERROR, description=f"Tool blocked by {source}")
         span.end()
 
-    def _run_event(self, event: Event, name: str, attrs: dict[str, str | int]) -> None:
+    def _run_event(self, event: Event, name: str, attrs: dict[str, str | int | float | bool]) -> None:
         span = self._run_spans.get(event.run_id)
         if span is not None:
             span.add_event(name, attrs)

@@ -33,6 +33,9 @@ class Agent:
     limits: Limits = field(default_factory=Limits)
     max_result_chars: int = DEFAULT_MAX_RESULT_CHARS
     truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE
+    compact_context: bool = False
+    """Opt-in (ADR 0026): when the model's view nears the context limits, old long tool results are replaced by a
+    placeholder in the request. `RunState.messages` is never shortened."""
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -46,6 +49,8 @@ class Agent:
         if self.max_result_chars < 100:
             raise ConfigError("max_result_chars must be >= 100")
         check_truncation_mode(self.truncation_mode, "Agent")
+        if not isinstance(self.compact_context, bool):
+            raise ConfigError(f"Agent.compact_context must be True or False, got {self.compact_context!r}")
 
     @property
     def policy(self) -> PermissionPolicy:
@@ -67,6 +72,7 @@ class Agent:
         limits: Limits | None = None,
         max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
         truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE,
+        compact_context: bool = False,
     ) -> Agent:
         """Shorthand constructor that normalizes a provider, prompt string, tool list, and hook list."""
         if isinstance(provider, ModelRouter):
@@ -91,4 +97,5 @@ class Agent:
             limits=limits if limits is not None else Limits(),
             max_result_chars=max_result_chars,
             truncation_mode=truncation_mode,
+            compact_context=compact_context,
         )

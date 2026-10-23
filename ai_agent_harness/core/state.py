@@ -48,13 +48,15 @@ CONTINUE_PROMPT = (
 )
 """User prompt sent by the runner to continue a truncated response (`StopReason.MAX_TOKENS`)."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 """Current version of the serialized state. Increment on every schema change (ADR 0010).
 
 History: 1 — initial version. 2 — `batch_done`, cache/reasoning tokens in `usage`,
 `ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012). 3 — `output_schema`,
 `output_model_name`, `output` for structured final output (ADR 0023). 4 — `output_schema_digest` replaces
-`output_schema`: the stored schema only detected a changed model, so its digest is enough.
+`output_schema`: the stored schema only detected a changed model, so its digest is enough. 5 — `context_floor` and the
+token measurement (`measured_provider_id`, `measured_chars`, `measured_prompt_tokens`) for context compaction and the
+calibrated token estimate (ADR 0026).
 """
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
@@ -82,7 +84,12 @@ def _v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4}
+def _v4_to_v5(data: dict[str, Any]) -> dict[str, Any]:
+    """v5 adds `context_floor` (0 = nothing cleared) and the token measurement (no measurement) (ADR 0026)."""
+    return data
+
+
+MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4, 4: _v4_to_v5}
 """Migrations from version n to n+1, keyed by n."""
 
 
@@ -152,6 +159,20 @@ class RunState(BaseModel):
     output_model_name: str | None = Field(default=None, description="Class name of required output_model (ADR 0023)")
     output: dict[str, Any] | None = Field(
         default=None, description="Validated structured final output as JSON-safe dictionary (ADR 0023)"
+    )
+    context_floor: int = Field(
+        default=0,
+        ge=0,
+        description="Messages before this index show old tool results as a placeholder in the model's view (ADR 0026)",
+    )
+    measured_provider_id: str | None = Field(
+        default=None, description="Provider that reported `measured_prompt_tokens` (ADR 0026)"
+    )
+    measured_chars: int = Field(
+        default=0, ge=0, description="Size in characters of the request behind `measured_prompt_tokens`"
+    )
+    measured_prompt_tokens: int = Field(
+        default=0, ge=0, description="Prompt tokens a provider reported for the last request; 0 = no measurement"
     )
     step: int = Field(default=0, ge=0, description="Number of model calls across the entire run")
     consecutive_retries: int = Field(default=0, ge=0)
@@ -319,6 +340,39 @@ class RunState(BaseModel):
         results = [by_id.get(c.id) or ToolResult(call_id=c.id, content=reason, is_error=True) for c in calls]
         self.add_tool_results(results, text=text)
 
+    def raise_context_floor(self, floor: int) -> None:
+        """Clears old tool results in the model's view up to message `floor`. Only a higher value is accepted.
+
+        `messages` stays as it is; only the view built for the model changes (ADR 0026). The token measurement
+        no longer fits the smaller view and is dropped.
+        """
+        if floor <= self.context_floor or floor > len(self.messages):
+            raise ProtocolError(
+                f"Invalid context floor {floor} (now {self.context_floor}, {len(self.messages)} messages)"
+            )
+        self.context_floor = floor
+        self.forget_measurement()
+
+    def record_measurement(self, provider_id: str, chars: int, prompt_tokens: int) -> None:
+        """Keeps what `provider_id` reported for a request of `chars` characters (ADR 0026).
+
+        A report of another provider than before (failover), or without tokens, drops the measurement instead:
+        the token estimate is then based on the size alone until the next report.
+        """
+        previous = self.measured_provider_id
+        if prompt_tokens <= 0 or (previous is not None and previous != provider_id):
+            self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = provider_id, 0, 0
+        else:
+            self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = (
+                provider_id,
+                chars,
+                prompt_tokens,
+            )
+
+    def forget_measurement(self) -> None:
+        """Drops the token measurement: the next estimate is based on the size alone."""
+        self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = None, 0, 0
+
     def set_status(self, status: RunStatus, reason: str | None = None) -> None:
         if status is not RunStatus.DONE:
             self.clear_output()  # a structured output belongs to a run that ended as done, never to anything else
@@ -339,6 +393,8 @@ class RunState(BaseModel):
                 got = [r.call_id for r in msg.tool_results]
                 if set(got) != prev_calls:
                     raise ProtocolError(f"Message {i}: tool results do not match the preceding tool calls")
+        if self.context_floor > len(self.messages):
+            raise ProtocolError(f"Context floor {self.context_floor} is beyond the {len(self.messages)} messages")
         open_calls = self.open_tool_calls()
         if open_calls and not (self.status == RunStatus.RUNNING or self.status.is_waiting):
             raise ProtocolError(f"Finished run ({self.status}) has unanswered tool calls")

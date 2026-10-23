@@ -112,7 +112,7 @@ agent = Agent(name="demo", router=ModelRouter(AnthropicProvider("claude-haiku-5-
 | State | In-memory, file (POSIX), SQLite (stdlib), and PostgreSQL stores with `list_runs` and deletion | Encryption, retention, and access rules for your data |
 | Operations | Metadata events, `log_listener`, `OpenTelemetryListener`, `Limits`, crash recovery | Your trace backend, cost tracking, your UI for approvals |
 
-Not built yet: context compaction, parallel tool calls. Streaming, MCP, and structured output exist; read their [limits](docs/known-limitations.md#streaming-structured-output-mcp) first.
+Not built yet: parallel tool calls. Context compaction, streaming, MCP, and structured output exist; read their [limits](docs/known-limitations.md#streaming-structured-output-mcp) first.
 
 ## Install
 

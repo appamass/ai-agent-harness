@@ -518,3 +518,30 @@ def test_bools_are_not_recorded_as_counters(otel_setup: tuple[TracerProvider, In
     assert attributes["gen_ai.usage.output_tokens"] == 5
     for absent in ("harness.request.messages", "gen_ai.usage.input_tokens", "gen_ai.usage.cache_read_input_tokens"):
         assert absent not in attributes
+
+
+def test_a_compaction_becomes_a_span_event_on_the_run_span(
+    otel_setup: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    """Event types without their own handler are attached to the run span (ADR 0026), counters only."""
+    listener, exporter = make_listener(otel_setup)
+    data: dict[str, Any] = {"floor": 21, "cleared_results": 10, "chars_saved": 9_000}
+    for type_, payload in (
+        (EventType.RUN_STARTED, {"agent": "a"}),
+        (EventType.CONTEXT_COMPACTED, data),
+        (EventType.RUN_FINISHED, {"status": "done"}),
+    ):
+        run_sync(listener.handle(Event(type=type_, run_id="r1", tenant_id="t1", step=1, data=payload)))
+
+    (span,) = exporter.get_finished_spans()
+    (compacted,) = [e for e in span.events if e.name == "harness.context_compacted"]
+    assert dict(compacted.attributes or {}) == data
+
+
+def test_an_event_without_a_handler_and_without_a_run_span_is_ignored(
+    otel_setup: tuple[TracerProvider, InMemorySpanExporter],
+) -> None:
+    listener, exporter = make_listener(otel_setup)
+    event = Event(type=EventType.CONTEXT_COMPACTED, run_id="unknown", tenant_id="t1", step=1, data={"floor": 1})
+    run_sync(listener.handle(event))
+    assert exporter.get_finished_spans() == ()

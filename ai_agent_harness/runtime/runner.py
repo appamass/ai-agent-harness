@@ -46,7 +46,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
-from ..context import ContextMeter, estimate_tokens
+from ..context import ContextMeter, RequestSize, char_budget, choose_floor, compact_view, estimate_tokens, same_items
 from ..core import state as state_schema
 from ..core.errors import ConcurrencyError, ConfigError, InvalidStateError, ProviderError
 from ..core.events import Event, EventType
@@ -285,24 +285,6 @@ def _extract_json_text(text: str) -> str:
     """The JSON object in a model answer: everything from the first `{` to the last `}` (drops fences and prose)."""
     start, end = text.find("{"), text.rfind("}")
     return text[start : end + 1] if 0 <= start < end else text.strip()
-
-
-@dataclass(frozen=True)
-class _Calibration:
-    """What a provider reported for one request: `prompt_tokens` for a request of `chars` characters (ADR 0026).
-
-    `(0, 0)` means no measurement. The token estimate is then based on the size alone.
-    """
-
-    provider_id: str | None = None
-    chars: int = 0
-    prompt_tokens: int = 0
-
-    def after(self, provider_id: str, chars: int, prompt_tokens: int) -> _Calibration:
-        """The measurement after a response. Another provider than before, or no reported tokens: start over."""
-        if prompt_tokens <= 0 or (self.provider_id is not None and self.provider_id != provider_id):
-            return _Calibration(provider_id)
-        return _Calibration(provider_id, chars, prompt_tokens)
 
 
 @dataclass(frozen=True)
@@ -600,7 +582,8 @@ class _Run:
         self._specs = [tool.spec() for tool in self.executor.visible_tools()]  # fixed for the life of a run
         self._output_instructions = self._build_output_instructions()
         self._meter = ContextMeter()
-        self._calibration = _Calibration()
+        self._view_source: tuple[Message, ...] = ()  # the messages before the floor, and how they look to the model:
+        self._view_head: tuple[Message, ...] = ()  # rebuilt only when the floor rises (ADR 0026)
         self._elapsed_base = state.elapsed_s
         self._t0 = time.monotonic()
         self._finishing = False
@@ -755,10 +738,15 @@ class _Run:
             elif self._output_instructions:
                 request = request.model_copy(update={"system": request.system + self._output_instructions})
 
-            size = self._meter.measure(request).total
-            calibration = self._calibration
-            tokens = estimate_tokens(size, calibration.chars, calibration.prompt_tokens)
-            reason = self._context_limit(size, tokens)
+            size = self._meter.measure(request)
+            if agent.compact_context:
+                await self._compact(size)
+                request = request.model_copy(update={"messages": self._model_view(request.messages)})
+                chars = size.view(state.context_floor)
+            else:
+                chars = size.total
+            tokens = estimate_tokens(chars, state.measured_chars, state.measured_prompt_tokens)
+            reason = self._context_limit(chars, tokens)
             if reason:
                 await self._finish(RunStatus.LIMIT_REACHED, reason)
                 return
@@ -770,7 +758,7 @@ class _Run:
                 {
                     "messages": len(request.messages),
                     "tools": len(specs),
-                    "context_chars": size,
+                    "context_chars": chars,
                     "context_tokens_est": tokens,
                 },
             )
@@ -784,7 +772,8 @@ class _Run:
                 response, provider_id = await agent.router.complete(request, self.emit)
             state.step += 1
             state.usage = state.usage + response.usage
-            self._calibration = calibration.after(provider_id, size, response.usage.prompt_tokens)
+            # An adapter chooses its `id`: store it as text so an odd one cannot make the state invalid
+            state.record_measurement(str(provider_id), chars, response.usage.prompt_tokens)
             await self.emit(
                 EventType.MODEL_RESPONSE,
                 {
@@ -836,6 +825,29 @@ class _Run:
                 return
 
             await self._checkpoint()
+
+    async def _compact(self, size: RequestSize) -> None:
+        """Raises the context floor when the model's view got too large (ADR 0026). Saves it before the model call."""
+        state, limits = self.state, self.agent.limits
+        budget = char_budget(
+            limits.max_context_chars, limits.max_context_tokens, state.measured_chars, state.measured_prompt_tokens
+        )
+        old = state.context_floor
+        floor = choose_floor(size, budget, old)
+        if floor <= old:
+            return
+        cleared, saved = size.cleared(old, floor)
+        state.raise_context_floor(floor)
+        await self.emit(EventType.CONTEXT_COMPACTED, {"floor": floor, "cleared_results": cleared, "chars_saved": saved})
+        await self._checkpoint()
+
+    def _model_view(self, messages: tuple[Message, ...]) -> tuple[Message, ...]:
+        """The messages for the model: the cleared head, which is built again only when its source changes."""
+        floor = min(self.state.context_floor, len(messages))
+        source = messages[:floor]
+        if not same_items(self._view_source, source):
+            self._view_source, self._view_head = source, compact_view(source, floor)
+        return self._view_head + messages[floor:]
 
     def _context_limit(self, chars: int, tokens: int) -> str | None:
         """Why the request is too large for `Limits`, or None."""

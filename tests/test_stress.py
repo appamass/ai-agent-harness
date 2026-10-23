@@ -128,7 +128,7 @@ class _Tracked(BaseTool[BaseModel]):
         if self.behaviour == "crashy" and roll < 0.5:
             raise Crash  # side effect happened, result is lost
         self.tracker.completed.add(seen[1])
-        return f"ok:{self.name}"
+        return f"ok:{self.name}" + "." * 250  # long enough for context compaction to clear it later
 
 
 class EchoTool(_Tracked):
@@ -322,8 +322,10 @@ def _build_agent(rng: random.Random, tracker: Tracker, store: CheckpointStore, a
             max_steps=rng.randint(2, 12),
             max_total_tokens=rng.randint(100, 2000),
             max_consecutive_retries=rng.randint(0, 3),
-            max_context_chars=rng.choice([400_000, 400_000, 1_500]),
+            max_context_chars=rng.choice([400_000, 400_000, 1_500, 3_000]),
+            max_context_tokens=rng.choice([None, None, 800]),
         ),
+        compact_context=rng.random() < 0.5,
     )
 
 
@@ -336,6 +338,9 @@ def _check(state: RunState, agent: Agent, tracker: Tracker, seed: int) -> None:
     assert state.status is not RunStatus.RUNNING, f"{where}: status 'running' after return"
     assert state.step <= agent.limits.max_steps, f"{where}: step limit exceeded"
     assert tracker.bypassed_hooks == 0, f"{where}: tool bypassed before_tool"
+    assert agent.compact_context or state.context_floor == 0, f"{where}: context cleared without compact_context"
+    stored = [r.content for message in state.messages for r in message.tool_results]
+    assert not any("Result removed to save space" in text for text in stored), f"{where}: stored result was cleared"
     in_history = {call.id for message in state.messages for call in message.tool_calls}
     untracked = set(tracker.executed) - in_history
     assert not untracked, f"{where}: side effect without trace in history (write-ahead missing): {untracked}"

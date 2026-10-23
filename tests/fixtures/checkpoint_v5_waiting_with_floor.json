@@ -1,0 +1,117 @@
+{
+  "schema_version": 5,
+  "run_id": "fixture-v5",
+  "tenant_id": "customer-1",
+  "agent_name": "test",
+  "revision": 0,
+  "status": "waiting_for_approval",
+  "status_reason": "write_file(path='a.py')",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Write the report"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_call",
+          "id": "call_1",
+          "name": "blob",
+          "arguments": {},
+          "arguments_error": null
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "call_id": "call_1",
+          "content": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_call",
+          "id": "call_2",
+          "name": "blob",
+          "arguments": {},
+          "arguments_error": null
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "call_id": "call_2",
+          "content": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_call",
+          "id": "call_3",
+          "name": "write_file",
+          "arguments": {
+            "path": "a.py"
+          },
+          "arguments_error": null
+        }
+      ]
+    }
+  ],
+  "pending": {
+    "done": [],
+    "waiting": {
+      "kind": "approval",
+      "call": {
+        "type": "tool_call",
+        "id": "call_3",
+        "name": "write_file",
+        "arguments": {
+          "path": "a.py"
+        },
+        "arguments_error": null
+      },
+      "prompt": "write_file(path='a.py')"
+    },
+    "remaining": []
+  },
+  "batch_done": [],
+  "output_schema_digest": null,
+  "output_model_name": null,
+  "output": null,
+  "context_floor": 3,
+  "measured_provider_id": "fake",
+  "measured_chars": 1500,
+  "measured_prompt_tokens": 700,
+  "step": 3,
+  "consecutive_retries": 0,
+  "usage": {
+    "input_tokens": 30,
+    "output_tokens": 30,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+    "reasoning_tokens": 0
+  },
+  "elapsed_s": 0.5,
+  "created_at": "2026-10-23T12:00:00Z",
+  "updated_at": "2026-10-23T12:00:00Z"
+}

@@ -42,6 +42,7 @@ class EventType(StrEnum):
     APPROVAL_REQUESTED = "approval_requested"
     INPUT_REQUESTED = "input_requested"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    CONTEXT_COMPACTED = "context_compacted"
     RUN_FINISHED = "run_finished"
 
 

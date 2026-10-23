@@ -8,7 +8,7 @@ Read this before you rely on the harness. Everything here is deliberate or not b
 - **Verified live so far:** the Anthropic adapter with Claude Haiku 5.5 (8 opt-in live tests plus 3 for the example agent).
   **Not verified live:** other providers and models, long-running or high-volume workloads, several real workers against one database in production.
 - **Bundled provider adapters:** The core ships without LLM SDKs; Anthropic (`[anthropic]`) and OpenAI-compatible (`[openai]`) are optional extras. For other custom providers, write an adapter following `ai_agent_harness/providers/base.py` and skill `add-provider-adapter`.
-- **Not built yet:** automatic context compaction, parallel tool execution.
+- **Not built yet:** parallel tool execution.
   Streaming, MCP, and structured final output exist but have only been tested offline (fake providers, stub servers, wire bodies: recorded for Anthropic, hand-written for OpenAI; the OpenAI live tests have not been run).
 
 ## Safety boundaries
@@ -58,10 +58,14 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   timeouts inside the tool itself.
 - **Sequential tool execution:** Tool calls within a single response run one after the other, so execution order, write-ahead checkpoints, and
   approval pauses stay deterministic.
-- **Estimated context size:** Without a tokenizer, the context size is an estimate. `max_context_chars` counts characters (images are excluded).
+- **Estimated context size and compaction:** Without a tokenizer, the context size is an estimate. `max_context_chars` counts characters (images are excluded).
   `max_context_tokens` (optional) starts from the prompt tokens the provider reported for the last call and adds the new characters at
   `CHARS_PER_TOKEN` (3) per token. For the first call, after a failover, or with a provider that reports no tokens, it is a size-based guess
   (ADR 0026). Oversized runs end cleanly with `limit_reached`.
+  Compaction (`Agent.compact_context=True`, ADR 0026) clears old `ToolResult` outputs from the model's view when approaching limits,
+  replacing them with a placeholder. The model "forgets" old results; there is no summary. The stored history (`state.messages`) is never
+  shortened, so **checkpoints do not become smaller** — each checkpoint writes the full conversation, so set `max_steps` to keep store growth
+  bounded (delta checkpoints are future work).
 - **Exception tracebacks:** Unexpected internal errors are logged to `ai_agent_harness.runner` with tracebacks that may contain local values.
   Events are content-free, but protect your application logs like production data.
 
