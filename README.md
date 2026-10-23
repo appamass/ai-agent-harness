@@ -49,7 +49,7 @@ With a real model: `pip install -e ".[anthropic]"`, `export ANTHROPIC_API_KEY=..
 - **Crash-safe, several workers:** state is saved before every tool call, in a file, SQLite, or PostgreSQL, and two workers cannot resume the same run.
   An approval can arrive days later in another process.
 - **Safe logs:** events carry only metadata, never prompts, arguments, or results. Limits on steps, tokens, and time, and a kill switch, hold across restarts.
-- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 16 guarantees and the test for each, including a test that injects random failures.
+- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 20 guarantees and the test for each, including a test that injects random failures.
 
 ## How to use this
 
