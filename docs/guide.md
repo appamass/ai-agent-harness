@@ -347,13 +347,54 @@ assert loaded is not None and loaded.status is RunStatus.WAITING_FOR_APPROVAL an
   await store.setup()                                    # once at deploy time (or run schema_sql() in your migrations)
   agent = Agent(..., checkpoints=store)
   queue = await store.list_runs("tenant-42", status=RunStatus.WAITING_FOR_APPROVAL)   # approval queue
-  await store.delete_tenant("tenant-42")                 # retention / erasure
   ```
 
-  Checkpoints hold full conversations as plaintext JSON: use TLS, a least-privilege role, and encryption at rest. Details: [ADR 0018](adr/0018-postgres-checkpoint-store.md).
+  Checkpoints hold full conversations as plaintext JSON by default: use TLS, a least-privilege role, encryption at rest, or pass `codec=AesGcmCodec(...)` (`pip install "ai-agent-harness[encryption]"`). Details: [ADR 0018](adr/0018-postgres-checkpoint-store.md), [ADR 0029](adr/0029-checkpoint-encryption-and-retention.md).
 - **Your own store:** implement `save(state)` with optimistic revision checking and `load(tenant_id, run_id)`, and **always** restore through
-  `restore_state(raw, tenant_id=tenant_id, run_id=run_id)`, never directly with `RunState.model_validate_json`. That gives you schema migrations,
+  `restore_state(raw, tenant_id=tenant_id, run_id=run_id)` (or `load_state`), never directly with `RunState.model_validate_json`. That gives you schema migrations,
   ownership checks, and protocol checks ([ADR 0010](adr/0010-checkpoint-schema-versioning.md)).
+
+### Retention and Deletion
+
+Checkpoints accumulate full conversations over time. Define data retention policies to prune completed runs and comply with privacy regulations (e.g. GDPR right to erasure):
+
+```python
+# executable
+import asyncio
+from datetime import timedelta
+from pathlib import Path
+import tempfile
+
+from ai_agent_harness import RunState, RunStatus, SqliteCheckpointStore
+
+
+async def retention_demo() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = SqliteCheckpointStore(Path(tmp) / "runs.sqlite")
+        await store.setup()
+
+        # 1. Scheduled retention: prune finished runs older than a threshold (e.g. 30 days).
+        # Running and waiting runs are NEVER deleted by purge_finished.
+        purged = await store.purge_finished(older_than=timedelta(days=30))
+        assert purged == 0
+
+        # 2. Deletion on demand (GDPR erasure, tenant offboarding):
+        # delete_tenant deletes all runs of a tenant; delete_run deletes a single run.
+        st = RunState(agent_name="a", tenant_id="tenant-42", run_id="run-1")
+        st.add_user_text("hi")
+        await store.save(st)
+        assert await store.delete_tenant("tenant-42") == 1
+        assert await store.load("tenant-42", "run-1") is None
+
+
+asyncio.run(retention_demo())
+```
+
+- **Scheduled purge:** Call `purge_finished(older_than=timedelta(days=...))` regularly (e.g. daily cron job). It evaluates time against the database clock to avoid worker clock skew.
+- **Manual erasure:** Call `delete_tenant(tenant_id)` or `delete_run(tenant_id, run_id)`. These delete runs in any status because a human made an explicit decision.
+- **Storage backends:** `SqliteCheckpointStore` and `PostgresCheckpointStore` support `purge_finished`. `JsonFileCheckpointStore` stores runs under `<dir>/<tenant>/<run>.json`. The in-memory store keeps nothing past process termination.
+- **Encryption at rest:** Pass `codec=AesGcmCodec(...)` (`pip install "ai-agent-harness[encryption]"`) to encrypt state payloads with AES-256-GCM. Metadata columns (`status`, `updated_at`) remain visible for queries and retention.
+- **Logs and backups:** Metadata events are content-free, but application tracebacks may log local context. Destroying encryption keys renders old checkpoints permanently unreadable even inside existing database backups.
 
 ## More building blocks
 

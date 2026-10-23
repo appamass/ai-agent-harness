@@ -34,12 +34,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, LiteralString
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Final, LiteralString
 
 from .core.errors import ConcurrencyError, ConfigError
-from .core.state import RunState, RunStatus, restore_state
-from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, settle_write
+from .core.state import RunState, RunStatus
+from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, load_state, settle_write
 from .persistence_sql import DEFAULT_TABLE, WriteRecord, sql_identifier, statements, status_index_name
+
+if TYPE_CHECKING:
+    from .encryption import StateCodec
 
 try:
     import psycopg
@@ -49,7 +53,8 @@ except ImportError as exc:
     raise ConfigError("The Postgres store needs the driver: pip install 'ai-agent-harness[postgres]'") from exc
 
 
-_SQL = statements("%s", "now()")
+_CUTOFF: Final[LiteralString] = "(now() - (%s * interval '1 second'))"
+_SQL = statements("%s", "now()", _CUTOFF)
 
 
 def _create_statements(schema: str, table: str) -> list[sql.Composed]:
@@ -83,6 +88,7 @@ class PostgresCheckpointStore:
         pool: AsyncConnectionPool[Any] | None = None,
         schema: str = "public",
         table: str = DEFAULT_TABLE,
+        codec: StateCodec | None = None,
     ) -> None:
         if (dsn is None) == (pool is None):
             raise ConfigError("PostgresCheckpointStore needs exactly one of dsn or pool")
@@ -91,6 +97,7 @@ class PostgresCheckpointStore:
         self._schema = sql_identifier(schema, "schema")
         self._table = sql_identifier(table, "table")
         self._qualified = sql.Identifier(self._schema, self._table)
+        self._codec = codec
 
     # ------------------------------------------------------------------ Setup
 
@@ -105,7 +112,7 @@ class PostgresCheckpointStore:
     async def save(self, state: RunState) -> None:
         """Saves and increments `state.revision`. Raises `ConcurrencyError` if another worker saved first."""
         check_ids(state.tenant_id, state.run_id)
-        record = WriteRecord.from_state(state)
+        record = await asyncio.to_thread(WriteRecord.from_state, state, self._codec)
         write = asyncio.ensure_future(self._write(record))
         await settle_write(write, state, record.new_revision)
 
@@ -114,7 +121,9 @@ class PostgresCheckpointStore:
         query = self._sql(_SQL.load)
         async with self._connection() as connection:
             row = await (await connection.execute(query, (tenant_id, run_id))).fetchone()
-        return restore_state(str(row[0]), tenant_id=tenant_id, run_id=run_id) if row is not None else None
+        if row is None:
+            return None
+        return await asyncio.to_thread(load_state, str(row[0]), tenant_id=tenant_id, run_id=run_id, codec=self._codec)
 
     async def _write(self, record: WriteRecord) -> None:
         query = self._sql(_SQL.upsert)
@@ -124,6 +133,27 @@ class PostgresCheckpointStore:
             raise ConcurrencyError(f"Run {record.run_id} was modified concurrently")
 
     # ------------------------------------------------------------------ Queries and retention
+
+    async def purge_finished(self, *, older_than: timedelta, tenant_id: str | None = None) -> int:
+        """Purges finished runs updated more than `older_than` ago.
+
+        Never touches running or waiting runs. If `tenant_id` is given, restricts to that tenant.
+        Returns the number of purged runs.
+        """
+        if not isinstance(older_than, timedelta) or older_than.total_seconds() <= 0:
+            raise ValueError("older_than must be a positive timedelta")
+        if tenant_id is not None:
+            check_tenant_id(tenant_id)
+        seconds = older_than.total_seconds()
+        if tenant_id is None:
+            query = self._sql(_SQL.purge_all)
+            params: tuple[Any, ...] = (seconds,)
+        else:
+            query = self._sql(_SQL.purge_tenant)
+            params = (tenant_id, seconds)
+        async with self._connection() as connection:
+            result = await connection.execute(query, params)
+            return result.rowcount if result.rowcount >= 0 else 0
 
     async def list_runs(self, tenant_id: str, *, status: RunStatus | None = None, limit: int = 100) -> list[RunInfo]:
         """Runs of one tenant, newest first. For example `status=RunStatus.WAITING_FOR_APPROVAL` for an approval queue.

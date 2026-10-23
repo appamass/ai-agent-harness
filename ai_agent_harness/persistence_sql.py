@@ -9,16 +9,30 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Final, LiteralString
+from typing import TYPE_CHECKING, Final, LiteralString
 
 from .core.errors import ConfigError
 from .core.state import RunState
+
+if TYPE_CHECKING:
+    from .encryption import StateCodec
 
 DEFAULT_TABLE: Final = "ai_agent_harness_checkpoints"
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
 COLUMNS: Final[tuple[LiteralString, ...]] = ("tenant_id", "run_id", "revision", "status", "schema_version", "state")
 """The row values of a write, in the order of `WriteRecord.params` (`updated_at` is set by the database)."""
+
+STATUS_LIST: Final[LiteralString] = "'blocked', 'cancelled', 'done', 'failed', 'limit_reached', 'refused'"
+
+FINISHED_STATUSES: Final[tuple[str, ...]] = (
+    "blocked",
+    "cancelled",
+    "done",
+    "failed",
+    "limit_reached",
+    "refused",
+)
 
 
 def sql_identifier(value: str, what: str) -> str:
@@ -44,10 +58,12 @@ class Statements:
     list_status: LiteralString
     delete_run: LiteralString
     delete_tenant: LiteralString
+    purge_all: LiteralString
+    purge_tenant: LiteralString
 
 
-def statements(placeholder: LiteralString, now: LiteralString) -> Statements:
-    """The statements with the dialect's parameter `placeholder` and current-time expression `now`."""
+def statements(placeholder: LiteralString, now: LiteralString, cutoff: LiteralString) -> Statements:
+    """The statements with the dialect's parameter `placeholder`, current-time expression `now`, and cutoff `cutoff`."""
     p = placeholder
     updates = ", ".join(f"{column} = excluded.{column}" for column in COLUMNS[2:])
     listing = "SELECT run_id, status, revision, updated_at FROM {table} WHERE tenant_id = " + p
@@ -64,6 +80,10 @@ def statements(placeholder: LiteralString, now: LiteralString) -> Statements:
         list_status=f"{listing} AND status = {p}{order}",
         delete_run=f"DELETE FROM {{table}} WHERE tenant_id = {p} AND run_id = {p}",
         delete_tenant=f"DELETE FROM {{table}} WHERE tenant_id = {p}",
+        purge_all=f"DELETE FROM {{table}} WHERE status IN ({STATUS_LIST}) AND updated_at < {cutoff}",
+        purge_tenant=(
+            f"DELETE FROM {{table}} WHERE tenant_id = {p} AND status IN ({STATUS_LIST}) AND updated_at < {cutoff}"
+        ),
     )
 
 
@@ -80,14 +100,24 @@ class WriteRecord:
     schema_version: int
 
     @classmethod
-    def from_state(cls, state: RunState) -> WriteRecord:
+    def from_state(cls, state: RunState, codec: StateCodec | None = None) -> WriteRecord:
         new_revision = state.revision + 1
+        plaintext = state.model_copy(update={"revision": new_revision}).model_dump_json()
+        if codec is not None:
+            payload = codec.encode(
+                plaintext,
+                tenant_id=state.tenant_id,
+                run_id=state.run_id,
+                revision=new_revision,
+            )
+        else:
+            payload = plaintext
         return cls(
             tenant_id=state.tenant_id,
             run_id=state.run_id,
             expected=state.revision,
             new_revision=new_revision,
-            payload=state.model_copy(update={"revision": new_revision}).model_dump_json(),
+            payload=payload,
             status=str(state.status),
             schema_version=state.schema_version,
         )

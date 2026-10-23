@@ -109,10 +109,10 @@ agent = Agent(name="demo", router=ModelRouter(AnthropicProvider("claude-haiku-5-
 | Models | `AnthropicProvider` (Claude), `OpenAIProvider` (GPT/Ollama/vLLM), router with retries, timeout, and fallback models, `FakeProvider` for tests | Adapters for other providers (a small contract, reference adapters) |
 | Tools | `AskUser`, `ReadFile` (secrets denied by default), `@tool(risk=…)` for plain functions, the execution gate (also usable alone), approvals | Your tools: a Pydantic model, a risk level, a timeout |
 | Guardrails | `ProtectedPaths`, `SecretGuard`, `EgressGuard`, `WeakeningGuard`, `KillSwitch`, fail-closed hooks (pattern checks, see [limits](docs/known-limitations.md#built-in-guards-are-heuristics)) | Your policies as `Hook` classes |
-| State | In-memory, file (POSIX), SQLite (stdlib), and PostgreSQL stores with `list_runs` and deletion | Encryption, retention, and access rules for your data |
+| State | In-memory, file (POSIX), SQLite (stdlib), and PostgreSQL stores with `list_runs`, retention purge, and `AesGcmCodec` | Keys, retention intervals, and access rules for your data |
 | Operations | Metadata events, `log_listener`, `OpenTelemetryListener`, `Limits`, crash recovery | Your trace backend, cost tracking, your UI for approvals |
 
-Not built yet: parallel tool calls. Context compaction, streaming, MCP, and structured output exist; read their [limits](docs/known-limitations.md#streaming-structured-output-mcp) first.
+Context compaction, parallel read tools, streaming, MCP, and structured output exist; read their [limits](docs/known-limitations.md#streaming-structured-output-mcp) first.
 
 ## Install
 
@@ -120,7 +120,7 @@ Not built yet: parallel tool calls. Context compaction, streaming, MCP, and stru
 pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.7.0"
 ```
 
-Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[openai]` (OpenAI/compat), `[postgres]` (PostgreSQL store), `[opentelemetry]` (tracing).
+Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[openai]` (OpenAI/compat), `[postgres]` (PostgreSQL store), `[encryption]` (AES-256-GCM), `[opentelemetry]` (tracing).
 The OpenAI adapter, SQLite store, streaming, MCP, structured output, and OpenTelemetry ship with the next tag; `v0.7.0` does not have them.
 Pin a release tag (for example `@v0.7.0`) and commit your lockfile: before 1.0, a minor version may contain breaking changes ([`CHANGELOG.md`](CHANGELOG.md)).
 What has been run against a real model, and what has not: [`docs/known-limitations.md`](docs/known-limitations.md).

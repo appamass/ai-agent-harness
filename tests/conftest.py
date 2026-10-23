@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, LiteralString, TypeVar
 
+if TYPE_CHECKING:
+    from ai_agent_harness.encryption import AesGcmCodec, StateCodec
+
 import pytest
 from pydantic import BaseModel
 
@@ -219,15 +222,21 @@ class SqlBackend:
     """A second store object on the same database, like another process that only shares the database."""
 
 
+def make_test_codec() -> AesGcmCodec:
+    from ai_agent_harness.encryption import AesGcmCodec
+
+    return AesGcmCodec({"k1": b"\x01" * 32}, active="k1")
+
+
 @contextlib.contextmanager
-def _sqlite_backend(tmp_path: Path) -> Generator[SqlBackend]:
+def _sqlite_backend(tmp_path: Path, codec: StateCodec | None = None) -> Generator[SqlBackend]:
     import sqlite3
     from contextlib import closing
 
     from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore
 
-    path = tmp_path / "checkpoints.sqlite"
-    opened = [SqliteCheckpointStore(path)]
+    path = tmp_path / f"checkpoints{'_enc' if codec else ''}.sqlite"
+    opened = [SqliteCheckpointStore(path, codec=codec)]
     run_sync(opened[0].setup())
 
     def execute(query: LiteralString, *params: object) -> list[tuple[Any, ...]]:
@@ -239,7 +248,7 @@ def _sqlite_backend(tmp_path: Path) -> Generator[SqlBackend]:
             return rows
 
     def reopen() -> SqliteCheckpointStore:
-        opened.append(SqliteCheckpointStore(path))
+        opened.append(SqliteCheckpointStore(path, codec=codec))
         return opened[-1]
 
     try:
@@ -250,7 +259,7 @@ def _sqlite_backend(tmp_path: Path) -> Generator[SqlBackend]:
 
 
 @contextlib.contextmanager
-def _postgres_backend() -> Generator[SqlBackend]:
+def _postgres_backend(codec: StateCodec | None = None) -> Generator[SqlBackend]:
     """Needs `HARNESS_TEST_POSTGRES_DSN`; the test is skipped without it."""
     with fresh_postgres_schema() as (dsn, schema):
         import psycopg
@@ -258,7 +267,7 @@ def _postgres_backend() -> Generator[SqlBackend]:
 
         from ai_agent_harness.persistence_postgres import PostgresCheckpointStore
 
-        created = PostgresCheckpointStore(dsn, schema=schema)
+        created = PostgresCheckpointStore(dsn, schema=schema, codec=codec)
         run_sync(created.setup())
 
         def execute(query: LiteralString, *params: object) -> list[tuple[Any, ...]]:
@@ -267,17 +276,18 @@ def _postgres_backend() -> Generator[SqlBackend]:
                 cursor = connection.execute(statement, params)
                 return cursor.fetchall() if cursor.description else []
 
-        yield SqlBackend(created, execute, lambda: PostgresCheckpointStore(dsn, schema=schema))
+        yield SqlBackend(created, execute, lambda: PostgresCheckpointStore(dsn, schema=schema, codec=codec))
 
 
-@pytest.fixture(params=["sqlite", "postgres"])
+@pytest.fixture(params=["sqlite", "postgres", "sqlite_enc", "postgres_enc"])
 def sql_backend(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[SqlBackend]:
-    """Both SQL stores, so one contract test runs against each. Postgres is skipped without a database."""
-    if request.param == "sqlite":
-        with _sqlite_backend(tmp_path) as backend:
+    """Both SQL stores, plain and encrypted. Postgres is skipped without a database."""
+    codec = make_test_codec() if "enc" in request.param else None
+    if "sqlite" in request.param:
+        with _sqlite_backend(tmp_path, codec=codec) as backend:
             yield backend
     else:
-        with _postgres_backend() as backend:
+        with _postgres_backend(codec=codec) as backend:
             yield backend
 
 
@@ -286,16 +296,28 @@ def sql_store(sql_backend: SqlBackend) -> SqliteCheckpointStore | PostgresCheckp
     return sql_backend.store
 
 
-@pytest.fixture(params=["memory", "file", "postgres", "sqlite"])
+@pytest.fixture(
+    params=[
+        "memory",
+        "file",
+        "postgres",
+        "sqlite",
+        "memory_enc",
+        "file_enc",
+        "postgres_enc",
+        "sqlite_enc",
+    ]
+)
 def any_store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[CheckpointStore]:
-    """Every shipped checkpoint store. Postgres is skipped without a database."""
-    if request.param == "memory":
-        yield InMemoryCheckpointStore()
-    elif request.param == "file":
-        yield JsonFileCheckpointStore(tmp_path / "cp")
-    elif request.param == "sqlite":
-        with _sqlite_backend(tmp_path) as backend:
+    """Every shipped checkpoint store, plain and encrypted. Postgres is skipped without a database."""
+    codec = make_test_codec() if "enc" in request.param else None
+    if "memory" in request.param:
+        yield InMemoryCheckpointStore(codec=codec)
+    elif "file" in request.param:
+        yield JsonFileCheckpointStore(tmp_path / f"cp_{request.param}", codec=codec)
+    elif "sqlite" in request.param:
+        with _sqlite_backend(tmp_path, codec=codec) as backend:
             yield backend.store
     else:
-        with _postgres_backend() as backend:
+        with _postgres_backend(codec=codec) as backend:
             yield backend.store

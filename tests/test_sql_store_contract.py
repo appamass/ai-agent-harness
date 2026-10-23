@@ -7,12 +7,14 @@ Tests that belong to one backend only stay in `test_sqlite_store.py` and `test_p
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 
 import pytest
 
-from ai_agent_harness import Autonomy, RunStatus, resume, start
+from ai_agent_harness import Autonomy, RunState, RunStatus, resume, start
 from ai_agent_harness.core import ConcurrencyError, InvalidStateError
 from ai_agent_harness.persistence_postgres import PostgresCheckpointStore
+from ai_agent_harness.persistence_sql import FINISHED_STATUSES
 from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore
 from ai_agent_harness.testing import text_response, tool_response
 
@@ -151,3 +153,96 @@ def test_a_crashed_run_is_recovered_from_the_database(sql_backend: SqlBackend, s
     assert stored is not None
     done = run_sync(resume(recovering, stored, recover=True))
     assert done.status is RunStatus.DONE and done.last_text == "recovered"
+
+
+def test_finished_statuses_matches_run_status() -> None:
+    all_statuses = {s.value for s in RunStatus}
+    waiting = {RunStatus.WAITING_FOR_INPUT.value, RunStatus.WAITING_FOR_APPROVAL.value}
+    running = {RunStatus.RUNNING.value}
+    assert set(FINISHED_STATUSES) == all_statuses - waiting - running
+    assert set(FINISHED_STATUSES).isdisjoint(waiting | running)
+
+
+def test_purge_finished_deletes_only_old_terminal_runs(sql_backend: SqlBackend, sql_store: SqlStore) -> None:
+    from ai_agent_harness.core.state import PendingBatch, PendingCall
+    from ai_agent_harness.core.types import Message, ToolCall
+
+    states: list[RunState] = []
+    terminal_statuses = [
+        RunStatus.DONE,
+        RunStatus.REFUSED,
+        RunStatus.BLOCKED,
+        RunStatus.LIMIT_REACHED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    ]
+
+    for status in terminal_statuses:
+        st = waiting_state("t1", f"term-{status.value}")
+        st.set_status(status)
+        states.append(st)
+
+    # Non-terminal states: RUNNING, WAITING_FOR_INPUT, WAITING_FOR_APPROVAL
+    running_st = waiting_state("t1", "nonterm-running")
+    states.append(running_st)
+
+    from typing import Literal
+
+    kinds: tuple[Literal["input", "approval"], ...] = ("input", "approval")
+    for kind in kinds:
+        wait_st = RunState(agent_name="a", tenant_id="t1", run_id=f"nonterm-waiting_{kind}")
+        wait_st.add_user_text("hi")
+        call = ToolCall(id=f"c-{kind}", name="echo")
+        wait_st.add_assistant(Message(role="assistant", content=(call,)))
+        wait_st.pending = PendingBatch(waiting=PendingCall(kind=kind, call=call, prompt="?"))
+        wait_st.set_status(RunStatus.WAITING_FOR_INPUT if kind == "input" else RunStatus.WAITING_FOR_APPROVAL)
+        states.append(wait_st)
+
+    # Recent terminal run that should NOT be purged
+    recent = waiting_state("t1", "term-recent")
+    recent.set_status(RunStatus.DONE)
+    states.append(recent)
+
+    # Terminal run for another tenant (t2)
+    t2_done = waiting_state("t2", "term-t2")
+    t2_done.set_status(RunStatus.DONE)
+    states.append(t2_done)
+
+    for st in states:
+        run_sync(sql_store.save(st))
+
+    # Move timestamps: old runs to 2 hours ago
+    old_stamp = "2026-01-01T10:00:00.000Z"
+    for st in states:
+        if st.run_id != "term-recent":
+            sql_backend.execute(
+                "UPDATE {table} SET updated_at = %s WHERE tenant_id = %s AND run_id = %s",
+                old_stamp,
+                st.tenant_id,
+                st.run_id,
+            )
+
+    # Invalid arguments rejected
+    with pytest.raises(ValueError, match="positive"):
+        run_sync(sql_store.purge_finished(older_than=timedelta(0)))
+    with pytest.raises(ValueError, match="positive"):
+        run_sync(sql_store.purge_finished(older_than=timedelta(seconds=-1)))
+    with pytest.raises(ValueError, match="Invalid tenant_id"):
+        run_sync(sql_store.purge_finished(older_than=timedelta(hours=1), tenant_id="bad/tenant"))
+
+    # Purge t1:
+    purged_t1 = run_sync(sql_store.purge_finished(older_than=timedelta(hours=1), tenant_id="t1"))
+    assert purged_t1 == len(terminal_statuses)
+
+    # Check that non-terminal runs and recent run still exist in t1
+    assert run_sync(sql_store.load("t1", "nonterm-running")) is not None
+    assert run_sync(sql_store.load("t1", "nonterm-waiting_input")) is not None
+    assert run_sync(sql_store.load("t1", "nonterm-waiting_approval")) is not None
+    assert run_sync(sql_store.load("t1", "term-recent")) is not None
+    assert run_sync(sql_store.load("t2", "term-t2")) is not None
+
+    # Now purge all tenants without tenant_id:
+    purged_all = run_sync(sql_store.purge_finished(older_than=timedelta(hours=1)))
+    assert purged_all == 1  # term-t2 purged
+
+    assert run_sync(sql_store.load("t2", "term-t2")) is None

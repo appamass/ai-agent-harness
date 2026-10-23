@@ -20,17 +20,21 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .core.errors import ConcurrencyError, ConfigError
-from .core.state import RunState, RunStatus, restore_state
-from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, settle_write
+from .core.state import RunState, RunStatus
+from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, load_state, settle_write
 from .persistence_sql import DEFAULT_TABLE, WriteRecord, sql_identifier, statements, status_index_name
 
+if TYPE_CHECKING:
+    from .encryption import StateCodec
+
 _NOW = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
-_SQL = statements("?", _NOW)
+_CUTOFF = "strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-' || ? || ' seconds')"
+_SQL = statements("?", _NOW, _CUTOFF)
 
 
 def _create_statements(table: str) -> list[str]:
@@ -68,10 +72,12 @@ class SqliteCheckpointStore:
         connection: sqlite3.Connection | None = None,
         table: str = DEFAULT_TABLE,
         busy_timeout_ms: int = 5000,
+        codec: StateCodec | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._closed = False
         self._owns_connection = connection is None
+        self._codec = codec
 
         if database is not None and connection is not None:
             raise ConfigError("SqliteCheckpointStore needs at most one of database or connection")
@@ -165,21 +171,47 @@ class SqliteCheckpointStore:
     async def save(self, state: RunState) -> None:
         """Saves and increments `state.revision`. Raises `ConcurrencyError` if another worker saved first."""
         check_ids(state.tenant_id, state.run_id)
-        record = WriteRecord.from_state(state)
-        write = asyncio.ensure_future(asyncio.to_thread(self._write_sync, record))
-        await settle_write(write, state, record.new_revision)
+        new_revision = state.revision + 1
+        write = asyncio.ensure_future(asyncio.to_thread(self._write_sync, state))
+        await settle_write(write, state, new_revision)
 
-    def _write_sync(self, record: WriteRecord) -> None:
+    def _write_sync(self, state: RunState) -> None:
+        record = WriteRecord.from_state(state, self._codec)
         rows, _ = self._run(self._sql(_SQL.upsert), record.params, commit=True)
         if not rows:
             raise ConcurrencyError(f"Run {record.run_id} was modified concurrently")
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
-        rows, _ = await asyncio.to_thread(self._run, self._sql(_SQL.load), (tenant_id, run_id))
-        return restore_state(str(rows[0][0]), tenant_id=tenant_id, run_id=run_id) if rows else None
+        return await asyncio.to_thread(self._load_sync, tenant_id, run_id)
+
+    def _load_sync(self, tenant_id: str, run_id: str) -> RunState | None:
+        rows, _ = self._run(self._sql(_SQL.load), (tenant_id, run_id))
+        return load_state(str(rows[0][0]), tenant_id=tenant_id, run_id=run_id, codec=self._codec) if rows else None
 
     # ------------------------------------------------------------------ Queries and retention
+
+    async def purge_finished(self, *, older_than: timedelta, tenant_id: str | None = None) -> int:
+        """Purges finished runs updated more than `older_than` ago.
+
+        Never touches running or waiting runs. If `tenant_id` is given, restricts to that tenant.
+        Returns the number of purged runs.
+        """
+        if not isinstance(older_than, timedelta) or older_than.total_seconds() <= 0:
+            raise ValueError("older_than must be a positive timedelta")
+        if tenant_id is not None:
+            check_tenant_id(tenant_id)
+        return await asyncio.to_thread(self._purge_sync, older_than.total_seconds(), tenant_id)
+
+    def _purge_sync(self, seconds: float, tenant_id: str | None) -> int:
+        if tenant_id is None:
+            query = self._sql(_SQL.purge_all)
+            params: tuple[Any, ...] = (seconds,)
+        else:
+            query = self._sql(_SQL.purge_tenant)
+            params = (tenant_id, seconds)
+        _, count = self._run(query, params, commit=True)
+        return count
 
     async def list_runs(self, tenant_id: str, *, status: RunStatus | None = None, limit: int = 100) -> list[RunInfo]:
         """Runs of one tenant, newest first."""

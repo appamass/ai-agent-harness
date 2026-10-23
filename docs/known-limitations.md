@@ -71,11 +71,10 @@ Read this before you rely on the harness. Everything here is deliberate or not b
 
 - **`JsonFileCheckpointStore`:** uses `fcntl`, so it works only on POSIX (Linux/macOS). On platforms without `fcntl` (for example Windows) it
   raises `ConfigError` rather than running without a cross-process lock. On case-insensitive filesystems (macOS, Windows), `Customer` and `customer`
-  map to the same path; the store detects and rejects this collision, so normalize IDs to lowercase. Locking is per tenant. It writes plaintext JSON
-  and is meant for development and single-host use.
-- **`PostgresCheckpointStore`:** works anywhere PostgreSQL does, but stores plaintext JSON too. Use TLS, a least-privilege role, and encryption at rest,
-  or wrap the store with per-tenant keys (note: that does not detect replay of an older complete row). Database errors and logs may
-  quote row data: treat them like checkpoints. See [ADR 0018](adr/0018-postgres-checkpoint-store.md).
+  map to the same path; the store detects and rejects this collision, so normalize IDs to lowercase. Locking is per tenant. It is meant for development and single-host use.
+- **`PostgresCheckpointStore`:** works anywhere PostgreSQL does. Use TLS, a least-privilege role, and encryption at rest,
+  or configure `codec=AesGcmCodec(...)`. Database errors and logs may quote row data: treat them like checkpoints. See [ADR 0018](adr/0018-postgres-checkpoint-store.md).
+- **Optional checkpoint encryption:** All stores support `codec=AesGcmCodec(...)` (`pip install "ai-agent-harness[encryption]"`). It uses AES-256-GCM with authenticated metadata headers (ADR 0029). Payloads are not compressed before encryption (preventing compression side-channel leakage), which increases storage requirements: Base64 encoding adds ~33% size, and Postgres TOAST compression cannot compress high-entropy ciphertext. Encrypted rows authenticate metadata against tampering, but encryption alone does not prevent the replay of an older complete row.
 
 ## Built-in guards are heuristics
 

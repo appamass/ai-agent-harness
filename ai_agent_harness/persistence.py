@@ -26,14 +26,18 @@ from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol
 
 from .core.errors import ConcurrencyError, ConfigError, InvalidStateError
 from .core.state import RunState, RunStatus, restore_state
 from .core.types import ID_RE
 from .persistence_sql import WriteRecord
 
+if TYPE_CHECKING:
+    from .encryption import StateCodec
+
 MAX_LIST_LIMIT: Final = 10_000
+ENCRYPTED_PREFIX: Final = "enc:v1:"
 
 try:  # POSIX file locks; without fcntl (Windows), JsonFileCheckpointStore refuses to start
     import fcntl
@@ -97,12 +101,47 @@ async def settle_write(write: asyncio.Future[None], state: RunState, new_revisio
     state.revision = new_revision
 
 
+def load_state(
+    raw: str,
+    *,
+    tenant_id: str,
+    run_id: str,
+    codec: StateCodec | None = None,
+) -> RunState:
+    """Decodes and restores a RunState from raw storage text."""
+    check_ids(tenant_id, run_id)
+    if codec is not None:
+        if not raw.startswith(ENCRYPTED_PREFIX):
+            raise InvalidStateError("Unencrypted checkpoint rejected: store is configured with encryption")
+        plaintext = codec.decode(raw, tenant_id=tenant_id, run_id=run_id)
+        return restore_state(plaintext, tenant_id=tenant_id, run_id=run_id)
+    if raw.startswith(ENCRYPTED_PREFIX):
+        raise InvalidStateError("Encrypted checkpoint cannot be loaded without a codec")
+    return restore_state(raw, tenant_id=tenant_id, run_id=run_id)
+
+
+def _extract_head(raw: str) -> tuple[str, str, int]:
+    if raw.startswith(ENCRYPTED_PREFIX):
+        header_json, _, _ = raw[len(ENCRYPTED_PREFIX) :].partition("\n")
+        try:
+            data = json.loads(header_json)
+            return str(data["tenant_id"]), str(data["run_id"]), int(data["revision"])
+        except Exception as exc:
+            raise InvalidStateError("Corrupted encrypted checkpoint header") from exc
+    try:
+        data = json.loads(raw)
+        return str(data.get("tenant_id")), str(data.get("run_id")), int(data.get("revision", 0))
+    except Exception as exc:
+        raise InvalidStateError("Corrupted checkpoint file") from exc
+
+
 class InMemoryCheckpointStore:
     """For tests and single-process runs that do not require disk persistence."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, codec: StateCodec | None = None) -> None:
         self._data: dict[tuple[str, str], tuple[int, str]] = {}
         self._lock = asyncio.Lock()
+        self._codec = codec
 
     async def save(self, state: RunState) -> None:
         key = (state.tenant_id, state.run_id)
@@ -110,42 +149,48 @@ class InMemoryCheckpointStore:
             stored = self._data.get(key)
             if stored is not None and stored[0] != state.revision:
                 raise ConcurrencyError(f"Run {state.run_id} was modified concurrently")
-            record = WriteRecord.from_state(state)
+            record = WriteRecord.from_state(state, self._codec)
             self._data[key] = (record.new_revision, record.payload)
             state.revision = record.new_revision
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
         stored = self._data.get((tenant_id, run_id))
-        return restore_state(stored[1], tenant_id=tenant_id, run_id=run_id) if stored else None
+        return load_state(stored[1], tenant_id=tenant_id, run_id=run_id, codec=self._codec) if stored else None
 
 
 class JsonFileCheckpointStore:
-    def __init__(self, directory: str | Path) -> None:
+    def __init__(self, directory: str | Path, *, codec: StateCodec | None = None) -> None:
         if not _file_locks_available():  # without a cross-process lock, two workers could repeat one action
             raise ConfigError(
                 "JsonFileCheckpointStore needs POSIX file locks (fcntl), which this platform lacks. "
                 "Use a database-backed CheckpointStore instead."
             )
         self._root = Path(directory).resolve()
+        self._codec = codec
         try:
             self._root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise ConfigError(f"Checkpoint directory is not usable: {self._root}") from exc
 
     async def save(self, state: RunState) -> None:
+        check_ids(state.tenant_id, state.run_id)
         new_revision = state.revision + 1
-        payload = state.model_copy(update={"revision": new_revision}).model_dump_json(indent=2)
         write = asyncio.ensure_future(
-            asyncio.to_thread(self._save_sync, state.tenant_id, state.run_id, state.revision, payload)
+            asyncio.to_thread(self._save_sync, state.tenant_id, state.run_id, state.revision, state)
         )
         await settle_write(write, state, new_revision)
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
         path = self._path(tenant_id, run_id)
-        raw = await asyncio.to_thread(lambda: path.read_text(encoding="utf-8") if path.exists() else None)
-        return restore_state(raw, tenant_id=tenant_id, run_id=run_id) if raw is not None else None
+        return await asyncio.to_thread(self._load_sync, path, tenant_id, run_id)
+
+    def _load_sync(self, path: Path, tenant_id: str, run_id: str) -> RunState | None:
+        if not path.exists():
+            return None
+        raw = path.read_text(encoding="utf-8")
+        return load_state(raw, tenant_id=tenant_id, run_id=run_id, codec=self._codec)
 
     def _path(self, tenant_id: str, run_id: str) -> Path:
         path = (self._root / tenant_id / f"{run_id}.json").resolve()
@@ -153,25 +198,31 @@ class JsonFileCheckpointStore:
             raise ValueError("Checkpoint path resolves outside the storage directory")
         return path
 
-    def _save_sync(self, tenant_id: str, run_id: str, expected_revision: int, payload: str) -> None:
+    def _save_sync(self, tenant_id: str, run_id: str, expected_revision: int, payload: str | RunState) -> None:
         check_ids(tenant_id, run_id)
         path = self._path(tenant_id, run_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with _file_lock(path.parent / ".lock"):  # one lock per tenant: avoids leaving per-run lock files behind
             if path.exists():
-                stored = json.loads(path.read_text(encoding="utf-8"))
-                if (stored.get("tenant_id"), stored.get("run_id")) != (tenant_id, run_id):
+                raw_stored = path.read_text(encoding="utf-8")
+                stored_tenant_id, stored_run_id, stored_revision = _extract_head(raw_stored)
+                if (stored_tenant_id, stored_run_id) != (tenant_id, run_id):
                     # e.g. `Customer`/`customer` on macOS/Windows: same file, different run
                     raise InvalidStateError(
                         f"Checkpoint file for {tenant_id}/{run_id} belongs to a different run "
                         "(case-insensitive filesystem?)"
                     )
-                if stored.get("revision") != expected_revision:
+                if stored_revision != expected_revision:
                     raise ConcurrencyError(f"Run {run_id} was modified concurrently")
+            if isinstance(payload, RunState):
+                record = WriteRecord.from_state(payload, self._codec)
+                payload_str = record.payload
+            else:
+                payload_str = payload
             fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{run_id}.", suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(payload)
+                    handle.write(payload_str)
                     handle.flush()
                     os.fsync(handle.fileno())
                 os.replace(tmp, path)
