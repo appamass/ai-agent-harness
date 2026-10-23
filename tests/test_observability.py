@@ -403,6 +403,7 @@ def test_non_standard_attributes_use_the_harness_prefix(
     assert model_span.attributes is not None
     names = set(model_span.attributes)
     assert {"harness.request.messages", "gen_ai.provider.name"} <= names
+    assert {"harness.request.context_chars", "harness.request.context_tokens_est"} <= names  # ADR 0026
     assert not {"gen_ai.request.messages_count", "gen_ai.request.tools_count", "gen_ai.system"} & names
 
 

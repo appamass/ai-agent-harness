@@ -58,8 +58,10 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   timeouts inside the tool itself.
 - **Sequential tool execution:** Tool calls within a single response run one after the other, so execution order, write-ahead checkpoints, and
   approval pauses stay deterministic.
-- **Estimated context size:** The context budget is estimated in characters (not exact tokens; images are excluded). Compaction is not built in:
-  oversized runs end cleanly with `limit_reached`.
+- **Estimated context size:** Without a tokenizer, the context size is an estimate. `max_context_chars` counts characters (images are excluded).
+  `max_context_tokens` (optional) starts from the prompt tokens the provider reported for the last call and adds the new characters at
+  `CHARS_PER_TOKEN` (3) per token. For the first call, after a failover, or with a provider that reports no tokens, it is a size-based guess
+  (ADR 0026). Oversized runs end cleanly with `limit_reached`.
 - **Exception tracebacks:** Unexpected internal errors are logged to `ai_agent_harness.runner` with tracebacks that may contain local values.
   Events are content-free, but protect your application logs like production data.
 

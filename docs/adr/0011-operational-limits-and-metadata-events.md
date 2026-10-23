@@ -1,6 +1,6 @@
 # 0011 – Metadata-Only Events, Budgets, Kill Switch
 
-- **Status:** Accepted (maintainer, 2026-10-18)
+- **Status:** Accepted (maintainer, 2026-10-18). Amended by [0026](0026-token-estimate-and-context-compaction.md): token estimate calibrated by the provider, deterministic compaction
 - **Date:** 2026-10-16
 - **Affects:** `ai_agent_harness/core/events.py`, `ai_agent_harness/tools/executor.py`, `ai_agent_harness/runtime/runner.py`, `ai_agent_harness/policy.py`, `ai_agent_harness/guardrails.py`
 
@@ -19,9 +19,9 @@ Events went to central logs while carrying raw hook reasons and model strings, w
 
 - Regex redaction in events: never complete; leaving content out is safe by construction.
 - Vendor tokenizers: provider-specific and heavy.
-- Automatic history compaction in core: changes what the model remembers.
+- Automatic history compaction in core: changes what the model remembers. (ADR 0026 allows one deterministic, opt-in variant that only clears old tool results from the model's view.)
 - `SIGTERM` as kill switch: no coordination across workers or tenants.
 
 ## Consequences
 
-To see why a hook blocked, read `RunState.status_reason`. The size estimate is rough (about 4 characters per token). Tracebacks logged with `log.exception` may contain local values: protect application logs. Tested in `tests/test_failures.py`, `tests/test_budgets_and_killswitch.py`, `tests/test_stress.py`.
+To see why a hook blocked, read `RunState.status_reason`. The size estimate is rough (`CHARS_PER_TOKEN` characters per token, calibrated by the provider's reported tokens, ADR 0026). Tracebacks logged with `log.exception` may contain local values: protect application logs. Tested in `tests/test_failures.py`, `tests/test_budgets_and_killswitch.py`, `tests/test_stress.py`.

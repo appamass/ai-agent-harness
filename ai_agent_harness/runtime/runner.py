@@ -46,6 +46,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
+from ..context import ContextMeter, estimate_tokens
 from ..core import state as state_schema
 from ..core.errors import ConcurrencyError, ConfigError, InvalidStateError, ProviderError
 from ..core.events import Event, EventType
@@ -284,6 +285,24 @@ def _extract_json_text(text: str) -> str:
     """The JSON object in a model answer: everything from the first `{` to the last `}` (drops fences and prose)."""
     start, end = text.find("{"), text.rfind("}")
     return text[start : end + 1] if 0 <= start < end else text.strip()
+
+
+@dataclass(frozen=True)
+class _Calibration:
+    """What a provider reported for one request: `prompt_tokens` for a request of `chars` characters (ADR 0026).
+
+    `(0, 0)` means no measurement. The token estimate is then based on the size alone.
+    """
+
+    provider_id: str | None = None
+    chars: int = 0
+    prompt_tokens: int = 0
+
+    def after(self, provider_id: str, chars: int, prompt_tokens: int) -> _Calibration:
+        """The measurement after a response. Another provider than before, or no reported tokens: start over."""
+        if prompt_tokens <= 0 or (self.provider_id is not None and self.provider_id != provider_id):
+            return _Calibration(provider_id)
+        return _Calibration(provider_id, chars, prompt_tokens)
 
 
 @dataclass(frozen=True)
@@ -580,6 +599,8 @@ class _Run:
         )
         self._specs = [tool.spec() for tool in self.executor.visible_tools()]  # fixed for the life of a run
         self._output_instructions = self._build_output_instructions()
+        self._meter = ContextMeter()
+        self._calibration = _Calibration()
         self._elapsed_base = state.elapsed_s
         self._t0 = time.monotonic()
         self._finishing = False
@@ -734,17 +755,25 @@ class _Run:
             elif self._output_instructions:
                 request = request.model_copy(update={"system": request.system + self._output_instructions})
 
-            size = request.estimated_chars
-            if size > agent.limits.max_context_chars:
-                await self._finish(
-                    RunStatus.LIMIT_REACHED,
-                    f"Context too large (approx. {size} chars, limit {agent.limits.max_context_chars})",
-                )
+            size = self._meter.measure(request).total
+            calibration = self._calibration
+            tokens = estimate_tokens(size, calibration.chars, calibration.prompt_tokens)
+            reason = self._context_limit(size, tokens)
+            if reason:
+                await self._finish(RunStatus.LIMIT_REACHED, reason)
                 return
             if await self._blocked(await agent.hooks.before_model(state, request)):
                 return
 
-            await self.emit(EventType.MODEL_REQUEST, {"messages": len(request.messages), "tools": len(specs)})
+            await self.emit(
+                EventType.MODEL_REQUEST,
+                {
+                    "messages": len(request.messages),
+                    "tools": len(specs),
+                    "context_chars": size,
+                    "context_tokens_est": tokens,
+                },
+            )
             if self._stream_sink is not None:
                 response, provider_id = await agent.router.stream(
                     request,
@@ -755,6 +784,7 @@ class _Run:
                 response, provider_id = await agent.router.complete(request, self.emit)
             state.step += 1
             state.usage = state.usage + response.usage
+            self._calibration = calibration.after(provider_id, size, response.usage.prompt_tokens)
             await self.emit(
                 EventType.MODEL_RESPONSE,
                 {
@@ -806,6 +836,15 @@ class _Run:
                 return
 
             await self._checkpoint()
+
+    def _context_limit(self, chars: int, tokens: int) -> str | None:
+        """Why the request is too large for `Limits`, or None."""
+        limits = self.agent.limits
+        if chars > limits.max_context_chars:
+            return f"Context too large (approx. {chars} chars, limit {limits.max_context_chars})"
+        if limits.max_context_tokens is not None and tokens > limits.max_context_tokens:
+            return f"Context too large (approx. {tokens} tokens, limit {limits.max_context_tokens})"
+        return None
 
     def _accept_final_text(self, text: str) -> str | None:
         """Stores the structured output found in a final text answer. Returns why it was rejected, or None."""

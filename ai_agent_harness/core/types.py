@@ -50,6 +50,10 @@ TruncationMode = Literal["head_and_tail", "head"]
 DEFAULT_MAX_RESULT_CHARS = 20_000
 DEFAULT_TRUNCATION_MODE: TruncationMode = "head_and_tail"
 
+CHARS_PER_TOKEN = 3
+"""Characters per token when a size in characters becomes a token estimate (ADR 0026).
+Deliberately low (real text is about 3.5 to 4 characters per token), so the estimate errs on the side of caution."""
+
 FINAL_OUTPUT_TOOL_NAME = "final_output"
 """Reserved tool name the runner offers for structured final output (ADR 0023). Agents cannot register it."""
 
@@ -215,6 +219,11 @@ class Usage(_Frozen):
         """All processed tokens — basis for `Limits.max_total_tokens`."""
         return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
 
+    @property
+    def prompt_tokens(self) -> int:
+        """All input tokens of one call: fresh input plus cache reads and cache writes (ADR 0026)."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             input_tokens=self.input_tokens + other.input_tokens,
@@ -253,30 +262,40 @@ class ModelRequest(_Frozen):
 
         Provider data on thinking blocks (e.g. encrypted reasoning) is included. Image data is not
         counted (providers bill images by pixel dimensions, not base64 string length).
-        Basis for `Limits.max_context_chars` — an estimate, not a tokenizer.
+        Basis for `Limits.max_context_chars` — an estimate, not a tokenizer. `CHARS_PER_TOKEN` turns it into tokens.
         """
-        size = len(self.system) + sum(len(spec.model_dump_json()) for spec in self.tools)
+        size = len(self.system) + sum(tool_spec_chars(spec) for spec in self.tools)
         if self.output_schema is not None:
-            size += _json_len(self.output_schema)
-        for message in self.messages:
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    size += len(block.text)
-                elif isinstance(block, ThinkingBlock):
-                    size += len(block.text) + (_json_len(block.provider_data) if block.provider_data else 0)
-                elif isinstance(block, ToolResult):
-                    size += len(block.content)
-                elif isinstance(block, ToolCall):
-                    size += len(block.model_dump_json())
-        return size
+            size += json_chars(self.output_schema)
+        return size + sum(message_chars(message) for message in self.messages)
 
 
-def _json_len(data: dict[str, Any]) -> int:
+def json_chars(data: dict[str, Any]) -> int:
     """Length of opaque provider data as JSON — with a fallback so the estimate never fails."""
     try:
         return len(json.dumps(data, default=repr, ensure_ascii=False))
     except (TypeError, ValueError):  # e.g. non-string dictionary keys
         return len(repr(data))
+
+
+def tool_spec_chars(spec: ToolSpec) -> int:
+    """Size of one tool spec in characters, as counted by `ModelRequest.estimated_chars`."""
+    return len(spec.model_dump_json())
+
+
+def message_chars(message: Message) -> int:
+    """Size of one message in characters, as counted by `ModelRequest.estimated_chars`."""
+    size = 0
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            size += len(block.text)
+        elif isinstance(block, ThinkingBlock):
+            size += len(block.text) + (json_chars(block.provider_data) if block.provider_data else 0)
+        elif isinstance(block, ToolResult):
+            size += len(block.content)
+        elif isinstance(block, ToolCall):
+            size += len(block.model_dump_json())
+    return size
 
 
 class ModelResponse(_Frozen):

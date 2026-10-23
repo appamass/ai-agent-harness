@@ -21,7 +21,7 @@ from enum import StrEnum
 
 from .core.errors import ConfigError
 from .core.state import RunState
-from .core.types import Risk
+from .core.types import Risk, is_positive_number
 
 
 class Autonomy(StrEnum):
@@ -60,6 +60,9 @@ class PermissionPolicy:
         return _MATRIX[self.autonomy][risk]
 
 
+_OPTIONAL_FIELDS = frozenset({"max_context_tokens"})  # fields of `Limits` that may be `None` (= no limit)
+
+
 @dataclass(frozen=True)
 class Limits:
     """Apply to the entire run across all resumes.
@@ -75,13 +78,20 @@ class Limits:
     max_context_chars: int = 400_000
     """Upper bound on the estimated size of each model request (`ModelRequest.estimated_chars`).
     If exceeded, the run ends with `limit_reached` instead of failing at the provider's context
-    window. Roughly 4 chars ≈ 1 token; tune to fit the smallest model in the router."""
+    window. Without a tokenizer, `CHARS_PER_TOKEN` (3) characters count as one token; tune to fit the
+    smallest model in the router."""
     max_input_chars: int = 50_000
     """Upper bound on each human input (`user_input`, `answer`). Longer inputs raise `ValueError`."""
+    max_context_tokens: int | None = None
+    """Optional upper bound on the estimated tokens of each model request. The estimate starts from the prompt
+    tokens the provider reported for the last call and adds the new characters (ADR 0026). `None` = no limit.
+    `max_context_chars` still applies."""
 
     def __post_init__(self) -> None:
         for item in fields(self):
             value: object = getattr(self, item.name)
+            if value is None and item.name in _OPTIONAL_FIELDS:
+                continue
             # NaN compares false with everything: `max_seconds=nan` would silently disable the time limit
             invalid_type = isinstance(value, bool) or not isinstance(value, int | float)
             if invalid_type or (isinstance(value, float) and not math.isfinite(value)):
@@ -97,6 +107,8 @@ class Limits:
             raise ConfigError("Limits must be positive")
         if self.max_consecutive_retries < 0:
             raise ConfigError("max_consecutive_retries must not be negative")
+        if self.max_context_tokens is not None and not is_positive_number(self.max_context_tokens, integer=True):
+            raise ConfigError(f"Limits.max_context_tokens must be a positive integer, got {self.max_context_tokens!r}")
 
     def exceeded(self, state: RunState, elapsed_s: float) -> str | None:
         if state.step >= self.max_steps:

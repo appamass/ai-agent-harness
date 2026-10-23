@@ -47,6 +47,15 @@ _USAGE_ATTRIBUTES = (
 )
 
 
+_REQUEST_ATTRIBUTES = (
+    # (MODEL_REQUEST data key, span attribute)
+    ("messages", "harness.request.messages"),
+    ("tools", "harness.request.tools"),
+    ("context_chars", "harness.request.context_chars"),
+    ("context_tokens_est", "harness.request.context_tokens_est"),
+)
+
+
 async def log_listener(event: Event) -> None:
     if not log.isEnabledFor(logging.INFO):
         return
@@ -154,7 +163,7 @@ class OpenTelemetryListener:
     def _on_model_request(self, event: Event) -> None:
         span = self._start("model_request", SpanKind.CLIENT, event)
         span.set_attribute("gen_ai.operation.name", "chat")
-        for key, attribute in (("messages", "harness.request.messages"), ("tools", "harness.request.tools")):
+        for key, attribute in _REQUEST_ATTRIBUTES:
             value = event.data.get(key)
             if _is_int(value):
                 span.set_attribute(attribute, value)

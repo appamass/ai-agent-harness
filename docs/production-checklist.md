@@ -8,7 +8,8 @@ Work through this list before you let an agent act on real data. Items marked wi
 - [ ] UI or notification channel for clarifying questions and approvals: show `state.status_reason`, and send back the `pending_id` that was shown
 - [ ] Explicitly configure the autonomy level and `allowed_tools`; the default is `read_only`
 - [ ] Tune `Limits` to your workload's cost and latency budget: `max_steps`, `max_total_tokens`, `max_seconds`, `max_consecutive_retries`,
-      `max_context_chars` (about 4 characters per token, sized for the **smallest** context window in your router), and `max_input_chars`.
+      `max_context_chars` (3 characters count as one token, sized for the **smallest** context window in your router), `max_context_tokens` (optional, calibrated by
+      the tokens your provider reports), and `max_input_chars`.
       `max_total_tokens` counts `Usage.total`, which **includes** cache read and write tokens
 - [ ] Wire `KillSwitch` to a runtime toggle (feature flag, file, or database row) that operations can flip without redeploying
 - [ ] Subscribe event listeners for logging, tracing, and cost tracking; alert on `failed` and `limit_reached`
