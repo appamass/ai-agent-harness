@@ -63,6 +63,11 @@ class ToolExecutor:
         """Tools offered to the model: everything not denied by the policy."""
         return [t for t in self._registry if self._policy.check(t.name, t.risk) is not Verdict.DENY]
 
+    def parallel_safe(self, call: ToolCall) -> bool:
+        """True if the tool is registered and marked parallel_safe (Risk.READ, ADR 0027)."""
+        tool = self._registry.get(call.name)
+        return bool(tool is not None and tool.parallel_safe)
+
     async def execute(self, call: ToolCall, state: RunState | None = None, *, approved: bool = False) -> ToolOutcome:
         active_state = state if state is not None else RunState.standalone()
 
@@ -95,7 +100,7 @@ class ToolExecutor:
         verdict = self._policy.check(tool.name, tool.risk)
         if verdict is Verdict.DENY:
             denied = fail(f"'{tool.name}' is not allowed at autonomy level '{self._policy.autonomy}'.")
-            await self._emit(EventType.TOOL_BLOCKED, {"tool": tool.name, "source": "policy"})
+            await self._emit(EventType.TOOL_BLOCKED, {"tool": tool.name, "source": "policy", "call_id": call.id})
             return denied
 
         # 4. Pre-execution hooks
@@ -103,7 +108,7 @@ class ToolExecutor:
         decision = await self._hooks.before_tool(active_state, invocation)
         if decision.action is Action.BLOCK:
             blocked = fail(f"Call to '{tool.name}' blocked: {decision.reason}")
-            await self._emit(EventType.TOOL_BLOCKED, {"tool": tool.name, "source": "before_tool"})
+            await self._emit(EventType.TOOL_BLOCKED, {"tool": tool.name, "source": "before_tool", "call_id": call.id})
             return blocked
 
         # 5. Approval
@@ -121,7 +126,7 @@ class ToolExecutor:
             return PendingCall(kind="approval", call=call, prompt=prompt)
 
         # 6. Execute
-        await self._emit(EventType.TOOL_STARTED, {"tool": tool.name})
+        await self._emit(EventType.TOOL_STARTED, {"tool": tool.name, "call_id": call.id})
         try:
             # Tools are external code: verify return type at runtime, not just via type annotations
             output: object = await asyncio.wait_for(tool.run(args, active_state), timeout=tool.timeout_s)
@@ -170,8 +175,14 @@ class ToolExecutor:
             result = ToolResult(call_id=result.call_id, content=withheld, is_error=True)
         state.record_result(result)
         if decision.action is Action.BLOCK:
-            await self._emit(EventType.TOOL_BLOCKED, {"tool": invocation.tool_name, "source": "after_tool"})
-        await self._emit(EventType.TOOL_FINISHED, {"tool": invocation.tool_name, "is_error": result.is_error})
+            await self._emit(
+                EventType.TOOL_BLOCKED,
+                {"tool": invocation.tool_name, "source": "after_tool", "call_id": invocation.call.id},
+            )
+        await self._emit(
+            EventType.TOOL_FINISHED,
+            {"tool": invocation.tool_name, "is_error": result.is_error, "call_id": invocation.call.id},
+        )
         return result
 
     def _present(self, tool: BaseTool[Any], text: str) -> str:

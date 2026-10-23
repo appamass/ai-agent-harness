@@ -1,6 +1,6 @@
 # 0007 – Tool Calls Run Sequentially
 
-- **Status:** Accepted (maintainer, 2026-10-18)
+- **Status:** Accepted (maintainer, 2026-10-18; amended by [0027](0027-parallel-read-tools.md))
 - **Date:** 2026-10-15
 - **Affects:** `ai_agent_harness/runtime/runner.py`
 

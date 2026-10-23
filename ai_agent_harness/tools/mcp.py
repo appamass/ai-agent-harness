@@ -591,6 +591,7 @@ def _build_mcp_tool(
         timeout_s=config.timeout_s,
         untrusted_output=True,  # server output is external data, never instructions
         strict_schema=False,  # the server's schema is arbitrary; the server validates
+        parallel_safe=False,
         max_result_chars=config.max_result_chars,
         truncation_mode=config.truncation_mode,
         spec=classmethod(spec),

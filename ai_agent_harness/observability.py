@@ -231,9 +231,18 @@ class OpenTelemetryListener:
                 attrs[key] = value
         entry[0].add_event(name, attrs)
 
+    def _tool_key(self, event: Event) -> tuple[str, str]:
+        call_id = event.data.get("call_id")
+        key = str(call_id) if call_id is not None and str(call_id).strip() else str(event.data.get("tool", "tool"))
+        return (event.run_id, key)
+
     def _on_tool_started(self, event: Event) -> None:
         tool_name = str(event.data.get("tool", "tool"))
-        self._tool_spans[(event.run_id, tool_name)] = self._start_tool_span(event, tool_name)
+        span = self._start_tool_span(event, tool_name)
+        call_id = event.data.get("call_id")
+        if call_id is not None:
+            span.set_attribute("gen_ai.tool.call_id", str(call_id))
+        self._tool_spans[self._tool_key(event)] = span
 
     def _start_tool_span(self, event: Event, tool_name: str) -> Span:
         span = self._start(f"execute_tool {tool_name}", SpanKind.INTERNAL, event)
@@ -241,7 +250,9 @@ class OpenTelemetryListener:
         return span
 
     def _on_tool_finished(self, event: Event) -> None:
-        span = self._tool_spans.pop((event.run_id, str(event.data.get("tool", "tool"))), None)
+        span = self._tool_spans.pop(self._tool_key(event), None)
+        if span is None:
+            span = self._tool_spans.pop((event.run_id, str(event.data.get("tool", "tool"))), None)
         if span is None:
             return
         is_error = bool(event.data.get("is_error", False))
@@ -255,7 +266,13 @@ class OpenTelemetryListener:
     def _on_tool_blocked(self, event: Event) -> None:
         tool_name = str(event.data.get("tool", "tool"))
         source = str(event.data.get("source", ""))
-        span = self._tool_spans.pop((event.run_id, tool_name), None) or self._start_tool_span(event, tool_name)
+        span = self._tool_spans.pop(self._tool_key(event), None)
+        if span is None:
+            span = self._tool_spans.pop((event.run_id, tool_name), None)
+        span = span or self._start_tool_span(event, tool_name)
+        call_id = event.data.get("call_id")
+        if call_id is not None:
+            span.set_attribute("gen_ai.tool.call_id", str(call_id))
         span.set_attribute("harness.tool.blocked", True)
         span.set_attribute("harness.tool.block_source", source)
         span.set_status(StatusCode.ERROR, description=f"Tool blocked by {source}")

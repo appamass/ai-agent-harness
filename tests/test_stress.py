@@ -136,6 +136,7 @@ class EchoTool(_Tracked):
     description: ClassVar[str] = "reads"
     input_model: ClassVar[type[BaseModel]] = Empty
     risk: ClassVar[Risk] = Risk.READ
+    parallel_safe: ClassVar[bool] = True
 
 
 class WriteTool(_Tracked):
@@ -158,6 +159,7 @@ class FlakyTool(_Tracked):
     input_model: ClassVar[type[BaseModel]] = Empty
     risk: ClassVar[Risk] = Risk.READ
     behaviour: ClassVar[str] = "flaky"
+    parallel_safe: ClassVar[bool] = True
 
 
 class CrashyTool(_Tracked):
@@ -326,6 +328,7 @@ def _build_agent(rng: random.Random, tracker: Tracker, store: CheckpointStore, a
             max_context_tokens=rng.choice([None, None, 800]),
         ),
         compact_context=rng.random() < 0.5,
+        max_parallel_tools=rng.choice([1, 1, 2, 4]),
     )
 
 

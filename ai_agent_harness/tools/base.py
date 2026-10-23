@@ -112,6 +112,8 @@ class BaseTool(ABC, Generic[InputT]):
     concrete-type check is skipped there, Pydantic and the server validate anyway."""
     max_result_chars: ClassVar[int | None] = None
     truncation_mode: ClassVar[TruncationMode | None] = None
+    parallel_safe: ClassVar[bool] = False
+    """True for Risk.READ tools that can safely run concurrently with other parallel_safe tools (ADR 0027)."""
 
     @abstractmethod
     async def run(self, args: InputT, state: RunState) -> ToolOutput: ...
@@ -140,6 +142,8 @@ class BaseTool(ABC, Generic[InputT]):
             payload["max_result_chars"] = cls.max_result_chars
         if cls.truncation_mode is not None:
             payload["truncation_mode"] = cls.truncation_mode
+        if cls.parallel_safe:
+            payload["parallel_safe"] = True
         return canonical_digest(payload)
 
     @classmethod
@@ -181,6 +185,10 @@ class BaseTool(ABC, Generic[InputT]):
             raise ConfigError(f"{where}: 'timeout_s' must be > 0")
         if not isinstance(cls.untrusted_output, bool):
             raise ConfigError(f"{where}: 'untrusted_output' must be a bool")
+        if not isinstance(cls.parallel_safe, bool):
+            raise ConfigError(f"{where}: 'parallel_safe' must be a bool")
+        if cls.parallel_safe and cls.risk is not Risk.READ:
+            raise ConfigError(f"{where}: parallel_safe is only allowed for Risk.READ tools, got {cls.risk}")
         if cls.max_result_chars is not None and not is_positive_number(cls.max_result_chars, integer=True):
             raise ConfigError(f"{where}: 'max_result_chars' must be a positive integer")
         if cls.truncation_mode is not None:
@@ -250,6 +258,7 @@ def tool(
     untrusted_output: bool = False,
     max_result_chars: int | None = None,
     truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any]: ...
 
 
@@ -265,6 +274,7 @@ def tool(
     untrusted_output: bool = False,
     max_result_chars: int | None = None,
     truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> Callable[[ToolFn], BaseTool[Any]]: ...
 
 
@@ -279,6 +289,7 @@ def tool(
     untrusted_output: bool = False,
     max_result_chars: int | None = None,
     truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any] | Callable[[ToolFn], BaseTool[Any]]:
     """Turns a typed Python function (sync or async) into a validated `BaseTool` or `SyncTool`.
 
@@ -297,6 +308,7 @@ def tool(
             untrusted_output=untrusted_output,
             max_result_chars=max_result_chars,
             truncation_mode=truncation_mode,
+            parallel_safe=parallel_safe,
         )
 
     return decorate(fn) if fn is not None else decorate
@@ -312,6 +324,7 @@ def _build_function_tool(
     untrusted_output: bool,
     max_result_chars: int | None = None,
     truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any]:
     if not callable(fn):
         raise ConfigError("@tool requires a callable function")
@@ -351,6 +364,7 @@ def _build_function_tool(
         "untrusted_output": untrusted_output,
         "max_result_chars": max_result_chars,
         "truncation_mode": truncation_mode,
+        "parallel_safe": parallel_safe,
     }
     if inspect.iscoroutinefunction(fn):
 

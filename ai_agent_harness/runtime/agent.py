@@ -10,7 +10,13 @@ from ..context import ContextBuilder
 from ..core.errors import ConfigError
 from ..core.events import EventBus
 from ..core.hooks import Hook, HookPipeline
-from ..core.types import DEFAULT_MAX_RESULT_CHARS, DEFAULT_TRUNCATION_MODE, FINAL_OUTPUT_TOOL_NAME, TruncationMode
+from ..core.types import (
+    DEFAULT_MAX_RESULT_CHARS,
+    DEFAULT_TRUNCATION_MODE,
+    FINAL_OUTPUT_TOOL_NAME,
+    TruncationMode,
+    is_positive_number,
+)
 from ..persistence import CheckpointStore
 from ..policy import Autonomy, Limits, PermissionPolicy
 from ..providers.base import CallableProvider, ModelFn, ModelProvider
@@ -36,6 +42,9 @@ class Agent:
     compact_context: bool = False
     """Opt-in (ADR 0026): when the model's view nears the context limits, old long tool results are replaced by a
     placeholder in the request. `RunState.messages` is never shortened."""
+    max_parallel_tools: int = 1
+    """Maximum number of `parallel_safe` read-only tools that can run concurrently (ADR 0027).
+    Defaults to 1 (sequential)."""
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -51,6 +60,8 @@ class Agent:
         check_truncation_mode(self.truncation_mode, "Agent")
         if not isinstance(self.compact_context, bool):
             raise ConfigError(f"Agent.compact_context must be True or False, got {self.compact_context!r}")
+        if not is_positive_number(self.max_parallel_tools, integer=True):
+            raise ConfigError("Agent.max_parallel_tools must be a positive integer")
 
     @property
     def policy(self) -> PermissionPolicy:
@@ -73,6 +84,7 @@ class Agent:
         max_result_chars: int = DEFAULT_MAX_RESULT_CHARS,
         truncation_mode: TruncationMode = DEFAULT_TRUNCATION_MODE,
         compact_context: bool = False,
+        max_parallel_tools: int = 1,
     ) -> Agent:
         """Shorthand constructor that normalizes a provider, prompt string, tool list, and hook list."""
         if isinstance(provider, ModelRouter):
@@ -98,4 +110,5 @@ class Agent:
             max_result_chars=max_result_chars,
             truncation_mode=truncation_mode,
             compact_context=compact_context,
+            max_parallel_tools=max_parallel_tools,
         )

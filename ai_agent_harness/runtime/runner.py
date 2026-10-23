@@ -65,7 +65,7 @@ from ..core.types import (
 )
 from ..providers.base import StreamDelta
 from ..tools.base import BaseTool, json_schema, make_tool
-from ..tools.executor import ToolExecutor, describe_validation
+from ..tools.executor import ToolExecutor, ToolOutcome, describe_validation
 from .agent import Agent
 
 log = logging.getLogger("ai_agent_harness.runner")
@@ -277,6 +277,7 @@ def _final_output_tool(model: type[BaseModel]) -> BaseTool[BaseModel]:
         input_model=model,
         risk=Risk.READ,
         strict_schema=False,  # the caller's own model: any field types are fine
+        parallel_safe=False,
         run=_submit_output,
     )
 
@@ -874,25 +875,80 @@ class _Run:
         self.state.set_output(validated)
         return None
 
-    async def _run_batch(self, calls: Sequence[ToolCall]) -> bool:
-        """Executes tool calls sequentially. Returns True if the run was paused or finished.
+    def _sort_batch_done(self) -> None:
+        """Keeps completed tool results in the original call order of open tool calls."""
+        open_calls = self.state.open_tool_calls()
+        if not open_calls or not self.state.batch_done:
+            return
+        order = {c.id: i for i, c in enumerate(open_calls)}
+        self.state.batch_done = tuple(sorted(self.state.batch_done, key=lambda r: order.get(r.call_id, 0)))
 
-        Write-ahead before EVERY tool: the checkpoint contains the planned calls and all results
-        completed so far. If the process dies mid-tool, `recover` reports only that tool as
-        "outcome unknown" — completed tools keep their actual result. After the batch, state is saved
+    async def _run_batch(self, calls: Sequence[ToolCall]) -> bool:
+        """Executes tool calls (sequentially or in bounded parallel groups for parallel_safe read tools).
+
+        Returns True if the run was paused or finished.
+
+        Write-ahead before EVERY tool or parallel group: the checkpoint contains the planned calls and
+        all results completed so far. If the process dies mid-tool, `recover` reports interrupted calls
+        as "outcome unknown" — completed tools keep their actual result. After the batch, state is saved
         again so a crash during the next model call loses nothing either.
         """
         final_rejected = False
-        for index, call in enumerate(calls):
+        index = 0
+        while index < len(calls):
+            call = calls[index]
+            if self.agent.max_parallel_tools > 1 and self.executor.parallel_safe(call):
+                end = index + 1
+                while end < len(calls) and self.executor.parallel_safe(calls[end]):
+                    end += 1
+                group = list(calls[index:end])
+                if len(group) > 1:
+                    await self._checkpoint()
+                    semaphore = asyncio.Semaphore(self.agent.max_parallel_tools)
+
+                    async def _run_one(c: ToolCall, sem: asyncio.Semaphore = semaphore) -> ToolOutcome:
+                        async with sem:
+                            return await self.executor.execute(c, self.state)
+
+                    tasks = [asyncio.create_task(_run_one(c)) for c in group]
+                    try:
+                        outcomes = await asyncio.gather(*tasks)
+                    except asyncio.CancelledError:
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        raise
+
+                    first_pending_idx = next((i for i, o in enumerate(outcomes) if isinstance(o, PendingCall)), None)
+                    if first_pending_idx is not None:
+                        pending = outcomes[first_pending_idx]
+                        assert isinstance(pending, PendingCall)
+                        remaining_calls: list[ToolCall] = []
+                        for i in range(first_pending_idx + 1, len(group)):
+                            if isinstance(outcomes[i], PendingCall):
+                                remaining_calls.append(group[i])
+                        remaining_calls.extend(calls[end:])
+                        self._sort_batch_done()
+                        await self._pause(pending, remaining_calls)
+                        return True
+
+                    self._sort_batch_done()
+                    index = end
+                    continue
+
             await self._checkpoint()
             outcome = await self.executor.execute(call, self.state)
             if isinstance(outcome, PendingCall):
+                self._sort_batch_done()
                 await self._pause(outcome, calls[index + 1 :])
                 return True
             if self._discard_rejected_output(call, outcome):
                 final_rejected = True
             elif await self._finish_if_output_submitted():
                 return True  # `_finish` answers the calls after it: "Not executed: run finished"
+            index += 1
+        self._sort_batch_done()
         self.state.add_tool_results(self.state.batch_done)
         self.state.batch_done = ()
         if final_rejected:
