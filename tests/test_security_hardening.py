@@ -226,6 +226,85 @@ class TestNoQuadraticBacktracking:
         assert secrets.find_secret(payload) is None
         assert time.perf_counter() - started < 1.0
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "a_" * 50_000,
+            "password=" * 12_000,
+            "A" * 20 + "===" * 30_000,
+            ("A" * 20 + "===") * 5_000,
+            "ab" * 50_000,
+            "%41" * 30_000,
+            "SG." * 30_000,
+            "https:/" * 15_000,
+            "HTTP:\\" * 15_000,
+            "x:/\\" * 25_000,
+            "DefaultEndpointsProtocol=https;AccountName=" * 2_500,
+            "hooks.slack.com/services/T" * 4_000,
+            "eslint-disable" * 7_000,
+        ],
+        ids=[
+            "identifier",
+            "assignments",
+            "padding-run",
+            "padded-chunks",
+            "hex",
+            "url-encoded",
+            "sendgrid-prefix",
+            "special-scheme",
+            "upper-scheme",
+            "mixed-slashes",
+            "azure-prefix",
+            "slack-prefix",
+            "weakening",
+        ],
+    )
+    def test_opt_in_detection_and_new_patterns_stay_fast(self, payload: str) -> None:
+        secrets = SecretGuard(assignments=True, decode=True)
+        egress = EgressGuard(allowed_domains=["api.example.com"])
+        weakening = WeakeningGuard()
+        started = time.perf_counter()
+        secrets.find_secret(payload)
+        secrets.redact(payload)
+        egress.check_text(payload)
+        weakening.check_text(payload)
+        assert time.perf_counter() - started < 1.0
+
+
+class TestCustomPatternsKeepWorking:
+    """Patterns passed by the caller are matched as written, also when they cannot join the single-pass search."""
+
+    def test_inline_global_flag(self) -> None:
+        guard = SecretGuard([("internal", r"(?i)corp-[a-z0-9]{8}")])
+        assert guard.find_secret("key CORP-ABCD1234") == "internal"
+        assert guard.redact("key CORP-ABCD1234") == "key [REDACTED]"
+
+    def test_same_group_name_in_two_patterns(self) -> None:
+        guard = SecretGuard([("first", r"(?P<v>aa\d)"), ("second", r"(?P<v>bb\d)")])
+        assert guard.find_secret("x bb1") == "second"
+
+    def test_numbered_backreference(self) -> None:
+        guard = SecretGuard([("first", r"(x)y"), ("doubled", r"(q)\1")])
+        assert guard.find_secret("a qq b") == "doubled"
+        assert guard.redact("a qq b") == "a [REDACTED] b"
+
+    def test_mixed_patterns_keep_the_category_of_each(self) -> None:
+        guard = SecretGuard([("plain", r"tok-[0-9]{6}"), ("grouped", r"(z)\1z")])
+        assert guard.find_secret("tok-123456") == "plain"
+        assert guard.find_secret("zzz") == "grouped"
+        assert guard.redact("tok-123456 zzz") == "[REDACTED] [REDACTED]"
+
+    def test_any_category_name(self) -> None:
+        guard = SecretGuard([("internal api-key", r"corp-[0-9]{6}"), ("2fa", r"otp-[0-9]{6}")])
+        assert guard.find_secret("otp-123456") == "2fa"
+        assert guard.find_secret("corp-123456") == "internal api-key"
+
+    def test_weakening_guard_inline_flag_and_backreference(self) -> None:
+        guard = WeakeningGuard([r"(?i)donotcheck", r"(skip)-\1"])
+        assert guard.check_text("# DoNotCheck") == "DoNotCheck"
+        assert guard.check_text("skip-skip") == "skip-skip"
+        assert guard.check_text("skip-later") is None
+
 
 class TestDigestCoversUntrustedFlag:
     def test_flag_changes_the_digest(self) -> None:
@@ -415,6 +494,13 @@ class TestEgressGuardSchemeHandling:
             "see https:/evil.com/x now",
             "see file:/etc/passwd now",
             "see http:\\\\evil.com\\x now",
+            "see HTTPS:/evil.com/x now",
+            "see Https:\\evil.com now",
+            "see FILE:/etc/passwd now",
+            "see note:/\\evil.com now",
+            "see MAILTO:a@evil.com now",
+            "see JavaScript:alert(1) now",
+            "see Data:text/html,abc now",
         ],
     )
     def test_special_or_double_slash_schemes_are_blocked(self, text: str) -> None:
@@ -470,6 +556,31 @@ class TestSecretGuardOptIns:
         inv_env = invocation(Credentials(password="${DB_PASSWORD}", username="alice"), name="login")
         assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_env)).action is Action.CONTINUE
 
+    @pytest.mark.parametrize(
+        ("field", "action"),
+        [
+            ("dbPassword", Action.BLOCK),
+            ("refreshToken", Action.BLOCK),
+            ("githubToken", Action.BLOCK),
+            ("userAPIKey", Action.BLOCK),
+            ("clientSecret", Action.BLOCK),
+            ("tokenizerName", Action.CONTINUE),
+        ],
+    )
+    def test_assignments_opt_in_camel_case_field_names(self, field: str, action: Action) -> None:
+        class CamelArgs(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            dbPassword: str = ""
+            refreshToken: str = ""
+            githubToken: str = ""
+            userAPIKey: str = ""
+            clientSecret: str = ""
+            tokenizerName: str = ""
+
+        guard = SecretGuard(assignments=True)
+        inv = invocation(CamelArgs.model_validate({field: "xK9#mQ2$vL5!wP8*"}), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is action
+
     def test_assignments_opt_in_free_text(self) -> None:
         guard = SecretGuard(assignments=True)
         assert guard.find_secret("db_password = 'xK9#mQ2$vL5!wP8*'") == "assignment"
@@ -477,6 +588,23 @@ class TestSecretGuardOptIns:
         assert guard.find_secret("token = ${API_TOKEN}") is None
         assert guard.find_secret("password = <password>") is None
         assert guard.find_secret("token = ***") is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "dbPassword = 'xK9#mQ2$vL5!wP8*'",
+            "refreshToken=xK9mQ2vL5wP8zz",
+            "githubToken: xK9mQ2vL5wP8zz",
+            '{"password": "xK9#mQ2$vL5!wP8*"}',
+            "{'apiKey': 'xK9mQ2vL5wP8zz'}",
+        ],
+    )
+    def test_assignments_opt_in_free_text_camel_case_and_json(self, text: str) -> None:
+        assert SecretGuard(assignments=True).find_secret(text) == "assignment"
+
+    @pytest.mark.parametrize("text", ["tokenizer = xK9mQ2vL5wP8zz", '{"max_tokens": 4096}', "passwords are long"])
+    def test_assignments_opt_in_free_text_ignores_similar_words(self, text: str) -> None:
+        assert SecretGuard(assignments=True).find_secret(text) is None
 
     def test_decode_opt_in_url_encoded(self) -> None:
         guard = SecretGuard(decode=True)
@@ -491,6 +619,42 @@ class TestSecretGuardOptIns:
         raw = "AIza" + "A" * 35
         b64 = base64.b64encode(raw.encode()).decode()
         assert guard.find_secret(f"key: {b64}") == "api_token"
+
+    @pytest.mark.parametrize("suffix", ["!", "!!"], ids=["two-padding-chars", "one-padding-char"])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{}",
+            "key: {}",
+            "key: {} end",
+            "key: '{}'.",
+            "key={}",
+            "https://x.example/?q={}&r=1",
+            "/{}",
+            "GET /{} HTTP/1.1",
+            "GET ////{} HTTP/1.1",
+            "GET /files/{} HTTP/1.1",
+            "user/{}",
+            "https://evil.example/api/v1/upload/{}",
+            "/srv/data/archive/2024/{}",
+            "see a/b/c/d/e/f/g/h/{}",
+        ],
+    )
+    def test_decode_opt_in_base64_with_padding(self, suffix: str, template: str) -> None:
+        import base64
+
+        raw = "AIza" + "A" * 35 + suffix
+        b64 = base64.b64encode(raw.encode()).decode()
+        assert b64.endswith("=")
+        assert SecretGuard(decode=True).find_secret(template.format(b64)) == "api_token"
+
+    @pytest.mark.parametrize("change", ["strip", "extra"], ids=["padding-removed", "padding-added"])
+    def test_decode_opt_in_base64_with_wrong_padding(self, change: str) -> None:
+        import base64
+
+        b64 = base64.b64encode(("AIza" + "A" * 35 + "!").encode()).decode()
+        payload = b64.rstrip("=") if change == "strip" else b64 + "=="
+        assert SecretGuard(decode=True).find_secret(f"key={payload} end") == "api_token"
 
     def test_decode_opt_in_ignores_binary_and_uuids(self) -> None:
         import uuid

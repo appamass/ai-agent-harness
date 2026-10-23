@@ -190,11 +190,20 @@ DEFAULT_SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("azure_connection_string", r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{40,}"),
 )
 
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _SECRET_FIELD_KEY = re.compile(
     r"(?:^|[^a-z])(?:pass(?:word)?|secret|token|api_?key|auth_?token|client_?secret|access_?token)s?(?:$|[^a-z])"
 )
+
+
+def _is_secret_key(key: str) -> bool:
+    """True for field names such as `password`, `api_key`, `dbPassword`, or `refreshToken` (camelCase is split)."""
+    return _SECRET_FIELD_KEY.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+
+
 _ASSIGNMENT_REGEX = re.compile(
-    r"""\b(?i:(?:[a-z0-9_]+_)?(?:password|secret|token|api_?key|client_?secret|access_?token))\s*[:=]\s*['"]?([^\s'"]{8,})['"]?"""
+    # A word ending in a credential name (`db_password`, `dbPassword`), an optional closing quote (JSON), `=` or `:`
+    r"""\b(?i:[a-z0-9_]*(?:password|secret|token|api_?key|client_?secret|access_?token))['"]?\s*[:=]\s*['"]?([^\s'"]{8,})['"]?"""
 )
 _PLACEHOLDER_WORDS = frozenset(
     {"changeme", "example", "placeholder", "dummy", "test", "none", "null", "admin", "password", "secret", "token"}
@@ -233,6 +242,43 @@ def _is_mostly_ascii(data: bytes) -> bool:
     return (printable / len(data)) >= 0.85
 
 
+_BASE64_CANDIDATE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}=*")
+"""A whole base64 run with any `=` after it. One start per run and no lookahead keep the search linear.
+A `=` before the run is allowed: `key=<base64>` is the common case."""
+
+
+_MAX_PATH_SLASHES = 8
+"""How many `/` at the start of a base64 run `_decode_base64` also tries as the start of the data."""
+
+
+def _decode_base64(candidate: str) -> list[bytes]:
+    """Every mostly printable decoding of `candidate`.
+
+    A path before the data is made of base64 characters too, so the run often starts with it
+    (`example/api/v1/upload/<base64>`). Decoded together, the path would turn into garbage in front of the secret.
+    So the data is also tried after each of the first `_MAX_PATH_SLASHES` slashes, and at the offsets 0 to 3 for a
+    prefix without a slash. A wrong start can look printable too, so all printable results are kept.
+    At most 12 tries per run keep the work linear.
+    """
+    starts = list(range(4))
+    slash = candidate.find("/")
+    while slash != -1 and len(starts) < 4 + _MAX_PATH_SLASHES:
+        starts.append(slash + 1)
+        slash = candidate.find("/", slash + 1)
+    decoded: list[bytes] = []
+    for begin in starts:
+        core = candidate[begin:].rstrip("=")  # lenient decoders accept missing or extra padding, so the check does too
+        if len(core) < 16:
+            continue
+        try:
+            raw = base64.b64decode(core + "=" * (-len(core) % 4), validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if len(raw) >= 12 and _is_mostly_ascii(raw):
+            decoded.append(raw)
+    return decoded
+
+
 def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | None:
     max_budget = 50_000
     consumed = 0
@@ -246,20 +292,15 @@ def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | N
             consumed += len(take)
 
     if consumed < max_budget:
-        for m in re.finditer(r"\b[A-Za-z0-9+/]{16,}={0,2}\b", text):
-            cand = m.group(0)
-            raw: bytes | None = None
-            try:
-                raw = base64.b64decode(cand, validate=True)
-            except (binascii.Error, ValueError):
-                raw = None
-            if raw is not None and len(raw) >= 12 and _is_mostly_ascii(raw):
-                decoded = raw.decode("utf-8", errors="ignore")
-                take = decoded[: max_budget - consumed]
+        for m in _BASE64_CANDIDATE.finditer(text):
+            for raw in _decode_base64(m.group(0)):
+                take = raw.decode("utf-8", errors="ignore")[: max_budget - consumed]
                 pieces.append(take)
                 consumed += len(take)
                 if consumed >= max_budget:
                     break
+            if consumed >= max_budget:
+                break
 
     if consumed < max_budget:
         for m in re.finditer(r"\b[0-9a-fA-F]{32,}\b", text):
@@ -284,14 +325,44 @@ def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | N
     return None
 
 
-def _compile_secret_alternation(patterns: tuple[tuple[str, str], ...]) -> tuple[re.Pattern[str], dict[str, str]]:
-    group_to_category: dict[str, str] = {}
-    named_parts: list[str] = []
-    for i, (cat, expr) in enumerate(patterns):
-        grp = f"g{i}_{cat}"
-        group_to_category[grp] = cat
-        named_parts.append(f"(?P<{grp}>{expr})")
-    return re.compile("|".join(named_parts)), group_to_category
+class _PatternSet:
+    """Labeled patterns, searched in one pass when they can share one alternation (ADR 0028).
+
+    A pattern with capturing groups cannot join it: group names would clash and `\\1` would point at another
+    pattern's group. Nor can a pattern with an inline global flag such as `(?i)`, which is only allowed at the start.
+    If any pattern cannot join, all patterns are searched one by one, as written.
+    """
+
+    def __init__(self, patterns: tuple[tuple[str, str], ...], flags: int = 0) -> None:
+        self._each = tuple((label, re.compile(expr, flags)) for label, expr in patterns)
+        self._combined: re.Pattern[str] | None = None
+        if all(compiled.groups == 0 for _, compiled in self._each):
+            try:  # each pattern becomes group n, so `lastindex` names the pattern that matched
+                self._combined = re.compile("|".join(f"({expr})" for _, expr in patterns), flags)
+            except re.error:
+                self._combined = None
+
+    def search(self, text: str) -> tuple[str, re.Match[str]] | None:
+        """The label and match of the first pattern found in `text`, or None."""
+        if self._combined is not None:
+            match = self._combined.search(text)
+            if match is None:
+                return None
+            if match.lastindex is not None:
+                return self._each[match.lastindex - 1][0], match
+            # cannot happen (every alternative is one group); if it does, search one by one rather than pass the text
+        for label, compiled in self._each:
+            found = compiled.search(text)
+            if found is not None:
+                return label, found
+        return None
+
+    def sub(self, replacement: str, text: str) -> str:
+        if self._combined is not None:
+            return self._combined.sub(replacement, text)
+        for _, compiled in self._each:
+            text = compiled.sub(replacement, text)
+        return text
 
 
 class SecretGuard(Hook):
@@ -311,9 +382,7 @@ class SecretGuard(Hook):
         assignments: bool = False,
         decode: bool = False,
     ) -> None:
-        raw_patterns = _at_least_one(tuple(patterns), "SecretGuard")
-        self._patterns = tuple((name, re.compile(expr)) for name, expr in raw_patterns)
-        self._combined, self._group_to_category = _compile_secret_alternation(raw_patterns)
+        self._patterns = _PatternSet(_at_least_one(tuple(patterns), "SecretGuard"))
         self._check_user_input = check_user_input
         self._check_model_output = check_model_output
         self._assignments = assignments
@@ -335,14 +404,12 @@ class SecretGuard(Hook):
         return None
 
     def _find_secret_direct(self, text: str) -> str | None:
-        match = self._combined.search(text)
-        if match is not None and match.lastgroup is not None:
-            return self._group_to_category.get(match.lastgroup)
-        return None
+        found = self._patterns.search(text)
+        return found[0] if found is not None else None
 
     def redact(self, text: str, *, replacement: str = "[REDACTED]") -> str:
         """Replaces all detected secrets in `text` with `replacement`."""
-        return self._combined.sub(replacement, text)
+        return self._patterns.sub(replacement, text)
 
     def _check(self, texts: Iterable[str], blocked: str) -> Decision:
         """Blocks with `blocked` and the category of the first secret found in `texts` (never the secret itself)."""
@@ -369,7 +436,7 @@ class SecretGuard(Hook):
                     continue
                 if (
                     key
-                    and _SECRET_FIELD_KEY.search(key.casefold())
+                    and _is_secret_key(key)
                     and not _is_placeholder(value)
                     and len(value) >= 8
                     and _shannon_entropy(value) >= 2.5
@@ -384,27 +451,32 @@ class SecretGuard(Hook):
 _WHATWG_SPECIAL_SCHEMES: tuple[str, ...] = ("https", "http", "wss", "ws", "ftp", "file")
 
 
+_OPAQUE_URL_BRANCHES: tuple[tuple[str, str], ...] = (
+    # (marker, branch) for URLs without a slash after the scheme; each branch starts with its marker in any case
+    ("mailto:", r"\b(?ai:mailto):[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"),
+    ("data:", r"\b(?ai:data):(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"),
+    ("javascript:", r"\b(?ai:javascript):[^\s<>()\"'\]]+"),
+)
+
+
 def _build_url_patterns() -> tuple[re.Pattern[str], tuple[str, ...]]:
+    """`_URL_IN_TEXT` and `_URL_MARKERS` from one table, so they cannot drift apart."""
     special = "|".join(_WHATWG_SPECIAL_SCHEMES)
-    pattern_str = (
-        rf"\b(?:{special}):[/\\]+[^\s<>()\"'\]]*"
-        r"|\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]{2,}[^\s<>()\"'\]]*"
-        r"|\bmailto:[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"
-        r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
-        r"|\bjavascript:[^\s<>()\"'\]]+"
+    branches = (
+        # Schemes are case-insensitive in ASCII (WHATWG): `HTTPS:/host` is a URL with a host, like `https://host`
+        rf"\b(?ai:{special}):[/\\]+[^\s<>()\"'\]]*",
+        r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]{2,}[^\s<>()\"'\]]*",
+        *(branch for _, branch in _OPAQUE_URL_BRANCHES),
     )
-    markers = ["://", ":\\\\", "mailto:", "data:", "javascript:"]
-    for s in _WHATWG_SPECIAL_SCHEMES:
-        markers.append(f"{s}:/")
-        markers.append(f"{s}:\\")
-    return re.compile(pattern_str), tuple(markers)
+    # The first two branches always contain `:/` or `:\`; the others hold their marker once the text is lower-cased
+    markers = (":/", ":\\", *(marker for marker, _ in _OPAQUE_URL_BRANCHES))
+    return re.compile("|".join(branches)), markers
 
 
 _URL_IN_TEXT, _URL_MARKERS = _build_url_patterns()
-"""Every `_URL_IN_TEXT` match contains one of these (the pattern is case-sensitive): text without them has no URL."""
+"""Every `_URL_IN_TEXT` match contains one of these once the text is lower-cased: text without them has no URL."""
 _TRAILING_PUNCT = ".,;:!?'\")"
 _URL_KEY_WORD = re.compile(r"(?:^|[^a-z])(?:url|uri|href|endpoint|webhook)s?(?:$|[^a-z])")
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _HOST_CHARS = re.compile(r"[a-z0-9.-]+")
 
 
@@ -487,7 +559,8 @@ class EgressGuard(Hook):
 
     def check_text(self, text: str) -> str | None:
         """Scans `text` for URLs and returns the first violation reason, or `None`."""
-        if not any(marker in text for marker in _URL_MARKERS):  # cheap: most text holds no URL at all
+        lowered = text.lower()  # ASCII letters keep their place, so a scheme in any case shows its marker
+        if not any(marker in lowered for marker in _URL_MARKERS):  # cheap: most text holds no URL at all
             return None
         for match in _URL_IN_TEXT.finditer(text):
             raw_url = match.group(0).rstrip(_TRAILING_PUNCT)
@@ -582,14 +655,13 @@ class WeakeningGuard(Hook):
     """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
 
     def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
-        p_list = _at_least_one(tuple(patterns), "WeakeningGuard")
-        self._patterns = tuple(re.compile(p, re.IGNORECASE) for p in p_list)
-        self._combined = re.compile("|".join(f"(?:{p})" for p in p_list), re.IGNORECASE)
+        listed = _at_least_one(tuple(patterns), "WeakeningGuard")
+        self._patterns = _PatternSet(tuple((p, p) for p in listed), re.IGNORECASE)
 
     def check_text(self, text: str) -> str | None:
         """Returns the first matched check-weakening directive in `text`, or `None`."""
-        match = self._combined.search(text)
-        return match.group(0).strip() if match is not None else None
+        found = self._patterns.search(text)
+        return found[1].group(0).strip() if found is not None else None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
         if invocation.risk is Risk.READ:

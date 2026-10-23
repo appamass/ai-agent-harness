@@ -326,12 +326,14 @@ class TestToolIntegrityAndUntrustedOutput:
         "javascript:alert(1)",
         "file:\\\\evil\\share",
         "ftp:/evil.example",
+        "MAILTO:x@y.example",  # schemes are case-insensitive (RFC 3986, WHATWG)
+        "JavaScript:alert(1)",
     ],
 )
 def test_the_egress_prefilter_never_skips_a_url(text: str) -> None:
     assert EgressGuard(allowed_domains=[]).check_text(text) is not None
 
 
-@pytest.mark.parametrize("text", ["", "plain text: no link here", "ratio 3:4 and a/b", "MAILTO:x@y.example"])
+@pytest.mark.parametrize("text", ["", "plain text: no link here", "ratio 3:4 and a/b", "MAILTO: no address here"])
 def test_text_without_a_url_passes_the_egress_check(text: str) -> None:
     assert EgressGuard(allowed_domains=[]).check_text(text) is None
