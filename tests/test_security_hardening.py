@@ -260,6 +260,19 @@ def _fake_secrets() -> dict[str, str]:
         "bearer_upper": "BEARER " + "i" * 30,
         "basic_lower": "authorization: basic dXNlcjpwYXNzd29yZDEyMw==",
         "basic_upper": "AUTHORIZATION: BASIC dXNlcjpwYXNzd29yZDEyMw==",
+        "sendgrid": "SG." + "s" * 22 + "." + "t" * 43,
+        "twilio": "SK" + "a" * 32,
+        "slack_webhook": "https://hooks.slack.com/services/T12345678/B12345678/" + "u" * 24,
+        "azure_conn": (
+            "DefaultEndpointsProtocol=https;AccountName=myacc;AccountKey="
+            + "v" * 44
+            + "==;EndpointSuffix=core.windows.net"
+        ),
+        "sk_proj": "sk-proj-" + "p" * 30,
+        "sk_ant": "sk-ant-" + "q" * 30,
+        "sk_svcacct": "sk-svcacct-" + "r" * 30,
+        "sk_admin": "sk-admin-" + "m" * 30,
+        "sk_plain": "sk-" + "n" * 30,
     }
 
 
@@ -281,6 +294,10 @@ class TestMoreSecretFormats:
             "eyJ.eyJ.x",
             "task_live_status_for_every_customer",
             "my-sk-learn-is-a-long-kebab-case-name-here",
+            "install sk-learn-model-v2-package-now",
+            "flask-routes-and-endpoints-configuration",
+            "task-runner-worker-process-pool",
+            "sk-something-long-name-here-with-hyphens",
             "pypi-publish-action-for-github-workflows-v1",
             "the bearer of this message is welcome",
         ],
@@ -324,6 +341,17 @@ class TestMoreWeakeningDirectives:
             "pytest.importorskip('numpy')",
             "// @ts-ignore",
             "// @ts-nocheck",
+            "// eslint-disable-next-line",
+            "/* eslint-disable */",
+            "// nolint:errcheck",
+            "#[allow(dead_code)]",
+            "#[ignore]",
+            '@SuppressWarnings("all")',
+            '@Disabled("reason")',
+            'describe.skip("suite", () => {})',
+            'it.skip("test", () => {})',
+            'xit("skip", () => {})',
+            't.Skip("skip reason")',
         ],
     )
     def test_directive_is_found(self, text: str) -> None:
@@ -365,3 +393,107 @@ class TestEgressGuardIgnoresCodeLookingText:
     def test_a_single_string_is_not_a_list_of_domains(self) -> None:
         with pytest.raises(ConfigError, match="allowed_domains"):
             EgressGuard(allowed_domains="api.example.com")
+
+
+class TestEgressGuardSchemeHandling:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "see note:/path/to/my/file now",
+            "path:/usr/bin",
+            "my custom scheme:/local/file",
+        ],
+    )
+    def test_non_special_single_slash_schemes_are_allowed(self, text: str) -> None:
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        assert guard.check_text(text) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "see note://evil.com/x now",
+            "see https:/evil.com/x now",
+            "see file:/etc/passwd now",
+            "see http:\\\\evil.com\\x now",
+        ],
+    )
+    def test_special_or_double_slash_schemes_are_blocked(self, text: str) -> None:
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        assert guard.check_text(text) is not None
+
+    def test_ignore_keys_downgrades_field_to_check_text(self) -> None:
+        class Payload(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            url: str
+
+        guard = EgressGuard(allowed_domains=["api.example.com"], ignore_keys=["url"])
+        # Normal check_url would reject prose with https://
+        inv_ok = invocation(Payload(url="Documentation at https://api.example.com/docs"), name="call")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_ok)).action is Action.CONTINUE
+
+        # But exfiltration URL is blocked, and the reason mentions the field name
+        inv_bad = invocation(Payload(url="exfil to https://evil.example.com/steal"), name="call")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv_bad))
+        assert dec.action is Action.BLOCK
+        assert "url" in (dec.reason or "")
+
+    def test_any_url_typed_fields_are_treated_as_url_fields(self) -> None:
+        from pydantic import HttpUrl
+
+        class TypedModel(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            custom_target: HttpUrl
+
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        inv = invocation(TypedModel(custom_target=HttpUrl("https://evil.example.com/api")), name="call")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv))
+        assert dec.action is Action.BLOCK
+
+
+class TestSecretGuardOptIns:
+    def test_assignments_opt_in_structured_fields(self) -> None:
+        class Credentials(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            password: str
+            username: str
+
+        guard = SecretGuard(assignments=True)
+        # Real high-entropy password is blocked
+        inv = invocation(Credentials(password="xK9#mQ2$vL5!wP8*", username="alice"), name="login")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv))
+        assert dec.action is Action.BLOCK
+        assert "assignment" in (dec.reason or "")
+
+        # Placeholders are allowed
+        inv_placeholder = invocation(Credentials(password="changeme", username="alice"), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_placeholder)).action is Action.CONTINUE
+        inv_env = invocation(Credentials(password="${DB_PASSWORD}", username="alice"), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_env)).action is Action.CONTINUE
+
+    def test_assignments_opt_in_free_text(self) -> None:
+        guard = SecretGuard(assignments=True)
+        assert guard.find_secret("db_password = 'xK9#mQ2$vL5!wP8*'") == "assignment"
+        assert guard.find_secret("api_key = changeme") is None
+        assert guard.find_secret("token = ${API_TOKEN}") is None
+        assert guard.find_secret("password = <password>") is None
+        assert guard.find_secret("token = ***") is None
+
+    def test_decode_opt_in_url_encoded(self) -> None:
+        guard = SecretGuard(decode=True)
+        raw = "AIza" + "A" * 35
+        encoded = "".join(f"%{ord(c):02X}" for c in raw)
+        assert guard.find_secret(f"param={encoded}") == "api_token"
+
+    def test_decode_opt_in_base64(self) -> None:
+        import base64
+
+        guard = SecretGuard(decode=True)
+        raw = "AIza" + "A" * 35
+        b64 = base64.b64encode(raw.encode()).decode()
+        assert guard.find_secret(f"key: {b64}") == "api_token"
+
+    def test_decode_opt_in_ignores_binary_and_uuids(self) -> None:
+        import uuid
+
+        guard = SecretGuard(decode=True)
+        assert guard.find_secret(f"id: {uuid.uuid4().hex}") is None

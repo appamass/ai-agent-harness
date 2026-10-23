@@ -4,15 +4,22 @@ a class that inherits from `Hook` and overrides only the required method.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import inspect
 import ipaddress
+import math
 import posixpath
 import re
+import urllib.parse
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, TypeVar, get_args
 from urllib.parse import urlsplit
+
+from pydantic.networks import AnyUrl
 
 from .core.errors import ConfigError
 from .core.hooks import CONTINUE, Decision, Hook, ToolInvocation
@@ -157,16 +164,134 @@ DEFAULT_SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
     (
         "api_token",
-        r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{20,}|(?<!-)sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}"
-        r"|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
-        r"|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,}|pypi-AgE[A-Za-z0-9_-]{30,}|[sr]k_live_[A-Za-z0-9]{16,})",
+        r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{20,}"
+        r"|(?<!-)sk-proj-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-ant-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-svcacct-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-admin-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-[A-Za-z0-9]{20,}"
+        r"|gh[pousr]_[A-Za-z0-9]{20,}"
+        r"|github_pat_[A-Za-z0-9_]{20,}"
+        r"|glpat-[A-Za-z0-9_-]{20,}"
+        r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+        r"|AIza[A-Za-z0-9_-]{35}"
+        r"|npm_[A-Za-z0-9]{30,}"
+        r"|pypi-AgE[A-Za-z0-9_-]{30,}"
+        r"|[sr]k_live_[A-Za-z0-9]{16,})",
     ),
     ("aws_access_key", r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
     ("auth_bearer", r"(?i:\bBearer\s+)[A-Za-z0-9._~+/=-]{20,}"),
     ("auth_basic", r"(?i:\bAuthorization:\s*Basic\s+)[A-Za-z0-9+/=]{8,}"),
     ("jwt", r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     ("url_credentials", r"\b[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^/\s:@]+:[^/\s:@]+@[^\s/]+"),
+    ("sendgrid_key", r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
+    ("twilio_key", r"\b(?:SK|AC)[0-9a-fA-F]{32}\b"),
+    ("slack_webhook", r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+"),
+    ("azure_connection_string", r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{40,}"),
 )
+
+_SECRET_FIELD_KEY = re.compile(
+    r"(?:^|[^a-z])(?:pass(?:word)?|secret|token|api_?key|auth_?token|client_?secret|access_?token)s?(?:$|[^a-z])"
+)
+_ASSIGNMENT_REGEX = re.compile(
+    r"""\b(?i:(?:[a-z0-9_]+_)?(?:password|secret|token|api_?key|client_?secret|access_?token))\s*[:=]\s*['"]?([^\s'"]{8,})['"]?"""
+)
+_PLACEHOLDER_WORDS = frozenset(
+    {"changeme", "example", "placeholder", "dummy", "test", "none", "null", "admin", "password", "secret", "token"}
+)
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    total = len(s)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _is_placeholder(val: str) -> bool:
+    s = val.strip().casefold()
+    if s in _PLACEHOLDER_WORDS:
+        return True
+    return bool(
+        (s.startswith("${") and s.endswith("}")) or (s.startswith("<") and s.endswith(">")) or s.startswith("***")
+    )
+
+
+def _find_assignment_secret(text: str) -> str | None:
+    for match in _ASSIGNMENT_REGEX.finditer(text):
+        val = match.group(1)
+        if not _is_placeholder(val) and len(val) >= 8 and _shannon_entropy(val) >= 2.5:
+            return "assignment"
+    return None
+
+
+def _is_mostly_ascii(data: bytes) -> bool:
+    if not data:
+        return False
+    printable = sum(1 for b in data if 32 <= b <= 126 or b in (9, 10, 13))
+    return (printable / len(data)) >= 0.85
+
+
+def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | None:
+    max_budget = 50_000
+    consumed = 0
+    pieces: list[str] = []
+
+    if "%" in text and re.search(r"%[0-9a-fA-F]{2}", text):
+        unquoted = urllib.parse.unquote(text)
+        if unquoted != text:
+            take = unquoted[: max_budget - consumed]
+            pieces.append(take)
+            consumed += len(take)
+
+    if consumed < max_budget:
+        for m in re.finditer(r"\b[A-Za-z0-9+/]{16,}={0,2}\b", text):
+            cand = m.group(0)
+            raw: bytes | None = None
+            try:
+                raw = base64.b64decode(cand, validate=True)
+            except (binascii.Error, ValueError):
+                raw = None
+            if raw is not None and len(raw) >= 12 and _is_mostly_ascii(raw):
+                decoded = raw.decode("utf-8", errors="ignore")
+                take = decoded[: max_budget - consumed]
+                pieces.append(take)
+                consumed += len(take)
+                if consumed >= max_budget:
+                    break
+
+    if consumed < max_budget:
+        for m in re.finditer(r"\b[0-9a-fA-F]{32,}\b", text):
+            cand = m.group(0)
+            if len(cand) % 2 != 0:
+                continue
+            raw_hex: bytes | None = None
+            try:
+                raw_hex = bytes.fromhex(cand)
+            except ValueError:
+                raw_hex = None
+            if raw_hex is not None and len(raw_hex) >= 16 and _is_mostly_ascii(raw_hex):
+                decoded = raw_hex.decode("utf-8", errors="ignore")
+                take = decoded[: max_budget - consumed]
+                pieces.append(take)
+                consumed += len(take)
+                if consumed >= max_budget:
+                    break
+
+    if pieces:
+        return scanner("\n".join(pieces))
+    return None
+
+
+def _compile_secret_alternation(patterns: tuple[tuple[str, str], ...]) -> tuple[re.Pattern[str], dict[str, str]]:
+    group_to_category: dict[str, str] = {}
+    named_parts: list[str] = []
+    for i, (cat, expr) in enumerate(patterns):
+        grp = f"g{i}_{cat}"
+        group_to_category[grp] = cat
+        named_parts.append(f"(?P<{grp}>{expr})")
+    return re.compile("|".join(named_parts)), group_to_category
 
 
 class SecretGuard(Hook):
@@ -183,24 +308,41 @@ class SecretGuard(Hook):
         *,
         check_user_input: bool = False,
         check_model_output: bool = True,
+        assignments: bool = False,
+        decode: bool = False,
     ) -> None:
-        self._patterns = _at_least_one(tuple((name, re.compile(expr)) for name, expr in patterns), "SecretGuard")
+        raw_patterns = _at_least_one(tuple(patterns), "SecretGuard")
+        self._patterns = tuple((name, re.compile(expr)) for name, expr in raw_patterns)
+        self._combined, self._group_to_category = _compile_secret_alternation(raw_patterns)
         self._check_user_input = check_user_input
         self._check_model_output = check_model_output
+        self._assignments = assignments
+        self._decode = decode
 
     def find_secret(self, text: str) -> str | None:
         """Returns the category name of the first detected secret in `text`, or `None`."""
-        for name, pattern in self._patterns:
-            if pattern.search(text) is not None:
-                return name
+        direct = self._find_secret_direct(text)
+        if direct is not None:
+            return direct
+        if self._assignments:
+            assigned = _find_assignment_secret(text)
+            if assigned is not None:
+                return assigned
+        if self._decode:
+            decoded = _decode_and_scan(text, self._find_secret_direct)
+            if decoded is not None:
+                return decoded
+        return None
+
+    def _find_secret_direct(self, text: str) -> str | None:
+        match = self._combined.search(text)
+        if match is not None and match.lastgroup is not None:
+            return self._group_to_category.get(match.lastgroup)
         return None
 
     def redact(self, text: str, *, replacement: str = "[REDACTED]") -> str:
         """Replaces all detected secrets in `text` with `replacement`."""
-        cleaned = text
-        for _, pattern in self._patterns:
-            cleaned = pattern.sub(replacement, cleaned)
-        return cleaned
+        return self._combined.sub(replacement, text)
 
     def _check(self, texts: Iterable[str], blocked: str) -> Decision:
         """Blocks with `blocked` and the category of the first secret found in `texts` (never the secret itself)."""
@@ -221,19 +363,44 @@ class SecretGuard(Hook):
         return self._check([response.message.text], "Model response blocked")
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        return self._check(_all_strings(invocation.args.model_dump()), "Tool arguments blocked")
+        if self._assignments:
+            for key, value, is_dict_key in _walk_strings(invocation.args.model_dump(mode="json")):
+                if not value or is_dict_key:
+                    continue
+                if (
+                    key
+                    and _SECRET_FIELD_KEY.search(key.casefold())
+                    and not _is_placeholder(value)
+                    and len(value) >= 8
+                    and _shannon_entropy(value) >= 2.5
+                ):
+                    return Decision.block("Tool arguments blocked: contains potential secret (assignment)")
+        return self._check(_all_strings(invocation.args.model_dump(mode="json")), "Tool arguments blocked")
 
     async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
         return self._check([result.content], "Tool output withheld")
 
 
-_URL_IN_TEXT = re.compile(
-    r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]+[^\s<>()\"'\]]*"
-    r"|\bmailto:[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"
-    r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
-    r"|\bjavascript:[^\s<>()\"'\]]+"
-)
-_URL_MARKERS = (":/", ":\\", "mailto:", "data:", "javascript:")
+_WHATWG_SPECIAL_SCHEMES: tuple[str, ...] = ("https", "http", "wss", "ws", "ftp", "file")
+
+
+def _build_url_patterns() -> tuple[re.Pattern[str], tuple[str, ...]]:
+    special = "|".join(_WHATWG_SPECIAL_SCHEMES)
+    pattern_str = (
+        rf"\b(?:{special}):[/\\]+[^\s<>()\"'\]]*"
+        r"|\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]{2,}[^\s<>()\"'\]]*"
+        r"|\bmailto:[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"
+        r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
+        r"|\bjavascript:[^\s<>()\"'\]]+"
+    )
+    markers = ["://", ":\\\\", "mailto:", "data:", "javascript:"]
+    for s in _WHATWG_SPECIAL_SCHEMES:
+        markers.append(f"{s}:/")
+        markers.append(f"{s}:\\")
+    return re.compile(pattern_str), tuple(markers)
+
+
+_URL_IN_TEXT, _URL_MARKERS = _build_url_patterns()
 """Every `_URL_IN_TEXT` match contains one of these (the pattern is case-sensitive): text without them has no URL."""
 _TRAILING_PUNCT = ".,;:!?'\")"
 _URL_KEY_WORD = re.compile(r"(?:^|[^a-z])(?:url|uri|href|endpoint|webhook)s?(?:$|[^a-z])")
@@ -246,6 +413,16 @@ def _is_url_key(key: str | None, extra: frozenset[str]) -> bool:
         return False
     folded = key.casefold()
     return folded in extra or _URL_KEY_WORD.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+
+
+def _is_url_typed_field(annotation: Any) -> bool:
+    if annotation is None:
+        return False
+    candidates = [annotation, *get_args(annotation)]
+    for cand in candidates:
+        if isinstance(cand, type) and (issubclass(cand, AnyUrl) or "url" in cand.__name__.casefold()):
+            return True
+    return False
 
 
 class EgressGuard(Hook):
@@ -270,6 +447,7 @@ class EgressGuard(Hook):
         allow_http: bool = False,
         check_model_output: bool = True,
         url_keys: Iterable[str] = (),
+        ignore_keys: Iterable[str] = (),
     ) -> None:
         if isinstance(allowed_domains, str):
             raise ConfigError("EgressGuard: allowed_domains must be a list of domains, not a single string")
@@ -277,6 +455,7 @@ class EgressGuard(Hook):
         self._allow_http = allow_http
         self._check_model_output = check_model_output
         self._url_keys = frozenset(k.casefold() for k in url_keys)
+        self._ignore_keys = frozenset(k.casefold() for k in ignore_keys)
 
     def check_url(self, url: str) -> str | None:
         """Returns `None` if `url` is allowed, or a concise reason string if blocked."""
@@ -318,15 +497,31 @@ class EgressGuard(Hook):
         return None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        for key, value, is_dict_key in _walk_strings(invocation.args.model_dump()):
+        url_fields: set[str] = set()
+        model_cls = type(invocation.args)
+        if hasattr(model_cls, "model_fields"):
+            for fname, finfo in model_cls.model_fields.items():
+                if _is_url_typed_field(finfo.annotation):
+                    url_fields.add(fname.casefold())
+
+        for key, value, is_dict_key in _walk_strings(invocation.args.model_dump(mode="json")):
             if not value:
                 continue
-            if not is_dict_key and _is_url_key(key, self._url_keys):
+            key_fold = key.casefold() if key else ""
+            is_ignored = key_fold in self._ignore_keys
+            is_strict_url = (
+                not is_dict_key and not is_ignored and (key_fold in url_fields or _is_url_key(key, self._url_keys))
+            )
+            if is_strict_url:
                 reason = self.check_url(value)
+                if reason is not None:
+                    return Decision.block(f"Outbound URL blocked: {reason}")
             else:
                 reason = self.check_text(value)
-            if reason is not None:
-                return Decision.block(f"Outbound URL blocked: {reason}")
+                if reason is not None:
+                    if is_ignored and key:
+                        return Decision.block(f"Outbound URL blocked in field '{key}': {reason}")
+                    return Decision.block(f"Outbound URL blocked: {reason}")
         return CONTINUE
 
     async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
@@ -371,6 +566,15 @@ DEFAULT_WEAKENING_PATTERNS: tuple[str, ...] = (
     r"\bunittest\.skip(?:If|Unless)?\b",
     r"//\s*@ts-(?:ignore|nocheck|expect-error)\b",
     r"\bsys\.exit\s*\(\s*0\s*\)",
+    r"eslint-disable\b",
+    r"//\s*nolint\b",
+    r"#\[allow\(",
+    r"#\[ignore\]",
+    r"@SuppressWarnings\b",
+    r"@Disabled\b",
+    r"\b(?:it|describe)\.skip\s*\(",
+    r"\bxit\s*\(",
+    r"\bt\.Skip(?:Now|f)?\s*\(",
 )
 
 
@@ -378,15 +582,14 @@ class WeakeningGuard(Hook):
     """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
 
     def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
-        self._patterns = _at_least_one(tuple(re.compile(p, re.IGNORECASE) for p in patterns), "WeakeningGuard")
+        p_list = _at_least_one(tuple(patterns), "WeakeningGuard")
+        self._patterns = tuple(re.compile(p, re.IGNORECASE) for p in p_list)
+        self._combined = re.compile("|".join(f"(?:{p})" for p in p_list), re.IGNORECASE)
 
     def check_text(self, text: str) -> str | None:
         """Returns the first matched check-weakening directive in `text`, or `None`."""
-        for pattern in self._patterns:
-            match = pattern.search(text)
-            if match is not None:
-                return match.group(0).strip()
-        return None
+        match = self._combined.search(text)
+        return match.group(0).strip() if match is not None else None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
         if invocation.risk is Risk.READ:

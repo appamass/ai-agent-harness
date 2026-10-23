@@ -82,20 +82,18 @@ Read this before you rely on the harness. Everything here is deliberate or not b
 `SecretGuard`, `EgressGuard`, and `WeakeningGuard` are fast, deterministic pattern checks. They run synchronously inside the event loop; their patterns are bounded so that large inputs scan in linear time. They catch the common cases and make mistakes visible.
 They are not data loss prevention and not a sandbox. Use them as one layer.
 
-- **`SecretGuard`:** it finds only the listed formats: private key headers, `hf_`, `sk-`, `sk_live_`/`rk_live_`, `ghp_`-style GitHub tokens, `github_pat_`,
-  `glpat-`, `xox*-`, Google `AIza` keys, `npm_` and PyPI (`pypi-AgE…`) tokens, AWS `AKIA`/`ASIA` keys, three-part JWTs, `Bearer` tokens with 20+ characters, and
-  `Authorization: Basic` (both case-insensitive), and `scheme://user:password@host`. A long kebab-case name that starts with `sk-` (for example `sk-learn-is-a-long-kebab-case-name`) looks like a key and is blocked. It does not find `password=…` assignments, passwords that contain `/` or `@`, other
-  vendors' keys, or secrets that are encoded or split over several messages. As a hook it only blocks (tool arguments, tool results, model
-  responses, and user input when enabled); `redact()` is a helper you call yourself.
+- **`SecretGuard`:** it finds only the listed formats: private key headers, `hf_`, `sk-` (requiring known sub-prefixes or alphanumeric characters; kebab-case names like `sk-learn-...` are not blocked), `sk_live_`/`rk_live_`, `ghp_`-style GitHub tokens, `github_pat_`,
+  `glpat-`, `xox*-`, Google `AIza` keys, `npm_` and PyPI (`pypi-AgE…`) tokens, AWS `AKIA`/`ASIA` keys, SendGrid (`SG.`), Twilio (`SK`), Slack incoming webhooks, Azure connection strings, three-part JWTs, `Bearer` tokens with 20+ characters,
+  `Authorization: Basic` (both case-insensitive), and `scheme://user:password@host`. Opt-in `assignments=True` detects assignment syntax (`name = value`) and credential-named structured fields with high Shannon entropy (placeholders like `changeme` or `${...}` are ignored). Opt-in `decode=True` scans single-step URL-encoded, Base64, and Hex candidate payloads within a length budget. It does not find passwords split over several messages or proprietary formats of unlisted vendors. As a hook it only blocks; `redact()` is a helper you call yourself.
 - **`EgressGuard`:** it looks at the URL as text. It does not follow redirects, does not resolve DNS (a name on your allowlist can point to a private
-  address, or to an open redirect), and cannot tell what a tool does with a host. Free text is scanned for `scheme://`, `scheme:/`, `scheme:\\`, and
-  `mailto:`/`data:`/`file:`-style URLs. A bare host such as `evil.example/x` is found only in fields named like a URL (`url`, `uri`, `href`,
-  `endpoint`, `webhook`, also `base_url` or `callbackUrl`) or listed in `url_keys`. Hosts must be ASCII (use punycode). Text such as `note:/path` or a config line `path:/usr/bin` looks like a URL with an unknown scheme and is blocked (`file:line` and `data:int` are not), and so is a URL-named field that holds a non-URL value (`endpoint="users"`). `allowed_domains` is
+  address, or to an open redirect), and cannot tell what a tool does with a host. A single schema table derives URL detection. Free text is scanned for `scheme://`, WHATWG single-slash `scheme:/` and `scheme:\` (for `http(s)`, `ws(s)`, `ftp`, `file`), and
+  `mailto:`/`data:`/`javascript:` URLs. Non-WHATWG notations like `note:/path` or `path:/usr/bin` are not treated as URLs and pass cleanly. A bare host such as `evil.example/x` is found in fields named like a URL, listed in `url_keys`, or typed as `HttpUrl`/`AnyUrl` on Pydantic models. Pass `ignore_keys` to downgrade specific fields to free-text scanning instead of strict URL parsing. `allowed_domains` is
   required. With an empty one, every URL in tool arguments and in model answers is blocked, so list the domains your agent may link to, or set
   `check_model_output=False` to scan only tool arguments.
 - **`WeakeningGuard`:** it finds `# type: ignore`, `# pyright: ignore`, `# noqa` (also `# ruff: noqa`, `# flake8: noqa`), `# pylint: disable`,
   `# mypy: ignore-errors`, `# nosec`, `# pragma: no cover`, `pytest.mark.skip`/`skipif`/`xfail`, `pytest.skip(`, `pytest.importorskip`,
-  `unittest.skip`, `// @ts-ignore`, and `sys.exit(0)`. Other tools' switches are not known to it, and a suppression that is split over several
+  `unittest.skip`, `// @ts-ignore`, `sys.exit(0)`, `eslint-disable`, `// nolint`, `#[allow(`, `#[ignore]`, `@SuppressWarnings`, `@Disabled`,
+  `it.skip(`, `describe.skip(`, `xit(`, and `t.Skip(`. Other tools' switches are not known to it, and a suppression that is split over several
   write calls is not seen.
 - **`ProtectedPaths(root=…)`:** it resolves paths against `root`, while a tool resolves them against its own working directory. Keep both the same.
   The check and the later write are separate steps, so a link created in between is not seen. Each path check reads the file system.
