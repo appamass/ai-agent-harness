@@ -167,7 +167,9 @@ def test_caching_and_effort_are_configurable() -> None:
 def test_api_key_is_sent_only_as_header() -> None:
     wire = Wire(ok("text"))
     complete(provider_for(wire))
-    assert wire.headers[0]["x-api-key"] == API_KEY
+    headers = wire.headers[0]
+    # anthropic 1 sends the key as `x-api-key`, anthropic 2 as `Authorization: Bearer`
+    assert (headers.get("x-api-key") or headers.get("authorization", "").removeprefix("Bearer ")) == API_KEY
     assert API_KEY not in json.dumps(wire.bodies[0])
 
 

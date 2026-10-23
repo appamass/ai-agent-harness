@@ -1,7 +1,7 @@
 """OpenAI adapter: translation, error classification, and full agent runs against the real SDK.
 
-The SDK is real; only the network is replaced by an `httpx` mock transport that returns the wire-format
-bodies from `tests/fixtures/openai/`.
+The SDK is real; only the network is replaced by an `httpx` mock transport (`httpx2` since openai 3) that
+returns the wire-format bodies from `tests/fixtures/openai/`.
 """
 
 from __future__ import annotations
@@ -9,9 +9,8 @@ from __future__ import annotations
 import importlib
 import json
 import sys
-from typing import Any, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-import httpx
 import openai
 import pytest
 
@@ -42,6 +41,11 @@ from .conftest import Echo, no_sleep, run_sync
 from .provider_helpers import ECHO_SPEC, complete, load_fixture, request, stream_items
 
 API_KEY = "sk-openai-test-key-1234567890"
+if TYPE_CHECKING:
+    import httpx2 as httpx
+else:  # openai 1 uses httpx, openai 3 uses httpx2: the mock transport must come from the library the SDK uses
+    httpx = importlib.import_module(openai.DefaultAsyncHttpxClient.__mro__[1].__module__.split(".")[0])
+
 MODEL = "gpt-4o"
 
 

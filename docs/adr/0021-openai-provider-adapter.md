@@ -10,7 +10,7 @@
 
 ## Decision
 
-- `OpenAIProvider` is an **optional extra** (`pip install "ai-agent-harness[openai]"`, `openai>=1.51,<2`). Without the SDK it raises `ConfigError` with the install hint.
+- `OpenAIProvider` is an **optional extra** (`pip install "ai-agent-harness[openai]"`, `openai>=1.51,<4`). Without the SDK it raises `ConfigError` with the install hint.
 - It implements `ModelProvider` (`id`, `capabilities`, `complete`) plus the optional `stream()` and `aclose()`. The client uses `max_retries=0`; retry and failover belong to `ModelRouter`.
 - `without_foreign_thinking` strips other providers' reasoning before translating. `reasoning_content` is kept as a `ThinkingBlock`, also when streaming.
 - Malformed tool-call JSON becomes `ToolCall(arguments_error=…)`, never a `ProviderError`, so the model can correct itself.
