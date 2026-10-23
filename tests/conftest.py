@@ -279,6 +279,12 @@ def _postgres_backend(codec: StateCodec | None = None) -> Generator[SqlBackend]:
         yield SqlBackend(created, execute, lambda: PostgresCheckpointStore(dsn, schema=schema, codec=codec))
 
 
+@pytest.fixture
+def anyio_backend() -> str:
+    """The harness runs on asyncio. Older anyio versions also run each async test on trio, which is not installed."""
+    return "asyncio"
+
+
 @pytest.fixture(params=["sqlite", "postgres", "sqlite_enc", "postgres_enc"])
 def sql_backend(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[SqlBackend]:
     """Both SQL stores, plain and encrypted. Postgres is skipped without a database."""

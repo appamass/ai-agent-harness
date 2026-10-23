@@ -458,7 +458,8 @@ async def test_stream_resume_closed_before_it_starts_leaves_a_waiting_run_untouc
     before = waiting.model_dump_json()
 
     handle = stream_resume(agent, waiting, approved=True, pending_id=shown)
-    await asyncio.wait_for(handle.aclose(), timeout=3)
+    handle.cancel()  # synchronous: before the task starts. `wait_for` runs `aclose()` as a task on Python 3.11,
+    await asyncio.wait_for(handle.aclose(), timeout=3)  # which would let the run task start first
 
     assert waiting.model_dump_json() == before  # nothing was claimed, nothing was overwritten
     assert write.written == []
@@ -479,6 +480,7 @@ async def test_stream_resume_recover_closed_before_it_starts_keeps_the_outcome_u
 
     recovering, _, _ = make_agent([text_response("recovered")], checkpoints=store)
     handle = stream_resume(recovering, stored, recover=True)
+    handle.cancel()  # synchronous: before the task starts (see the test above)
     await asyncio.wait_for(handle.aclose(), timeout=3)
     still = await store.load("default", "c1")
     assert still is not None and still.status is RunStatus.RUNNING  # still recoverable
