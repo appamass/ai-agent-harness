@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import inspect
 import ipaddress
 import math
@@ -19,6 +20,7 @@ from pathlib import Path
 from typing import Any, TypeVar, get_args
 from urllib.parse import urlsplit
 
+from pydantic import BaseModel
 from pydantic.networks import AnyUrl
 
 from .core.errors import ConfigError
@@ -196,9 +198,14 @@ _SECRET_FIELD_KEY = re.compile(
 )
 
 
+def _key_words(key: str) -> str:
+    """A field name as lower-case words (`dbPassword` becomes `db_password`): one pattern covers both spellings."""
+    return _CAMEL_BOUNDARY.sub("_", key).casefold()
+
+
 def _is_secret_key(key: str) -> bool:
-    """True for field names such as `password`, `api_key`, `dbPassword`, or `refreshToken` (camelCase is split)."""
-    return _SECRET_FIELD_KEY.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+    """True for field names such as `password`, `api_key`, `dbPassword`, or `refreshToken`."""
+    return _SECRET_FIELD_KEY.search(_key_words(key)) is not None
 
 
 _ASSIGNMENT_REGEX = re.compile(
@@ -227,142 +234,77 @@ def _is_placeholder(val: str) -> bool:
     )
 
 
+def _looks_like_secret(value: str) -> bool:
+    """A value that is no placeholder, is long enough, and has enough variety to be a credential."""
+    return not _is_placeholder(value) and len(value) >= 8 and _shannon_entropy(value) >= 2.5
+
+
 def _find_assignment_secret(text: str) -> str | None:
+    if "=" not in text and ":" not in text:  # cheap: an assignment needs one of them
+        return None
     for match in _ASSIGNMENT_REGEX.finditer(text):
-        val = match.group(1)
-        if not _is_placeholder(val) and len(val) >= 8 and _shannon_entropy(val) >= 2.5:
+        if _looks_like_secret(match.group(1)):
             return "assignment"
     return None
-
-
-def _is_mostly_ascii(data: bytes) -> bool:
-    if not data:
-        return False
-    printable = sum(1 for b in data if 32 <= b <= 126 or b in (9, 10, 13))
-    return (printable / len(data)) >= 0.85
 
 
 _BASE64_CANDIDATE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}=*")
 """A whole base64 run with any `=` after it. One start per run and no lookahead keep the search linear.
 A `=` before the run is allowed: `key=<base64>` is the common case."""
+_HEX_CANDIDATE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_PERCENT_ESCAPE = re.compile(r"%[0-9a-fA-F]{2}")
+_PRINTABLE_RUN = re.compile(rb"[\t\n\r\x20-\x7e]{12,}")
+_DECODE_BUDGET = 50_000
+"""Characters of decoded text that `decode=True` scans per text, so a large input cannot make the scan slow."""
 
 
-_MAX_PATH_SLASHES = 8
-"""How many `/` at the start of a base64 run `_decode_base64` also tries as the start of the data."""
+def _printable_runs(raw: bytes) -> Iterator[str]:
+    """The readable stretches of `raw` (12 characters or more). Binary data, such as a hash, has none."""
+    for run in _PRINTABLE_RUN.findall(raw):
+        yield run.decode("ascii")
 
 
-def _decode_base64(candidate: str) -> list[bytes]:
-    """Every mostly printable decoding of `candidate`.
+def _decode_base64(candidate: str) -> Iterator[str]:
+    """Readable text in a base64 run, decoded at each of the 4 offsets.
 
-    A path before the data is made of base64 characters too, so the run often starts with it
-    (`example/api/v1/upload/<base64>`). Decoded together, the path would turn into garbage in front of the secret.
-    So the data is also tried after each of the first `_MAX_PATH_SLASHES` slashes, and at the offsets 0 to 3 for a
-    prefix without a slash. A wrong start can look printable too, so all printable results are kept.
-    At most 12 tries per run keep the work linear.
+    A path before the data is made of base64 characters too (`example/api/v1/upload/<base64>`): it is part of the run
+    and moves the 4-character blocks. The path only turns into a few garbage bytes in front of the data, which
+    `_printable_runs` drops, so the data is found at the offset where its blocks line up. The `/` that ends the
+    path decodes to a byte that is never a letter or digit, so it cannot hide the start of a token.
     """
-    starts = list(range(4))
-    slash = candidate.find("/")
-    while slash != -1 and len(starts) < 4 + _MAX_PATH_SLASHES:
-        starts.append(slash + 1)
-        slash = candidate.find("/", slash + 1)
-    decoded: list[bytes] = []
-    for begin in starts:
-        core = candidate[begin:].rstrip("=")  # lenient decoders accept missing or extra padding, so the check does too
-        if len(core) < 16:
-            continue
+    for offset in range(4):
+        core = candidate[offset:].rstrip("=")  # lenient decoders accept missing or extra padding, so the check does too
         try:
             raw = base64.b64decode(core + "=" * (-len(core) % 4), validate=True)
         except (binascii.Error, ValueError):
             continue
-        if len(raw) >= 12 and _is_mostly_ascii(raw):
-            decoded.append(raw)
-    return decoded
+        yield from _printable_runs(raw)
+
+
+def _decoded_texts(text: str) -> Iterator[str]:
+    """The text that one step of URL, base64, or hex decoding reveals in `text`."""
+    if _PERCENT_ESCAPE.search(text):
+        unquoted = urllib.parse.unquote(text)
+        if unquoted != text:
+            yield unquoted
+    for match in _BASE64_CANDIDATE.finditer(text):
+        yield from _decode_base64(match.group(0))
+    for match in _HEX_CANDIDATE.finditer(text):
+        digits = match.group(0)
+        if len(digits) % 2 == 0:
+            yield from _printable_runs(bytes.fromhex(digits))
 
 
 def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | None:
-    max_budget = 50_000
-    consumed = 0
+    """Scans what `_decoded_texts` finds, once, up to `_DECODE_BUDGET` characters in all."""
     pieces: list[str] = []
-
-    if "%" in text and re.search(r"%[0-9a-fA-F]{2}", text):
-        unquoted = urllib.parse.unquote(text)
-        if unquoted != text:
-            take = unquoted[: max_budget - consumed]
-            pieces.append(take)
-            consumed += len(take)
-
-    if consumed < max_budget:
-        for m in _BASE64_CANDIDATE.finditer(text):
-            for raw in _decode_base64(m.group(0)):
-                take = raw.decode("utf-8", errors="ignore")[: max_budget - consumed]
-                pieces.append(take)
-                consumed += len(take)
-                if consumed >= max_budget:
-                    break
-            if consumed >= max_budget:
-                break
-
-    if consumed < max_budget:
-        for m in re.finditer(r"\b[0-9a-fA-F]{32,}\b", text):
-            cand = m.group(0)
-            if len(cand) % 2 != 0:
-                continue
-            raw_hex: bytes | None = None
-            try:
-                raw_hex = bytes.fromhex(cand)
-            except ValueError:
-                raw_hex = None
-            if raw_hex is not None and len(raw_hex) >= 16 and _is_mostly_ascii(raw_hex):
-                decoded = raw_hex.decode("utf-8", errors="ignore")
-                take = decoded[: max_budget - consumed]
-                pieces.append(take)
-                consumed += len(take)
-                if consumed >= max_budget:
-                    break
-
-    if pieces:
-        return scanner("\n".join(pieces))
-    return None
-
-
-class _PatternSet:
-    """Labeled patterns, searched in one pass when they can share one alternation (ADR 0028).
-
-    A pattern with capturing groups cannot join it: group names would clash and `\\1` would point at another
-    pattern's group. Nor can a pattern with an inline global flag such as `(?i)`, which is only allowed at the start.
-    If any pattern cannot join, all patterns are searched one by one, as written.
-    """
-
-    def __init__(self, patterns: tuple[tuple[str, str], ...], flags: int = 0) -> None:
-        self._each = tuple((label, re.compile(expr, flags)) for label, expr in patterns)
-        self._combined: re.Pattern[str] | None = None
-        if all(compiled.groups == 0 for _, compiled in self._each):
-            try:  # each pattern becomes group n, so `lastindex` names the pattern that matched
-                self._combined = re.compile("|".join(f"({expr})" for _, expr in patterns), flags)
-            except re.error:
-                self._combined = None
-
-    def search(self, text: str) -> tuple[str, re.Match[str]] | None:
-        """The label and match of the first pattern found in `text`, or None."""
-        if self._combined is not None:
-            match = self._combined.search(text)
-            if match is None:
-                return None
-            if match.lastindex is not None:
-                return self._each[match.lastindex - 1][0], match
-            # cannot happen (every alternative is one group); if it does, search one by one rather than pass the text
-        for label, compiled in self._each:
-            found = compiled.search(text)
-            if found is not None:
-                return label, found
-        return None
-
-    def sub(self, replacement: str, text: str) -> str:
-        if self._combined is not None:
-            return self._combined.sub(replacement, text)
-        for _, compiled in self._each:
-            text = compiled.sub(replacement, text)
-        return text
+    left = _DECODE_BUDGET
+    for piece in _decoded_texts(text):
+        pieces.append(piece[:left])
+        left -= len(pieces[-1])
+        if left <= 0:
+            break
+    return scanner("\n".join(pieces)) if pieces else None
 
 
 class SecretGuard(Hook):
@@ -382,7 +324,8 @@ class SecretGuard(Hook):
         assignments: bool = False,
         decode: bool = False,
     ) -> None:
-        self._patterns = _PatternSet(_at_least_one(tuple(patterns), "SecretGuard"))
+        listed = _at_least_one(tuple(patterns), "SecretGuard")
+        self._patterns = tuple((name, re.compile(expr)) for name, expr in listed)
         self._check_user_input = check_user_input
         self._check_model_output = check_model_output
         self._assignments = assignments
@@ -404,12 +347,17 @@ class SecretGuard(Hook):
         return None
 
     def _find_secret_direct(self, text: str) -> str | None:
-        found = self._patterns.search(text)
-        return found[0] if found is not None else None
+        for name, pattern in self._patterns:
+            if pattern.search(text) is not None:
+                return name
+        return None
 
     def redact(self, text: str, *, replacement: str = "[REDACTED]") -> str:
         """Replaces all detected secrets in `text` with `replacement`."""
-        return self._patterns.sub(replacement, text)
+        cleaned = text
+        for _, pattern in self._patterns:
+            cleaned = pattern.sub(replacement, cleaned)
+        return cleaned
 
     def _check(self, texts: Iterable[str], blocked: str) -> Decision:
         """Blocks with `blocked` and the category of the first secret found in `texts` (never the secret itself)."""
@@ -430,19 +378,12 @@ class SecretGuard(Hook):
         return self._check([response.message.text], "Model response blocked")
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
+        args = invocation.args.model_dump(mode="json")
         if self._assignments:
-            for key, value, is_dict_key in _walk_strings(invocation.args.model_dump(mode="json")):
-                if not value or is_dict_key:
-                    continue
-                if (
-                    key
-                    and _is_secret_key(key)
-                    and not _is_placeholder(value)
-                    and len(value) >= 8
-                    and _shannon_entropy(value) >= 2.5
-                ):
+            for key, value, is_dict_key in _walk_strings(args):
+                if key and value and not is_dict_key and _is_secret_key(key) and _looks_like_secret(value):
                     return Decision.block("Tool arguments blocked: contains potential secret (assignment)")
-        return self._check(_all_strings(invocation.args.model_dump(mode="json")), "Tool arguments blocked")
+        return self._check(_all_strings(args), "Tool arguments blocked")
 
     async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
         return self._check([result.content], "Tool output withheld")
@@ -460,7 +401,7 @@ _OPAQUE_URL_BRANCHES: tuple[tuple[str, str], ...] = (
 
 
 def _build_url_patterns() -> tuple[re.Pattern[str], tuple[str, ...]]:
-    """`_URL_IN_TEXT` and `_URL_MARKERS` from one table, so they cannot drift apart."""
+    """`_URL_IN_TEXT` and its quick pre-check `_URL_MARKERS` from one table, so they cannot drift apart."""
     special = "|".join(_WHATWG_SPECIAL_SCHEMES)
     branches = (
         # Schemes are case-insensitive in ASCII (WHATWG): `HTTPS:/host` is a URL with a host, like `https://host`
@@ -468,7 +409,7 @@ def _build_url_patterns() -> tuple[re.Pattern[str], tuple[str, ...]]:
         r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]{2,}[^\s<>()\"'\]]*",
         *(branch for _, branch in _OPAQUE_URL_BRANCHES),
     )
-    # The first two branches always contain `:/` or `:\`; the others hold their marker once the text is lower-cased
+    # The first two branches always contain `:/` or `:\`; the others start with their marker
     markers = (":/", ":\\", *(marker for marker, _ in _OPAQUE_URL_BRANCHES))
     return re.compile("|".join(branches)), markers
 
@@ -484,7 +425,7 @@ def _is_url_key(key: str | None, extra: frozenset[str]) -> bool:
     if key is None:
         return False
     folded = key.casefold()
-    return folded in extra or _URL_KEY_WORD.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+    return folded in extra or _URL_KEY_WORD.search(_key_words(key)) is not None
 
 
 def _is_url_typed_field(annotation: Any) -> bool:
@@ -495,6 +436,14 @@ def _is_url_typed_field(annotation: Any) -> bool:
         if isinstance(cand, type) and (issubclass(cand, AnyUrl) or "url" in cand.__name__.casefold()):
             return True
     return False
+
+
+@functools.lru_cache(maxsize=256)
+def _url_field_names(model: type[BaseModel]) -> frozenset[str]:
+    """Lower-case names of the fields of `model` that are typed as URLs. It depends on the class only."""
+    return frozenset(
+        name.casefold() for name, info in model.model_fields.items() if _is_url_typed_field(info.annotation)
+    )
 
 
 class EgressGuard(Hook):
@@ -570,13 +519,7 @@ class EgressGuard(Hook):
         return None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        url_fields: set[str] = set()
-        model_cls = type(invocation.args)
-        if hasattr(model_cls, "model_fields"):
-            for fname, finfo in model_cls.model_fields.items():
-                if _is_url_typed_field(finfo.annotation):
-                    url_fields.add(fname.casefold())
-
+        url_fields = _url_field_names(type(invocation.args))
         for key, value, is_dict_key in _walk_strings(invocation.args.model_dump(mode="json")):
             if not value:
                 continue
@@ -655,13 +598,15 @@ class WeakeningGuard(Hook):
     """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
 
     def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
-        listed = _at_least_one(tuple(patterns), "WeakeningGuard")
-        self._patterns = _PatternSet(tuple((p, p) for p in listed), re.IGNORECASE)
+        self._patterns = _at_least_one(tuple(re.compile(p, re.IGNORECASE) for p in patterns), "WeakeningGuard")
 
     def check_text(self, text: str) -> str | None:
         """Returns the first matched check-weakening directive in `text`, or `None`."""
-        found = self._patterns.search(text)
-        return found[1].group(0).strip() if found is not None else None
+        for pattern in self._patterns:
+            match = pattern.search(text)
+            if match is not None:
+                return match.group(0).strip()
+        return None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
         if invocation.risk is Risk.READ:

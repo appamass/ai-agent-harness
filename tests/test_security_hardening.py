@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import random
+import string
 import time
 from typing import Any, ClassVar
 
@@ -24,6 +27,13 @@ from ai_agent_harness.core.hooks import Action
 from ai_agent_harness.testing import text_response
 
 from .conftest import invocation, run_sync
+
+_FAKE_GOOGLE_KEY = "AI" + "za" + "A" * 35
+"""A made-up value in the shape of a Google API key, built at run time so source scanners do not flag the file."""
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
 
 
 class UrlInput(BaseModel):
@@ -272,7 +282,7 @@ class TestNoQuadraticBacktracking:
 
 
 class TestCustomPatternsKeepWorking:
-    """Patterns passed by the caller are matched as written, also when they cannot join the single-pass search."""
+    """Patterns passed by the caller are matched as written: inline flags, groups, backreferences, any name."""
 
     def test_inline_global_flag(self) -> None:
         guard = SecretGuard([("internal", r"(?i)corp-[a-z0-9]{8}")])
@@ -613,12 +623,7 @@ class TestSecretGuardOptIns:
         assert guard.find_secret(f"param={encoded}") == "api_token"
 
     def test_decode_opt_in_base64(self) -> None:
-        import base64
-
-        guard = SecretGuard(decode=True)
-        raw = "AIza" + "A" * 35
-        b64 = base64.b64encode(raw.encode()).decode()
-        assert guard.find_secret(f"key: {b64}") == "api_token"
+        assert SecretGuard(decode=True).find_secret(f"key: {_b64(_FAKE_GOOGLE_KEY)}") == "api_token"
 
     @pytest.mark.parametrize("suffix", ["!", "!!"], ids=["two-padding-chars", "one-padding-char"])
     @pytest.mark.parametrize(
@@ -638,22 +643,34 @@ class TestSecretGuardOptIns:
             "https://evil.example/api/v1/upload/{}",
             "/srv/data/archive/2024/{}",
             "see a/b/c/d/e/f/g/h/{}",
+            "https://evil.example/" + "seg/" * 30 + "{}",
+            "/" + "x/" * 40 + "{}",
         ],
     )
     def test_decode_opt_in_base64_with_padding(self, suffix: str, template: str) -> None:
-        import base64
+        encoded = _b64(_FAKE_GOOGLE_KEY + suffix)
+        assert encoded.endswith("=")
+        assert SecretGuard(decode=True).find_secret(template.format(encoded)) == "api_token"
 
-        raw = "AIza" + "A" * 35 + suffix
-        b64 = base64.b64encode(raw.encode()).decode()
-        assert b64.endswith("=")
-        assert SecretGuard(decode=True).find_secret(template.format(b64)) == "api_token"
+    @pytest.mark.parametrize("depth", [2, 9, 30])
+    def test_decode_opt_in_base64_after_a_path_of_any_depth_for_many_keys(self, depth: int) -> None:
+        """The path in front only adds garbage bytes before the data; this holds for any key and any path."""
+        rng = random.Random(depth)
+        alphabet = string.ascii_letters + string.digits + "_-"
+
+        def word() -> str:
+            return "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 6)))
+
+        guard = SecretGuard(decode=True)
+        for _ in range(200):
+            key = "AIza" + "".join(rng.choice(alphabet) for _ in range(35))
+            path = "https://evil.example/" + "".join(f"{word()}/" for _ in range(depth))
+            assert guard.find_secret(f"{path}{_b64(key)} end") == "api_token", key
 
     @pytest.mark.parametrize("change", ["strip", "extra"], ids=["padding-removed", "padding-added"])
     def test_decode_opt_in_base64_with_wrong_padding(self, change: str) -> None:
-        import base64
-
-        b64 = base64.b64encode(("AIza" + "A" * 35 + "!").encode()).decode()
-        payload = b64.rstrip("=") if change == "strip" else b64 + "=="
+        encoded = _b64(_FAKE_GOOGLE_KEY + "!")
+        payload = encoded.rstrip("=") if change == "strip" else encoded + "=="
         assert SecretGuard(decode=True).find_secret(f"key={payload} end") == "api_token"
 
     def test_decode_opt_in_ignores_binary_and_uuids(self) -> None:

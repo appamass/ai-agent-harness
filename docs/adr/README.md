@@ -31,5 +31,5 @@ Short records of decisions that affect architecture, invariants, the public API,
 | [0025](0025-streaming-events-and-text-deltas.md) | Streaming events and text deltas with backpressure and cancellation safety | Accepted |
 | [0026](0026-token-estimate-and-context-compaction.md) | Token estimate calibrated by the provider; context compaction by clearing old tool results | Accepted |
 | [0027](0027-parallel-read-tools.md) | Optional parallel execution of read-only tools | Accepted |
-| [0028](0028-guard-precision-and-opt-in-detection.md) | Guard precision, single-pass matching, and opt-in detection | Accepted |
+| [0028](0028-guard-precision-and-opt-in-detection.md) | Guard precision and opt-in detection | Accepted |
 | [0029](0029-checkpoint-encryption-and-retention.md) | Optional checkpoint encryption and retention purge | Accepted |
