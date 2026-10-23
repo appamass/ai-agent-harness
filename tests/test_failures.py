@@ -25,7 +25,7 @@ from ai_agent_harness import (
 from ai_agent_harness.core import ProviderError, ToolInvocation
 from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import Echo, assert_consistent, make_agent, results_of, run_sync
+from .conftest import Echo, assert_consistent, make_agent, no_sleep, results_of, run_sync
 
 
 class EndRecorder(Hook):
@@ -255,8 +255,6 @@ def test_router_events_contain_no_error_text() -> None:
     """Provider error messages often echo the input — they must not appear in retry/failover events."""
     from ai_agent_harness import ModelRouter, RetryPolicy
     from ai_agent_harness.testing import FakeProvider
-
-    from .conftest import no_sleep
 
     secret = "AT611904300234573201"
     primary = FakeProvider([ProviderError(f"429 too many requests: {secret}", retryable=True)] * 2, id="primary")

@@ -4,20 +4,38 @@ a class that inherits from `Hook` and overrides only the required method.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import functools
 import inspect
 import ipaddress
+import math
 import posixpath
 import re
+import urllib.parse
+from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, get_args
 from urllib.parse import urlsplit
+
+from pydantic import BaseModel
+from pydantic.networks import AnyUrl
 
 from .core.errors import ConfigError
 from .core.hooks import CONTINUE, Decision, Hook, ToolInvocation
 from .core.state import RunState
 from .core.types import ModelRequest, ModelResponse, Risk, ToolResult
+
+_T = TypeVar("_T")
+
+
+def _at_least_one(items: tuple[_T, ...], guard: str) -> tuple[_T, ...]:
+    if not items:
+        raise ValueError(f"{guard} requires at least one pattern")
+    return items
+
 
 DEFAULT_PROTECTED: tuple[str, ...] = (
     "tests",
@@ -104,9 +122,7 @@ class ProtectedPaths(Hook):
         extra_keys: Iterable[str] = (),
         root: str | Path | None = None,
     ) -> None:
-        self._patterns = tuple(p.casefold().strip("/") for p in patterns)
-        if not self._patterns:
-            raise ValueError("ProtectedPaths requires at least one pattern")
+        self._patterns = _at_least_one(tuple(p.casefold().strip("/") for p in patterns), "ProtectedPaths")
         self._extra_keys = frozenset(k.casefold() for k in extra_keys)
         self._root: Path | None = None
         if root is not None:
@@ -150,16 +166,145 @@ DEFAULT_SECRET_PATTERNS: tuple[tuple[str, str], ...] = (
     ("private_key", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
     (
         "api_token",
-        r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{20,}|(?<!-)sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}"
-        r"|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}"
-        r"|AIza[A-Za-z0-9_-]{35}|npm_[A-Za-z0-9]{30,}|pypi-AgE[A-Za-z0-9_-]{30,}|[sr]k_live_[A-Za-z0-9]{16,})",
+        r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{20,}"
+        r"|(?<!-)sk-proj-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-ant-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-svcacct-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-admin-[A-Za-z0-9_-]{20,}"
+        r"|(?<!-)sk-[A-Za-z0-9]{20,}"
+        r"|gh[pousr]_[A-Za-z0-9]{20,}"
+        r"|github_pat_[A-Za-z0-9_]{20,}"
+        r"|glpat-[A-Za-z0-9_-]{20,}"
+        r"|xox[baprs]-[A-Za-z0-9-]{10,}"
+        r"|AIza[A-Za-z0-9_-]{35}"
+        r"|npm_[A-Za-z0-9]{30,}"
+        r"|pypi-AgE[A-Za-z0-9_-]{30,}"
+        r"|[sr]k_live_[A-Za-z0-9]{16,})",
     ),
     ("aws_access_key", r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Za-z0-9])"),
     ("auth_bearer", r"(?i:\bBearer\s+)[A-Za-z0-9._~+/=-]{20,}"),
     ("auth_basic", r"(?i:\bAuthorization:\s*Basic\s+)[A-Za-z0-9+/=]{8,}"),
     ("jwt", r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
     ("url_credentials", r"\b[a-zA-Z][a-zA-Z0-9+.-]{0,31}://[^/\s:@]+:[^/\s:@]+@[^\s/]+"),
+    ("sendgrid_key", r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b"),
+    ("twilio_key", r"\b(?:SK|AC)[0-9a-fA-F]{32}\b"),
+    ("slack_webhook", r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+"),
+    ("azure_connection_string", r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{40,}"),
 )
+
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_SECRET_FIELD_KEY = re.compile(
+    r"(?:^|[^a-z])(?:pass(?:word)?|secret|token|api_?key|auth_?token|client_?secret|access_?token)s?(?:$|[^a-z])"
+)
+
+
+def _key_words(key: str) -> str:
+    """A field name as lower-case words (`dbPassword` becomes `db_password`): one pattern covers both spellings."""
+    return _CAMEL_BOUNDARY.sub("_", key).casefold()
+
+
+def _is_secret_key(key: str) -> bool:
+    """True for field names such as `password`, `api_key`, `dbPassword`, or `refreshToken`."""
+    return _SECRET_FIELD_KEY.search(_key_words(key)) is not None
+
+
+_ASSIGNMENT_REGEX = re.compile(
+    # A word ending in a credential name (`db_password`, `dbPassword`), an optional closing quote (JSON), `=` or `:`
+    r"""\b(?i:[a-z0-9_]*(?:password|secret|token|api_?key|client_?secret|access_?token))['"]?\s*[:=]\s*['"]?([^\s'"]{8,})['"]?"""
+)
+_PLACEHOLDER_WORDS = frozenset(
+    {"changeme", "example", "placeholder", "dummy", "test", "none", "null", "admin", "password", "secret", "token"}
+)
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    total = len(s)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _is_placeholder(val: str) -> bool:
+    s = val.strip().casefold()
+    if s in _PLACEHOLDER_WORDS:
+        return True
+    return bool(
+        (s.startswith("${") and s.endswith("}")) or (s.startswith("<") and s.endswith(">")) or s.startswith("***")
+    )
+
+
+def _looks_like_secret(value: str) -> bool:
+    """A value that is no placeholder, is long enough, and has enough variety to be a credential."""
+    return not _is_placeholder(value) and len(value) >= 8 and _shannon_entropy(value) >= 2.5
+
+
+def _find_assignment_secret(text: str) -> str | None:
+    if "=" not in text and ":" not in text:  # cheap: an assignment needs one of them
+        return None
+    for match in _ASSIGNMENT_REGEX.finditer(text):
+        if _looks_like_secret(match.group(1)):
+            return "assignment"
+    return None
+
+
+_BASE64_CANDIDATE = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{16,}=*")
+"""A whole base64 run with any `=` after it. One start per run and no lookahead keep the search linear.
+A `=` before the run is allowed: `key=<base64>` is the common case."""
+_HEX_CANDIDATE = re.compile(r"\b[0-9a-fA-F]{32,}\b")
+_PERCENT_ESCAPE = re.compile(r"%[0-9a-fA-F]{2}")
+_PRINTABLE_RUN = re.compile(rb"[\t\n\r\x20-\x7e]{12,}")
+_DECODE_BUDGET = 50_000
+"""Characters of decoded text that `decode=True` scans per text, so a large input cannot make the scan slow."""
+
+
+def _printable_runs(raw: bytes) -> Iterator[str]:
+    """The readable stretches of `raw` (12 characters or more). Binary data, such as a hash, has none."""
+    for run in _PRINTABLE_RUN.findall(raw):
+        yield run.decode("ascii")
+
+
+def _decode_base64(candidate: str) -> Iterator[str]:
+    """Readable text in a base64 run, decoded at each of the 4 offsets.
+
+    A path before the data is made of base64 characters too (`example/api/v1/upload/<base64>`): it is part of the run
+    and moves the 4-character blocks. The path only turns into a few garbage bytes in front of the data, which
+    `_printable_runs` drops, so the data is found at the offset where its blocks line up. The `/` that ends the
+    path decodes to a byte that is never a letter or digit, so it cannot hide the start of a token.
+    """
+    for offset in range(4):
+        core = candidate[offset:].rstrip("=")  # lenient decoders accept missing or extra padding, so the check does too
+        try:
+            raw = base64.b64decode(core + "=" * (-len(core) % 4), validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        yield from _printable_runs(raw)
+
+
+def _decoded_texts(text: str) -> Iterator[str]:
+    """The text that one step of URL, base64, or hex decoding reveals in `text`."""
+    if _PERCENT_ESCAPE.search(text):
+        unquoted = urllib.parse.unquote(text)
+        if unquoted != text:
+            yield unquoted
+    for match in _BASE64_CANDIDATE.finditer(text):
+        yield from _decode_base64(match.group(0))
+    for match in _HEX_CANDIDATE.finditer(text):
+        digits = match.group(0)
+        if len(digits) % 2 == 0:
+            yield from _printable_runs(bytes.fromhex(digits))
+
+
+def _decode_and_scan(text: str, scanner: Callable[[str], str | None]) -> str | None:
+    """Scans what `_decoded_texts` finds, once, up to `_DECODE_BUDGET` characters in all."""
+    pieces: list[str] = []
+    left = _DECODE_BUDGET
+    for piece in _decoded_texts(text):
+        pieces.append(piece[:left])
+        left -= len(pieces[-1])
+        if left <= 0:
+            break
+    return scanner("\n".join(pieces)) if pieces else None
 
 
 class SecretGuard(Hook):
@@ -176,16 +321,32 @@ class SecretGuard(Hook):
         *,
         check_user_input: bool = False,
         check_model_output: bool = True,
+        assignments: bool = False,
+        decode: bool = False,
     ) -> None:
-        compiled = tuple((name, re.compile(expr)) for name, expr in patterns)
-        if not compiled:
-            raise ValueError("SecretGuard requires at least one pattern")
-        self._patterns = compiled
+        listed = _at_least_one(tuple(patterns), "SecretGuard")
+        self._patterns = tuple((name, re.compile(expr)) for name, expr in listed)
         self._check_user_input = check_user_input
         self._check_model_output = check_model_output
+        self._assignments = assignments
+        self._decode = decode
 
     def find_secret(self, text: str) -> str | None:
         """Returns the category name of the first detected secret in `text`, or `None`."""
+        direct = self._find_secret_direct(text)
+        if direct is not None:
+            return direct
+        if self._assignments:
+            assigned = _find_assignment_secret(text)
+            if assigned is not None:
+                return assigned
+        if self._decode:
+            decoded = _decode_and_scan(text, self._find_secret_direct)
+            if decoded is not None:
+                return decoded
+        return None
+
+    def _find_secret_direct(self, text: str) -> str | None:
         for name, pattern in self._patterns:
             if pattern.search(text) is not None:
                 return name
@@ -198,45 +359,65 @@ class SecretGuard(Hook):
             cleaned = pattern.sub(replacement, cleaned)
         return cleaned
 
+    def _check(self, texts: Iterable[str], blocked: str) -> Decision:
+        """Blocks with `blocked` and the category of the first secret found in `texts` (never the secret itself)."""
+        for text in texts:
+            kind = self.find_secret(text)
+            if kind is not None:
+                return Decision.block(f"{blocked}: contains potential secret ({kind})")
+        return CONTINUE
+
     async def on_user_input(self, state: RunState, text: str) -> Decision:
         if not self._check_user_input:
             return CONTINUE
-        kind = self.find_secret(text)
-        if kind is not None:
-            return Decision.block(f"User input blocked: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([text], "User input blocked")
 
     async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
         if not self._check_model_output:
             return CONTINUE
-        kind = self.find_secret(response.message.text)
-        if kind is not None:
-            return Decision.block(f"Model response blocked: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([response.message.text], "Model response blocked")
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        for value in _all_strings(invocation.args.model_dump()):
-            kind = self.find_secret(value)
-            if kind is not None:
-                return Decision.block(f"Tool arguments blocked: contains potential secret ({kind})")
-        return CONTINUE
+        args = invocation.args.model_dump(mode="json")
+        if self._assignments:
+            for key, value, is_dict_key in _walk_strings(args):
+                if key and value and not is_dict_key and _is_secret_key(key) and _looks_like_secret(value):
+                    return Decision.block("Tool arguments blocked: contains potential secret (assignment)")
+        return self._check(_all_strings(args), "Tool arguments blocked")
 
     async def after_tool(self, state: RunState, invocation: ToolInvocation, result: ToolResult) -> Decision:
-        kind = self.find_secret(result.content)
-        if kind is not None:
-            return Decision.block(f"Tool output withheld: contains potential secret ({kind})")
-        return CONTINUE
+        return self._check([result.content], "Tool output withheld")
 
 
-_URL_IN_TEXT = re.compile(
-    r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]+[^\s<>()\"'\]]*"
-    r"|\bmailto:[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"
-    r"|\bdata:(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"
-    r"|\bjavascript:[^\s<>()\"'\]]+"
+_WHATWG_SPECIAL_SCHEMES: tuple[str, ...] = ("https", "http", "wss", "ws", "ftp", "file")
+
+
+_OPAQUE_URL_BRANCHES: tuple[tuple[str, str], ...] = (
+    # (marker, branch) for URLs without a slash after the scheme; each branch starts with its marker in any case
+    ("mailto:", r"\b(?ai:mailto):[^\s<>()\"'\]@]*@[^\s<>()\"'\]]*"),
+    ("data:", r"\b(?ai:data):(?:[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+|[;,])[^\s<>()\"'\]]*"),
+    ("javascript:", r"\b(?ai:javascript):[^\s<>()\"'\]]+"),
 )
+
+
+def _build_url_patterns() -> tuple[re.Pattern[str], tuple[str, ...]]:
+    """`_URL_IN_TEXT` and its quick pre-check `_URL_MARKERS` from one table, so they cannot drift apart."""
+    special = "|".join(_WHATWG_SPECIAL_SCHEMES)
+    branches = (
+        # Schemes are case-insensitive in ASCII (WHATWG): `HTTPS:/host` is a URL with a host, like `https://host`
+        rf"\b(?ai:{special}):[/\\]+[^\s<>()\"'\]]*",
+        r"\b[a-zA-Z][a-zA-Z0-9+.-]{1,31}:[/\\]{2,}[^\s<>()\"'\]]*",
+        *(branch for _, branch in _OPAQUE_URL_BRANCHES),
+    )
+    # The first two branches always contain `:/` or `:\`; the others start with their marker
+    markers = (":/", ":\\", *(marker for marker, _ in _OPAQUE_URL_BRANCHES))
+    return re.compile("|".join(branches)), markers
+
+
+_URL_IN_TEXT, _URL_MARKERS = _build_url_patterns()
+"""Every `_URL_IN_TEXT` match contains one of these once the text is lower-cased: text without them has no URL."""
 _TRAILING_PUNCT = ".,;:!?'\")"
 _URL_KEY_WORD = re.compile(r"(?:^|[^a-z])(?:url|uri|href|endpoint|webhook)s?(?:$|[^a-z])")
-_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _HOST_CHARS = re.compile(r"[a-z0-9.-]+")
 
 
@@ -244,7 +425,25 @@ def _is_url_key(key: str | None, extra: frozenset[str]) -> bool:
     if key is None:
         return False
     folded = key.casefold()
-    return folded in extra or _URL_KEY_WORD.search(_CAMEL_BOUNDARY.sub("_", key).casefold()) is not None
+    return folded in extra or _URL_KEY_WORD.search(_key_words(key)) is not None
+
+
+def _is_url_typed_field(annotation: Any) -> bool:
+    if annotation is None:
+        return False
+    candidates = [annotation, *get_args(annotation)]
+    for cand in candidates:
+        if isinstance(cand, type) and (issubclass(cand, AnyUrl) or "url" in cand.__name__.casefold()):
+            return True
+    return False
+
+
+@functools.lru_cache(maxsize=256)
+def _url_field_names(model: type[BaseModel]) -> frozenset[str]:
+    """Lower-case names of the fields of `model` that are typed as URLs. It depends on the class only."""
+    return frozenset(
+        name.casefold() for name, info in model.model_fields.items() if _is_url_typed_field(info.annotation)
+    )
 
 
 class EgressGuard(Hook):
@@ -269,6 +468,7 @@ class EgressGuard(Hook):
         allow_http: bool = False,
         check_model_output: bool = True,
         url_keys: Iterable[str] = (),
+        ignore_keys: Iterable[str] = (),
     ) -> None:
         if isinstance(allowed_domains, str):
             raise ConfigError("EgressGuard: allowed_domains must be a list of domains, not a single string")
@@ -276,6 +476,7 @@ class EgressGuard(Hook):
         self._allow_http = allow_http
         self._check_model_output = check_model_output
         self._url_keys = frozenset(k.casefold() for k in url_keys)
+        self._ignore_keys = frozenset(k.casefold() for k in ignore_keys)
 
     def check_url(self, url: str) -> str | None:
         """Returns `None` if `url` is allowed, or a concise reason string if blocked."""
@@ -307,6 +508,9 @@ class EgressGuard(Hook):
 
     def check_text(self, text: str) -> str | None:
         """Scans `text` for URLs and returns the first violation reason, or `None`."""
+        lowered = text.lower()  # ASCII letters keep their place, so a scheme in any case shows its marker
+        if not any(marker in lowered for marker in _URL_MARKERS):  # cheap: most text holds no URL at all
+            return None
         for match in _URL_IN_TEXT.finditer(text):
             raw_url = match.group(0).rstrip(_TRAILING_PUNCT)
             reason = self.check_url(raw_url)
@@ -315,15 +519,25 @@ class EgressGuard(Hook):
         return None
 
     async def before_tool(self, state: RunState, invocation: ToolInvocation) -> Decision:
-        for key, value, is_dict_key in _walk_strings(invocation.args.model_dump()):
+        url_fields = _url_field_names(type(invocation.args))
+        for key, value, is_dict_key in _walk_strings(invocation.args.model_dump(mode="json")):
             if not value:
                 continue
-            if not is_dict_key and _is_url_key(key, self._url_keys):
+            key_fold = key.casefold() if key else ""
+            is_ignored = key_fold in self._ignore_keys
+            is_strict_url = (
+                not is_dict_key and not is_ignored and (key_fold in url_fields or _is_url_key(key, self._url_keys))
+            )
+            if is_strict_url:
                 reason = self.check_url(value)
+                if reason is not None:
+                    return Decision.block(f"Outbound URL blocked: {reason}")
             else:
                 reason = self.check_text(value)
-            if reason is not None:
-                return Decision.block(f"Outbound URL blocked: {reason}")
+                if reason is not None:
+                    if is_ignored and key:
+                        return Decision.block(f"Outbound URL blocked in field '{key}': {reason}")
+                    return Decision.block(f"Outbound URL blocked: {reason}")
         return CONTINUE
 
     async def after_model(self, state: RunState, response: ModelResponse) -> Decision:
@@ -368,6 +582,15 @@ DEFAULT_WEAKENING_PATTERNS: tuple[str, ...] = (
     r"\bunittest\.skip(?:If|Unless)?\b",
     r"//\s*@ts-(?:ignore|nocheck|expect-error)\b",
     r"\bsys\.exit\s*\(\s*0\s*\)",
+    r"eslint-disable\b",
+    r"//\s*nolint\b",
+    r"#\[allow\(",
+    r"#\[ignore\]",
+    r"@SuppressWarnings\b",
+    r"@Disabled\b",
+    r"\b(?:it|describe)\.skip\s*\(",
+    r"\bxit\s*\(",
+    r"\bt\.Skip(?:Now|f)?\s*\(",
 )
 
 
@@ -375,10 +598,7 @@ class WeakeningGuard(Hook):
     """Prevents write tools from inserting directives that silence linters, typecheckers, or tests."""
 
     def __init__(self, patterns: Iterable[str] = DEFAULT_WEAKENING_PATTERNS) -> None:
-        compiled = tuple(re.compile(p, re.IGNORECASE) for p in patterns)
-        if not compiled:
-            raise ValueError("WeakeningGuard requires at least one pattern")
-        self._patterns = compiled
+        self._patterns = _at_least_one(tuple(re.compile(p, re.IGNORECASE) for p in patterns), "WeakeningGuard")
 
     def check_text(self, text: str) -> str | None:
         """Returns the first matched check-weakening directive in `text`, or `None`."""

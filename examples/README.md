@@ -50,7 +50,7 @@ and cannot be combined with `--resume`.
 - Run it on a folder you are comfortable showing to the model provider: file contents you let it read are sent to the API.
 - `.env` files are git-ignored in this repository and denied to the agent. Still, keep keys in your shell environment or a
   secrets manager, not in the project folder you point `--root` at.
-- This is an example, not a hardened product. For real deployments read the production checklist in the main README.
+- This is an example, not a hardened product. For real deployments read [`docs/production-checklist.md`](../docs/production-checklist.md).
 
 ## Adapting it
 
@@ -58,3 +58,18 @@ and cannot be combined with `--resume`.
 including input validation and a risk level), the autonomy level, the limits, and the checkpoint store. `run_question()`
 and `resume_run()` show how to drive a run that pauses for a human; replace `input()` with a button in your own UI and send
 back the `pending_id` that was shown with the request.
+
+---
+
+## `incident_responder.py` — on-call agent for alert diagnosis and approved rollback
+
+A complete incident responder:
+- **Stage 1 (`Autonomy.READ_ONLY`):** Safe automated diagnosis (`query_logs`, `get_metrics`, `recent_deploys`).
+- **Stage 2 (`Autonomy.ACT_WITH_APPROVAL`):** Remediation (`rollback_deploy`, `Risk.IRREVERSIBLE`) with mandatory on-call review.
+- **Sensitive credentials:** Passed exclusively via runtime `deps` (`DeployClient`), never serialized into checkpoints.
+- **Emergency stop:** `build_incident_agent(..., freeze_file=...)` wires a `KillSwitch` to a freeze file (the demo does not use it).
+- **Persistence:** Uses `SqliteCheckpointStore`.
+
+```bash
+python examples/incident_responder.py --demo    # offline demonstration of Stage 1 & Stage 2
+```

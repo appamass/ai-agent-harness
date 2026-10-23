@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from ai_agent_harness import ContextBuilder, Limits, RunState, start
-from ai_agent_harness.core import ConfigError, Event, EventType
+from ai_agent_harness import ContextBuilder, Limits, Risk, RunState, restore_state, start, stream_start, tool
+from ai_agent_harness.core import ConfigError, Event, EventType, SchemaVersionError
 from ai_agent_harness.observability import log_listener
 from ai_agent_harness.persistence import JsonFileCheckpointStore
 from ai_agent_harness.testing import text_response
@@ -116,3 +116,30 @@ def test_unusable_checkpoint_directory_is_config_error(tmp_path: Path) -> None:
     blocker.write_text("x", encoding="utf-8")
     with pytest.raises(ConfigError):
         JsonFileCheckpointStore(blocker / "subdir")
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 0, -1, True])
+def test_a_tool_timeout_must_be_a_finite_positive_number(timeout: float) -> None:
+    with pytest.raises(ConfigError, match="timeout_s"):
+        tool(risk=Risk.READ, timeout_s=timeout)(_noop)
+
+
+@pytest.mark.parametrize("idle_timeout", [float("nan"), float("inf"), 0])
+def test_a_stream_idle_timeout_must_be_a_finite_positive_number(idle_timeout: float) -> None:
+    agent, _, _ = make_agent([text_response("hi")])
+    with pytest.raises(ConfigError, match="idle_timeout_s"):
+        stream_start(agent, "hi", idle_timeout_s=idle_timeout)
+
+
+def _noop() -> str:
+    """Does nothing."""
+    return "ok"
+
+
+def test_huge_integers_are_valid_positive_numbers() -> None:
+    assert tool(risk=Risk.READ, timeout_s=10**400, max_result_chars=10**400)(_noop).timeout_s == 10**400
+
+
+def test_a_huge_schema_version_is_a_schema_version_error() -> None:
+    with pytest.raises(SchemaVersionError):
+        restore_state('{"schema_version": ' + "9" * 400 + "}")

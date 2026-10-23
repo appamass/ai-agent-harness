@@ -31,18 +31,32 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .errors import InvalidStateError, ProtocolError, SchemaVersionError
-from .types import ID_PATTERN, Block, Message, TextBlock, ToolCall, ToolResult, Usage
+from .types import (
+    ID_PATTERN,
+    Block,
+    Message,
+    TextBlock,
+    ToolCall,
+    ToolResult,
+    Usage,
+    canonical_digest,
+    is_positive_number,
+)
 
 CONTINUE_PROMPT = (
     "Your response was truncated due to the length limit. Continue from the exact point where you stopped."
 )
 """User prompt sent by the runner to continue a truncated response (`StopReason.MAX_TOKENS`)."""
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 """Current version of the serialized state. Increment on every schema change (ADR 0010).
 
 History: 1 — initial version. 2 — `batch_done`, cache/reasoning tokens in `usage`,
-`ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012).
+`ThinkingBlock.provider_id`, `ToolCall.arguments_error` (ADR 0012). 3 — `output_schema`,
+`output_model_name`, `output` for structured final output (ADR 0023). 4 — `output_schema_digest` replaces
+`output_schema`: the stored schema only detected a changed model, so its digest is enough. 5 — `context_floor` and the
+token measurement (`measured_provider_id`, `measured_chars`, `measured_prompt_tokens`) for context compaction and the
+calibrated token estimate (ADR 0026).
 """
 
 Migration = Callable[[dict[str, Any]], dict[str, Any]]
@@ -56,7 +70,26 @@ def _v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2}
+def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """v3 adds `output_schema`, `output_model_name`, and `output` with None defaults (ADR 0023)."""
+    return data
+
+
+def _v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
+    """v4 stores the digest of the output model's JSON schema instead of the schema itself (ADR 0023)."""
+    schema = data.pop("output_schema", None)
+    if schema is not None and not isinstance(schema, dict):  # v3 rejected this too: never load it as unbound
+        raise SchemaVersionError("Saved state has an invalid output_schema")
+    data["output_schema_digest"] = canonical_digest(cast("dict[str, Any]", schema)) if schema is not None else None
+    return data
+
+
+def _v4_to_v5(data: dict[str, Any]) -> dict[str, Any]:
+    """v5 adds `context_floor` (0 = nothing cleared) and the token measurement (no measurement) (ADR 0026)."""
+    return data
+
+
+MIGRATIONS: dict[int, Migration] = {1: _v1_to_v2, 2: _v2_to_v3, 3: _v3_to_v4, 4: _v4_to_v5}
 """Migrations from version n to n+1, keyed by n."""
 
 
@@ -97,6 +130,7 @@ class PendingBatch(BaseModel):
 
 
 DepsT = TypeVar("DepsT")
+OutputT = TypeVar("OutputT", bound=BaseModel)
 
 
 def _now() -> datetime:
@@ -118,6 +152,27 @@ class RunState(BaseModel):
     batch_done: tuple[ToolResult, ...] = Field(
         default=(),
         description="Completed results of the current tool batch — survive a crash (write-ahead)",
+    )
+    output_schema_digest: str | None = Field(
+        default=None, description="`canonical_digest` of the output model's JSON schema (ADR 0023)"
+    )
+    output_model_name: str | None = Field(default=None, description="Class name of required output_model (ADR 0023)")
+    output: dict[str, Any] | None = Field(
+        default=None, description="Validated structured final output as JSON-safe dictionary (ADR 0023)"
+    )
+    context_floor: int = Field(
+        default=0,
+        ge=0,
+        description="Messages before this index show old tool results as a placeholder in the model's view (ADR 0026)",
+    )
+    measured_provider_id: str | None = Field(
+        default=None, description="Provider that reported `measured_prompt_tokens` (ADR 0026)"
+    )
+    measured_chars: int = Field(
+        default=0, ge=0, description="Size in characters of the request behind `measured_prompt_tokens`"
+    )
+    measured_prompt_tokens: int = Field(
+        default=0, ge=0, description="Prompt tokens a provider reported for the last request; 0 = no measurement"
     )
     step: int = Field(default=0, ge=0, description="Number of model calls across the entire run")
     consecutive_retries: int = Field(default=0, ge=0)
@@ -186,6 +241,33 @@ class RunState(BaseModel):
             parts.append(msgs[index].text)
         return "".join(reversed(parts))  # continuation resumes at the exact cutoff point
 
+    def output_as(self, model: type[OutputT]) -> OutputT:
+        """Returns the structured final output validated as `model`.
+
+        Raises `InvalidStateError` if the run produced no structured output.
+        """
+        if self.output is None:
+            raise InvalidStateError(f"Run has no structured output (status: {self.status})")
+        return model.model_validate(self.output)
+
+    @classmethod
+    def standalone(cls) -> RunState:
+        """A throwaway state for bricks used outside a run (`ToolExecutor`, `HookPipeline`)."""
+        return cls(agent_name="standalone")
+
+    def record_result(self, result: ToolResult) -> None:
+        """Adds a finished result of the current batch (persisted in the checkpoint before the batch ends)."""
+        self.batch_done = (*self.batch_done, result)
+
+    def clear_output(self) -> None:
+        """Drops the structured output of an earlier turn before the run continues."""
+        self.output = None
+
+    def set_output(self, output: BaseModel) -> None:
+        """Stores a validated structured output as a JSON-safe dict. Read it back with `output_as(model)`."""
+        self.output = output.model_dump(mode="json")
+        self._touch()
+
     @property
     def pending_id(self) -> str | None:
         """Identifies the current pause; `None` when the run is not waiting (ADR 0014).
@@ -249,16 +331,51 @@ class RunState(BaseModel):
         self.messages.append(Message(role="user", content=tuple(blocks)))
         self._touch()
 
-    def close_open_tool_calls(self, reason: str, known: Sequence[ToolResult] = ()) -> None:
-        """Answer open calls: keep known results and fill the rest as errors with `reason`."""
+    def close_open_tool_calls(self, reason: str, known: Sequence[ToolResult] = (), text: str | None = None) -> None:
+        """Answer open calls: keep known results and fill the rest as errors with `reason`. `text` rides along."""
         calls = self.open_tool_calls()
         if not calls:
             return
         by_id = {r.call_id: r for r in known}
         results = [by_id.get(c.id) or ToolResult(call_id=c.id, content=reason, is_error=True) for c in calls]
-        self.add_tool_results(results)
+        self.add_tool_results(results, text=text)
+
+    def raise_context_floor(self, floor: int) -> None:
+        """Clears old tool results in the model's view up to message `floor`. Only a higher value is accepted.
+
+        `messages` stays as it is; only the view built for the model changes (ADR 0026). The token measurement
+        no longer fits the smaller view and is dropped.
+        """
+        if floor <= self.context_floor or floor > len(self.messages):
+            raise ProtocolError(
+                f"Invalid context floor {floor} (now {self.context_floor}, {len(self.messages)} messages)"
+            )
+        self.context_floor = floor
+        self.forget_measurement()
+
+    def record_measurement(self, provider_id: str, chars: int, prompt_tokens: int) -> None:
+        """Keeps what `provider_id` reported for a request of `chars` characters (ADR 0026).
+
+        A report of another provider than before (failover), or without tokens, drops the measurement instead:
+        the token estimate is then based on the size alone until the next report.
+        """
+        previous = self.measured_provider_id
+        if prompt_tokens <= 0 or (previous is not None and previous != provider_id):
+            self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = provider_id, 0, 0
+        else:
+            self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = (
+                provider_id,
+                chars,
+                prompt_tokens,
+            )
+
+    def forget_measurement(self) -> None:
+        """Drops the token measurement: the next estimate is based on the size alone."""
+        self.measured_provider_id, self.measured_chars, self.measured_prompt_tokens = None, 0, 0
 
     def set_status(self, status: RunStatus, reason: str | None = None) -> None:
+        if status is not RunStatus.DONE:
+            self.clear_output()  # a structured output belongs to a run that ended as done, never to anything else
         self.status = status
         self.status_reason = reason
         self._touch()
@@ -276,6 +393,8 @@ class RunState(BaseModel):
                 got = [r.call_id for r in msg.tool_results]
                 if set(got) != prev_calls:
                     raise ProtocolError(f"Message {i}: tool results do not match the preceding tool calls")
+        if self.context_floor > len(self.messages):
+            raise ProtocolError(f"Context floor {self.context_floor} is beyond the {len(self.messages)} messages")
         open_calls = self.open_tool_calls()
         if open_calls and not (self.status == RunStatus.RUNNING or self.status.is_waiting):
             raise ProtocolError(f"Finished run ({self.status}) has unanswered tool calls")
@@ -311,7 +430,7 @@ def restore_state(raw: str | bytes, *, tenant_id: str | None = None, run_id: str
         raise SchemaVersionError("Saved state is not a JSON object")
     fields = cast("dict[str, Any]", data)
     version = fields.get("schema_version", 1)  # states before schema versioning = version 1
-    if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+    if not is_positive_number(version, integer=True):
         raise SchemaVersionError(f"Invalid schema version: {version!r}")
     if version > SCHEMA_VERSION:
         raise SchemaVersionError(

@@ -3,7 +3,7 @@
 **A small Python harness for AI agents where the model proposes and your code decides.**
 
 It runs the agent loop and enforces the rules around it. Every run ends with a status. Tools run only through one gate. Irreversible actions
-always wait for a human. State survives crashes and several workers. Nothing sensitive leaks into logs.
+never run without a human. State survives crashes and several workers. Events carry only metadata.
 You bring the model, the tools, and the policy.
 
 ## Try it in 30 seconds (no API key, no cost)
@@ -43,13 +43,21 @@ With a real model: `pip install -e ".[anthropic]"`, `export ANTHROPIC_API_KEY=..
 ## What you get
 
 - **Every run ends with a status** (`done`, `blocked`, `failed`, `waiting_for_approval`, ...), even on outages, broken hooks, or cancellation.
-- **Humans stay in control:** an irreversible tool call always pauses the run, and so does a write at the `suggest` and `act_with_approval` levels
-  (the default, `read_only`, denies writes). The approval is tied to the exact request that was shown, so an old dialog can never approve a later action.
+- **Humans stay in control:** an irreversible tool call never runs without approval (it is denied below `act_with_approval` and pauses the run above),
+  and so does a write at the `suggest` and `act_with_approval` levels (the default, `read_only`, denies writes). The approval is tied to the exact request that was shown, so an old dialog can never approve a later action.
 - **Guardrails fail closed:** a check that crashes blocks the action. It never lets it through by accident.
-- **Crash-safe, several workers:** state is saved before every tool call, in a file or in PostgreSQL, and two workers cannot resume the same run.
+- **Crash-safe, several workers:** state is saved before every tool call, in a file, SQLite, or PostgreSQL, and two workers cannot resume the same run.
   An approval can arrive days later in another process.
 - **Safe logs:** events carry only metadata, never prompts, arguments, or results. Limits on steps, tokens, and time, and a kill switch, hold across restarts.
-- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 16 guarantees and the test for each, including a test that injects random failures.
+- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 20 guarantees and the test for each, including a test that injects random failures.
+
+## How to use this
+
+An executable specification and reference implementation of an agent loop with enforced guarantees. Everyone is welcome to use it, whether as a whole or just for a snippet. The guarantees are enforced by tests; from v1 on, the code base is not promised to stay small or easy to audit in full.
+
+- **Use:** As a pinned Git dependency for pure Python services needing crash safety, optimistic locking, and human approval. We deliberately do not publish to PyPI ([ADR 0013](docs/adr/0013-package-distribution.md)).
+- **Copy:** Use or copy standalone bricks (`ToolExecutor`, `@tool(risk=…)`, `SecretGuard`, `RunState`; copy them together with `core/` and `policy.py`) ([ADR 0019](docs/adr/0019-modular-bricks-and-security-guards.md)).
+- **Rebuild:** Apply our core invariants (bound `pending_id`, write-ahead checkpoints, outcome-unknown on crash) in LangGraph, Pydantic AI, or custom loops via [`ai-kit/`](ai-kit/skills/ai-agent-harness/SKILL.md).
 
 ## Hello agent
 
@@ -98,13 +106,13 @@ agent = Agent(name="demo", router=ModelRouter(AnthropicProvider("claude-haiku-5-
 
 | Part | Included | You bring |
 |---|---|---|
-| Models | `AnthropicProvider` (Claude), a router with retries, a timeout, and fallback models, `FakeProvider` for tests | Adapters for other providers (a small contract, one reference adapter) |
+| Models | `AnthropicProvider` (Claude), `OpenAIProvider` (GPT/Ollama/vLLM), router with retries, timeout, and fallback models, `FakeProvider` for tests | Adapters for other providers (a small contract, reference adapters) |
 | Tools | `AskUser`, `ReadFile` (secrets denied by default), `@tool(risk=…)` for plain functions, the execution gate (also usable alone), approvals | Your tools: a Pydantic model, a risk level, a timeout |
 | Guardrails | `ProtectedPaths`, `SecretGuard`, `EgressGuard`, `WeakeningGuard`, `KillSwitch`, fail-closed hooks (pattern checks, see [limits](docs/known-limitations.md#built-in-guards-are-heuristics)) | Your policies as `Hook` classes |
-| State | In-memory, file (POSIX), and PostgreSQL stores with `list_runs` and deletion | Encryption, retention, and access rules for your data |
-| Operations | Metadata events, `log_listener`, `Limits`, crash recovery | Tracing, cost tracking, your UI for approvals |
+| State | In-memory, file (POSIX), SQLite (stdlib), and PostgreSQL stores with `list_runs`, retention purge, and `AesGcmCodec` | Keys, retention intervals, and access rules for your data |
+| Operations | Metadata events, `log_listener`, `OpenTelemetryListener`, `Limits`, crash recovery | Your trace backend, cost tracking, your UI for approvals |
 
-Not built yet: streaming, MCP, structured final output, parallel tool calls ([`docs/next-steps.md`](docs/next-steps.md)).
+Context compaction, parallel read tools, streaming, MCP, and structured output exist; read their [limits](docs/known-limitations.md#streaming-structured-output-mcp) first.
 
 ## Install
 
@@ -112,7 +120,8 @@ Not built yet: streaming, MCP, structured final output, parallel tool calls ([`d
 pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.7.0"
 ```
 
-Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[postgres]` (PostgreSQL store).
+Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[openai]` (OpenAI/compat), `[postgres]` (PostgreSQL store), `[encryption]` (AES-256-GCM), `[opentelemetry]` (tracing).
+The OpenAI adapter, SQLite store, streaming, MCP, structured output, and OpenTelemetry ship with the next tag; `v0.7.0` does not have them.
 Pin a release tag (for example `@v0.7.0`) and commit your lockfile: before 1.0, a minor version may contain breaking changes ([`CHANGELOG.md`](CHANGELOG.md)).
 What has been run against a real model, and what has not: [`docs/known-limitations.md`](docs/known-limitations.md).
 
@@ -121,18 +130,15 @@ What has been run against a real model, and what has not: [`docs/known-limitatio
 | Read | When |
 |---|---|
 | [`docs/guide.md`](docs/guide.md) | You want to build: tools, guardrails, providers, stores (tested examples) |
-| [`docs/how-it-works.md`](docs/how-it-works.md) | You want to understand the run loop, statuses, the gate, and the code map |
 | [`docs/guarantees.md`](docs/guarantees.md) | You want proof: every guarantee and the test behind it |
-| [`docs/use-cases/`](docs/use-cases/README.md) | You want full scenarios: assistant with a bank account, coding agents, support, incident responder |
-| [`docs/first-real-run.md`](docs/first-real-run.md) | You connect a real model for the first time |
-| [`docs/production-checklist.md`](docs/production-checklist.md) · [`docs/known-limitations.md`](docs/known-limitations.md) · [`SECURITY.md`](SECURITY.md) | You go to production |
-| [`docs/adr/`](docs/adr/README.md) · [`docs/next-steps.md`](docs/next-steps.md) · [`HARNESS_TAXONOMY.md`](HARNESS_TAXONOMY.md) | You want the decisions, the roadmap, and the concepts |
-| [`llms.txt`](llms.txt) · [`AGENTS.md`](AGENTS.md) | You are an AI agent: a compact index, and the rules for changing this repository |
+| [`docs/production-checklist.md`](docs/production-checklist.md) · [`docs/known-limitations.md`](docs/known-limitations.md) | You go to production |
+| [`docs/adr/`](docs/adr/README.md) · [`HARNESS_TAXONOMY.md`](HARNESS_TAXONOMY.md) | You want the decisions and the concepts |
+| [`AGENTS.md`](AGENTS.md) | You are an AI agent, or you change this repository: invariants, commands, and working rules |
 
 ## Contributing
 
-Humans and AI coding agents are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first: every change needs a test, and the checks (`ruff`, `mypy --strict`,
-`pyright --strict`, `pytest`) must pass. Report vulnerabilities privately as described in [`SECURITY.md`](SECURITY.md).
+Humans and AI coding agents are welcome. Read [`AGENTS.md`](AGENTS.md) first: every change needs a test, and the checks (`ruff`, `mypy --strict`,
+`pyright --strict`, `pytest`) must pass. Report vulnerabilities privately through GitHub's Private Vulnerability Reporting on this repository, never in a public issue; include the affected module and version and a minimal failing test.
 
 ## License
 

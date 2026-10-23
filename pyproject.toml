@@ -1,6 +1,6 @@
 [project]
 name = "ai-agent-harness"
-version = "0.7.0"
+version = "0.8.0"
 description = "Model-agnostic Python harness for AI agents: human approval, guardrails, crash-safe runs"
 readme = "README.md"
 license = "MIT"
@@ -27,6 +27,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Topic :: Software Development :: Libraries :: Application Frameworks",
   "Typing :: Typed",
@@ -41,19 +42,32 @@ Issues = "https://github.com/appamass/ai-agent-harness/issues"
 Changelog = "https://github.com/appamass/ai-agent-harness/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-# Model provider adapter (ai_agent_harness.providers.anthropic). The core never imports it.
-anthropic = ["anthropic>=1.15,<2"]
+# Model provider adapters. The core never imports them.
+anthropic = ["anthropic>=1.15,<3"]
+openai = ["openai>=1.51,<4"]
 # Checkpoint store for several workers (ai_agent_harness.persistence_postgres). The core never imports it.
 postgres = ["psycopg[binary,pool]>=3.2,<4"]
-# cryptography only for doc tests (Use Case 01); anthropic so the adapter is type-checked and tested in CI
+# Optional checkpoint encryption (ai_agent_harness.encryption). The core never imports it.
+encryption = ["cryptography>=43,<51"]
+# adapters (anthropic, openai, psycopg) are type-checked and tested in CI; anyio runs the async tests
 dev = [
   "pytest>=8",
+  "anyio>=4",  # the async tests use its pytest plugin (`@pytest.mark.anyio`)
+  "pytest-timeout>=2",  # a hang becomes a failing test instead of a stuck run
   "mypy>=1.10",
   "pyright>=1.1.380",
   "ruff>=0.5",
-  "cryptography>=42",
-  "anthropic>=1.15,<2",
+  "anthropic>=1.15,<3",
+  "openai>=1.51,<4",
   "psycopg[binary,pool]>=3.2,<4",
+  "cryptography>=43,<51",
+  "opentelemetry-api>=1.20,<2",
+  "opentelemetry-sdk>=1.20,<2",
+]
+# OpenTelemetry listener (ai_agent_harness.observability). The core never imports it.
+opentelemetry = [
+  "opentelemetry-api>=1.20,<2",
+  "opentelemetry-sdk>=1.20,<2",
 ]
 
 [build-system]
@@ -70,6 +84,7 @@ ai_agent_harness = ["py.typed"]
 testpaths = ["tests"]
 # Tests marked "live" call a real model API and cost money: they are opt-in (`pytest -m live`), never part of a default run.
 addopts = "-ra --strict-markers -m 'not live'"
+timeout = 60
 markers = ["live: calls a real model API (needs an API key, costs money); run with `pytest -m live`"]
 filterwarnings = ["error"]
 
@@ -100,6 +115,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "PLR", "PT011", "PT018", "PLC0415", "BLE001", "TRY"]
+# Statements are built from fixed text; table names pass `sql_identifier` (ADR 0018, ADR 0020)
+"ai_agent_harness/persistence_sql.py" = ["S608"]
 
 [tool.pyright]
 include = ["ai_agent_harness", "examples", "tests"]

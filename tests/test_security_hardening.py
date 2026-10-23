@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import random
+import string
 import time
 from typing import Any, ClassVar
 
@@ -11,15 +14,9 @@ from pydantic import BaseModel, ConfigDict
 from ai_agent_harness import (
     BaseTool,
     EgressGuard,
-    Message,
-    ModelResponse,
     Risk,
     RunState,
     SecretGuard,
-    StopReason,
-    TextBlock,
-    ToolCall,
-    ToolInvocation,
     ToolRegistry,
     WeakeningGuard,
     as_untrusted,
@@ -27,8 +24,16 @@ from ai_agent_harness import (
 )
 from ai_agent_harness.core import ConfigError
 from ai_agent_harness.core.hooks import Action
+from ai_agent_harness.testing import text_response
 
-from .conftest import run_sync
+from .conftest import invocation, run_sync
+
+_FAKE_GOOGLE_KEY = "AI" + "za" + "A" * 35
+"""A made-up value in the shape of a Google API key, built at run time so source scanners do not flag the file."""
+
+
+def _b64(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
 
 
 class UrlInput(BaseModel):
@@ -40,13 +45,8 @@ class UrlInput(BaseModel):
     urls: list[str] = []
 
 
-def _invocation(args: UrlInput) -> ToolInvocation:
-    call = ToolCall(id="1", name="fetch", arguments=args.model_dump())
-    return ToolInvocation(call=call, tool_name="fetch", risk=Risk.READ, args=args)
-
-
 def _decide(guard: EgressGuard, args: UrlInput) -> Action:
-    return run_sync(guard.before_tool(RunState(agent_name="a"), _invocation(args))).action
+    return run_sync(guard.before_tool(RunState(agent_name="a"), invocation(args, name="fetch", risk=Risk.READ))).action
 
 
 class TestAsUntrustedCannotBeBrokenOut:
@@ -136,8 +136,7 @@ class TestEgressGuardParsing:
             target: str
 
         guard = EgressGuard(allowed_domains=["api.example.com"], url_keys=["target"])
-        call = ToolCall(id="1", name="fetch", arguments={"target": "evil.com/x"})
-        inv = ToolInvocation(call=call, tool_name="fetch", risk=Risk.READ, args=Custom(target="evil.com/x"))
+        inv = invocation(Custom(target="evil.com/x"), name="fetch", risk=Risk.READ)
         assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is Action.BLOCK
         plain = EgressGuard(allowed_domains=["api.example.com"])
         assert run_sync(plain.before_tool(RunState(agent_name="a"), inv)).action is Action.CONTINUE
@@ -237,6 +236,85 @@ class TestNoQuadraticBacktracking:
         assert secrets.find_secret(payload) is None
         assert time.perf_counter() - started < 1.0
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "a_" * 50_000,
+            "password=" * 12_000,
+            "A" * 20 + "===" * 30_000,
+            ("A" * 20 + "===") * 5_000,
+            "ab" * 50_000,
+            "%41" * 30_000,
+            "SG." * 30_000,
+            "https:/" * 15_000,
+            "HTTP:\\" * 15_000,
+            "x:/\\" * 25_000,
+            "DefaultEndpointsProtocol=https;AccountName=" * 2_500,
+            "hooks.slack.com/services/T" * 4_000,
+            "eslint-disable" * 7_000,
+        ],
+        ids=[
+            "identifier",
+            "assignments",
+            "padding-run",
+            "padded-chunks",
+            "hex",
+            "url-encoded",
+            "sendgrid-prefix",
+            "special-scheme",
+            "upper-scheme",
+            "mixed-slashes",
+            "azure-prefix",
+            "slack-prefix",
+            "weakening",
+        ],
+    )
+    def test_opt_in_detection_and_new_patterns_stay_fast(self, payload: str) -> None:
+        secrets = SecretGuard(assignments=True, decode=True)
+        egress = EgressGuard(allowed_domains=["api.example.com"])
+        weakening = WeakeningGuard()
+        started = time.perf_counter()
+        secrets.find_secret(payload)
+        secrets.redact(payload)
+        egress.check_text(payload)
+        weakening.check_text(payload)
+        assert time.perf_counter() - started < 1.0
+
+
+class TestCustomPatternsKeepWorking:
+    """Patterns passed by the caller are matched as written: inline flags, groups, backreferences, any name."""
+
+    def test_inline_global_flag(self) -> None:
+        guard = SecretGuard([("internal", r"(?i)corp-[a-z0-9]{8}")])
+        assert guard.find_secret("key CORP-ABCD1234") == "internal"
+        assert guard.redact("key CORP-ABCD1234") == "key [REDACTED]"
+
+    def test_same_group_name_in_two_patterns(self) -> None:
+        guard = SecretGuard([("first", r"(?P<v>aa\d)"), ("second", r"(?P<v>bb\d)")])
+        assert guard.find_secret("x bb1") == "second"
+
+    def test_numbered_backreference(self) -> None:
+        guard = SecretGuard([("first", r"(x)y"), ("doubled", r"(q)\1")])
+        assert guard.find_secret("a qq b") == "doubled"
+        assert guard.redact("a qq b") == "a [REDACTED] b"
+
+    def test_mixed_patterns_keep_the_category_of_each(self) -> None:
+        guard = SecretGuard([("plain", r"tok-[0-9]{6}"), ("grouped", r"(z)\1z")])
+        assert guard.find_secret("tok-123456") == "plain"
+        assert guard.find_secret("zzz") == "grouped"
+        assert guard.redact("tok-123456 zzz") == "[REDACTED] [REDACTED]"
+
+    def test_any_category_name(self) -> None:
+        guard = SecretGuard([("internal api-key", r"corp-[0-9]{6}"), ("2fa", r"otp-[0-9]{6}")])
+        assert guard.find_secret("otp-123456") == "2fa"
+        assert guard.find_secret("corp-123456") == "internal api-key"
+
+    def test_weakening_guard_inline_flag_and_backreference(self) -> None:
+        guard = WeakeningGuard([r"(?i)donotcheck", r"(skip)-\1"])
+        assert guard.check_text("# DoNotCheck") == "DoNotCheck"
+        assert guard.check_text("skip-skip") == "skip-skip"
+        assert guard.check_text("skip-later") is None
+
 
 class TestDigestCoversUntrustedFlag:
     def test_flag_changes_the_digest(self) -> None:
@@ -271,6 +349,19 @@ def _fake_secrets() -> dict[str, str]:
         "bearer_upper": "BEARER " + "i" * 30,
         "basic_lower": "authorization: basic dXNlcjpwYXNzd29yZDEyMw==",
         "basic_upper": "AUTHORIZATION: BASIC dXNlcjpwYXNzd29yZDEyMw==",
+        "sendgrid": "SG." + "s" * 22 + "." + "t" * 43,
+        "twilio": "SK" + "a" * 32,
+        "slack_webhook": "https://hooks.slack.com/services/T12345678/B12345678/" + "u" * 24,
+        "azure_conn": (
+            "DefaultEndpointsProtocol=https;AccountName=myacc;AccountKey="
+            + "v" * 44
+            + "==;EndpointSuffix=core.windows.net"
+        ),
+        "sk_proj": "sk-proj-" + "p" * 30,
+        "sk_ant": "sk-ant-" + "q" * 30,
+        "sk_svcacct": "sk-svcacct-" + "r" * 30,
+        "sk_admin": "sk-admin-" + "m" * 30,
+        "sk_plain": "sk-" + "n" * 30,
     }
 
 
@@ -292,6 +383,10 @@ class TestMoreSecretFormats:
             "eyJ.eyJ.x",
             "task_live_status_for_every_customer",
             "my-sk-learn-is-a-long-kebab-case-name-here",
+            "install sk-learn-model-v2-package-now",
+            "flask-routes-and-endpoints-configuration",
+            "task-runner-worker-process-pool",
+            "sk-something-long-name-here-with-hyphens",
             "pypi-publish-action-for-github-workflows-v1",
             "the bearer of this message is welcome",
         ],
@@ -300,28 +395,21 @@ class TestMoreSecretFormats:
         assert SecretGuard().find_secret(text) is None
 
 
-def _response(text: str) -> ModelResponse:
-    return ModelResponse(
-        message=Message(role="assistant", content=(TextBlock(text=text),)),
-        stop_reason=StopReason.END,
-    )
-
-
 class TestSecretGuardChecksModelOutput:
     def test_model_response_with_a_secret_is_blocked_without_echoing_it(self) -> None:
         guard = SecretGuard()
         value = _fake_secrets()["npm"]
-        decision = run_sync(guard.after_model(RunState(agent_name="a"), _response(f"Your key is {value}")))
+        decision = run_sync(guard.after_model(RunState(agent_name="a"), text_response(f"Your key is {value}")))
         assert decision.action is Action.BLOCK
         assert decision.reason is not None and value not in decision.reason
 
     def test_clean_response_continues(self) -> None:
-        decision = run_sync(SecretGuard().after_model(RunState(agent_name="a"), _response("All done.")))
+        decision = run_sync(SecretGuard().after_model(RunState(agent_name="a"), text_response("All done.")))
         assert decision.action is Action.CONTINUE
 
     def test_can_be_switched_off(self) -> None:
         guard = SecretGuard(check_model_output=False)
-        decision = run_sync(guard.after_model(RunState(agent_name="a"), _response(_fake_secrets()["npm"])))
+        decision = run_sync(guard.after_model(RunState(agent_name="a"), text_response(_fake_secrets()["npm"])))
         assert decision.action is Action.CONTINUE
 
 
@@ -342,6 +430,17 @@ class TestMoreWeakeningDirectives:
             "pytest.importorskip('numpy')",
             "// @ts-ignore",
             "// @ts-nocheck",
+            "// eslint-disable-next-line",
+            "/* eslint-disable */",
+            "// nolint:errcheck",
+            "#[allow(dead_code)]",
+            "#[ignore]",
+            '@SuppressWarnings("all")',
+            '@Disabled("reason")',
+            'describe.skip("suite", () => {})',
+            'it.skip("test", () => {})',
+            'xit("skip", () => {})',
+            't.Skip("skip reason")',
         ],
     )
     def test_directive_is_found(self, text: str) -> None:
@@ -383,3 +482,199 @@ class TestEgressGuardIgnoresCodeLookingText:
     def test_a_single_string_is_not_a_list_of_domains(self) -> None:
         with pytest.raises(ConfigError, match="allowed_domains"):
             EgressGuard(allowed_domains="api.example.com")
+
+
+class TestEgressGuardSchemeHandling:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "see note:/path/to/my/file now",
+            "path:/usr/bin",
+            "my custom scheme:/local/file",
+        ],
+    )
+    def test_non_special_single_slash_schemes_are_allowed(self, text: str) -> None:
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        assert guard.check_text(text) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "see note://evil.com/x now",
+            "see https:/evil.com/x now",
+            "see file:/etc/passwd now",
+            "see http:\\\\evil.com\\x now",
+            "see HTTPS:/evil.com/x now",
+            "see Https:\\evil.com now",
+            "see FILE:/etc/passwd now",
+            "see note:/\\evil.com now",
+            "see MAILTO:a@evil.com now",
+            "see JavaScript:alert(1) now",
+            "see Data:text/html,abc now",
+        ],
+    )
+    def test_special_or_double_slash_schemes_are_blocked(self, text: str) -> None:
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        assert guard.check_text(text) is not None
+
+    def test_ignore_keys_downgrades_field_to_check_text(self) -> None:
+        class Payload(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            url: str
+
+        guard = EgressGuard(allowed_domains=["api.example.com"], ignore_keys=["url"])
+        # Normal check_url would reject prose with https://
+        inv_ok = invocation(Payload(url="Documentation at https://api.example.com/docs"), name="call")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_ok)).action is Action.CONTINUE
+
+        # But exfiltration URL is blocked, and the reason mentions the field name
+        inv_bad = invocation(Payload(url="exfil to https://evil.example.com/steal"), name="call")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv_bad))
+        assert dec.action is Action.BLOCK
+        assert "url" in (dec.reason or "")
+
+    def test_any_url_typed_fields_are_treated_as_url_fields(self) -> None:
+        from pydantic import HttpUrl
+
+        class TypedModel(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            custom_target: HttpUrl
+
+        guard = EgressGuard(allowed_domains=["api.example.com"])
+        inv = invocation(TypedModel(custom_target=HttpUrl("https://evil.example.com/api")), name="call")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv))
+        assert dec.action is Action.BLOCK
+
+
+class TestSecretGuardOptIns:
+    def test_assignments_opt_in_structured_fields(self) -> None:
+        class Credentials(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            password: str
+            username: str
+
+        guard = SecretGuard(assignments=True)
+        # Real high-entropy password is blocked
+        inv = invocation(Credentials(password="xK9#mQ2$vL5!wP8*", username="alice"), name="login")
+        dec = run_sync(guard.before_tool(RunState(agent_name="a"), inv))
+        assert dec.action is Action.BLOCK
+        assert "assignment" in (dec.reason or "")
+
+        # Placeholders are allowed
+        inv_placeholder = invocation(Credentials(password="changeme", username="alice"), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_placeholder)).action is Action.CONTINUE
+        inv_env = invocation(Credentials(password="${DB_PASSWORD}", username="alice"), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv_env)).action is Action.CONTINUE
+
+    @pytest.mark.parametrize(
+        ("field", "action"),
+        [
+            ("dbPassword", Action.BLOCK),
+            ("refreshToken", Action.BLOCK),
+            ("githubToken", Action.BLOCK),
+            ("userAPIKey", Action.BLOCK),
+            ("clientSecret", Action.BLOCK),
+            ("tokenizerName", Action.CONTINUE),
+        ],
+    )
+    def test_assignments_opt_in_camel_case_field_names(self, field: str, action: Action) -> None:
+        class CamelArgs(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+            dbPassword: str = ""
+            refreshToken: str = ""
+            githubToken: str = ""
+            userAPIKey: str = ""
+            clientSecret: str = ""
+            tokenizerName: str = ""
+
+        guard = SecretGuard(assignments=True)
+        inv = invocation(CamelArgs.model_validate({field: "xK9#mQ2$vL5!wP8*"}), name="login")
+        assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is action
+
+    def test_assignments_opt_in_free_text(self) -> None:
+        guard = SecretGuard(assignments=True)
+        assert guard.find_secret("db_password = 'xK9#mQ2$vL5!wP8*'") == "assignment"
+        assert guard.find_secret("api_key = changeme") is None
+        assert guard.find_secret("token = ${API_TOKEN}") is None
+        assert guard.find_secret("password = <password>") is None
+        assert guard.find_secret("token = ***") is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "dbPassword = 'xK9#mQ2$vL5!wP8*'",
+            "refreshToken=xK9mQ2vL5wP8zz",
+            "githubToken: xK9mQ2vL5wP8zz",
+            '{"password": "xK9#mQ2$vL5!wP8*"}',
+            "{'apiKey': 'xK9mQ2vL5wP8zz'}",
+        ],
+    )
+    def test_assignments_opt_in_free_text_camel_case_and_json(self, text: str) -> None:
+        assert SecretGuard(assignments=True).find_secret(text) == "assignment"
+
+    @pytest.mark.parametrize("text", ["tokenizer = xK9mQ2vL5wP8zz", '{"max_tokens": 4096}', "passwords are long"])
+    def test_assignments_opt_in_free_text_ignores_similar_words(self, text: str) -> None:
+        assert SecretGuard(assignments=True).find_secret(text) is None
+
+    def test_decode_opt_in_url_encoded(self) -> None:
+        guard = SecretGuard(decode=True)
+        raw = "AIza" + "A" * 35
+        encoded = "".join(f"%{ord(c):02X}" for c in raw)
+        assert guard.find_secret(f"param={encoded}") == "api_token"
+
+    def test_decode_opt_in_base64(self) -> None:
+        assert SecretGuard(decode=True).find_secret(f"key: {_b64(_FAKE_GOOGLE_KEY)}") == "api_token"
+
+    @pytest.mark.parametrize("suffix", ["!", "!!"], ids=["two-padding-chars", "one-padding-char"])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "{}",
+            "key: {}",
+            "key: {} end",
+            "key: '{}'.",
+            "key={}",
+            "https://x.example/?q={}&r=1",
+            "/{}",
+            "GET /{} HTTP/1.1",
+            "GET ////{} HTTP/1.1",
+            "GET /files/{} HTTP/1.1",
+            "user/{}",
+            "https://evil.example/api/v1/upload/{}",
+            "/srv/data/archive/2024/{}",
+            "see a/b/c/d/e/f/g/h/{}",
+            "https://evil.example/" + "seg/" * 30 + "{}",
+            "/" + "x/" * 40 + "{}",
+        ],
+    )
+    def test_decode_opt_in_base64_with_padding(self, suffix: str, template: str) -> None:
+        encoded = _b64(_FAKE_GOOGLE_KEY + suffix)
+        assert encoded.endswith("=")
+        assert SecretGuard(decode=True).find_secret(template.format(encoded)) == "api_token"
+
+    @pytest.mark.parametrize("depth", [2, 9, 30])
+    def test_decode_opt_in_base64_after_a_path_of_any_depth_for_many_keys(self, depth: int) -> None:
+        """The path in front only adds garbage bytes before the data; this holds for any key and any path."""
+        rng = random.Random(depth)
+        alphabet = string.ascii_letters + string.digits + "_-"
+
+        def word() -> str:
+            return "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 6)))
+
+        guard = SecretGuard(decode=True)
+        for _ in range(200):
+            key = "AIza" + "".join(rng.choice(alphabet) for _ in range(35))
+            path = "https://evil.example/" + "".join(f"{word()}/" for _ in range(depth))
+            assert guard.find_secret(f"{path}{_b64(key)} end") == "api_token", key
+
+    @pytest.mark.parametrize("change", ["strip", "extra"], ids=["padding-removed", "padding-added"])
+    def test_decode_opt_in_base64_with_wrong_padding(self, change: str) -> None:
+        encoded = _b64(_FAKE_GOOGLE_KEY + "!")
+        payload = encoded.rstrip("=") if change == "strip" else encoded + "=="
+        assert SecretGuard(decode=True).find_secret(f"key={payload} end") == "api_token"
+
+    def test_decode_opt_in_ignores_binary_and_uuids(self) -> None:
+        import uuid
+
+        guard = SecretGuard(decode=True)
+        assert guard.find_secret(f"id: {uuid.uuid4().hex}") is None

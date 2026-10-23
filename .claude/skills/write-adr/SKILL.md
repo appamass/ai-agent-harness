@@ -20,7 +20,7 @@ Do not write an ADR for routine bug fixes, behavior-preserving refactorings, or 
 1. Find the next available four-digit number in `docs/adr/`.
 2. Copy `docs/adr/0000-template.md` to `docs/adr/NNNN-short-title.md` and fill it in.
    Set the initial status to `Proposed`.
-3. Write **Context** honestly: what problem and competing forces exist? List **Alternatives Considered**
+3. Write **Context** honestly: what problem and competing forces exist? List what was **Rejected**
    with the specific reason each was rejected. Include negative **Consequences** as well as positive ones.
 4. Add the new ADR to the index table in `docs/adr/README.md`.
 5. A human sets the status to `Accepted`. Coding agents never set `Accepted` on their own.

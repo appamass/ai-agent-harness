@@ -1,5 +1,4 @@
-"""Documentation tests: code blocks in README.md, docs/guide.md, docs/how-it-works.md, docs/use-cases/ and
-docs/first-real-run.md are executed
+"""Documentation tests: code blocks in README.md, docs/guide.md and the ai-kit recipes are executed
 so documentation never drifts from the code.
 
 Only ```python blocks whose first line is `# executable` are executed. All blocks in a file
@@ -16,30 +15,23 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parent.parent
-DOCS = ROOT / "docs" / "use-cases"
-RUNBOOKS = (
-    DOCS.parent / "first-real-run.md",
-    ROOT / "README.md",
-    DOCS.parent / "guide.md",
-    DOCS.parent / "how-it-works.md",
+from .conftest import REPO_ROOT
+
+DOC_FILES = (
+    REPO_ROOT / "README.md",
+    REPO_ROOT / "docs" / "guide.md",
+    REPO_ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "references" / "adopt-in-x.md",
 )
 BLOCK = re.compile(r"^```python\n(# executable\n.*?)^```", re.MULTILINE | re.DOTALL)
-OPTIONAL_MODULES = {"cryptography"}  # not part of core template dependencies
 
 
-def _use_cases() -> list[Path]:
-    return [*sorted(p for p in DOCS.glob("*.md") if p.name != "README.md"), *RUNBOOKS]
-
-
-def test_every_use_case_has_executable_blocks() -> None:
-    assert _use_cases(), "no use cases found"
-    for path in _use_cases():
+def test_every_doc_file_has_executable_blocks() -> None:
+    for path in DOC_FILES:
         assert BLOCK.findall(path.read_text(encoding="utf-8")), f"{path.name} contains no executable block"
 
 
-@pytest.mark.parametrize("path", _use_cases(), ids=lambda p: p.stem)
-def test_use_case_runs(path: Path) -> None:
+@pytest.mark.parametrize("path", DOC_FILES, ids=lambda p: p.stem)
+def test_doc_file_runs(path: Path) -> None:
     # Real module so dataclasses/Pydantic can resolve annotations just like in normal code.
     module = types.ModuleType(f"doc_{path.stem.replace('-', '_')}")
     sys.modules[module.__name__] = module
@@ -49,9 +41,9 @@ def test_use_case_runs(path: Path) -> None:
             try:
                 exec(code, module.__dict__)
             except ModuleNotFoundError as exc:
-                if exc.name in OPTIONAL_MODULES:
-                    pytest.skip(f"optional dependency missing: {exc.name}")
-                raise
+                raise AssertionError(
+                    f"{path.name} block {index} needs a module that is not installed: {exc.name}"
+                ) from exc
     finally:
         sys.modules.pop(module.__name__, None)
 
@@ -70,7 +62,7 @@ def test_the_readme_demo_transcript_matches_the_real_demo(
 ) -> None:
     from .conftest import load_example
 
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     match = re.search(r"```text\n(.*?)```", readme, re.DOTALL)
     assert match is not None, "README.md has no ```text block with the demo transcript"
     monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
@@ -84,3 +76,50 @@ def test_the_readme_demo_transcript_matches_the_real_demo(
     for line in shown:
         assert line in real[position:], f"README transcript line not in the real demo output: {line!r}"
         position = real.index(line, position) + 1
+
+
+PIN = re.compile(r"ai-agent-harness(?:\.git)?@v(\d+\.\d+\.\d+)|@v(\d+\.\d+\.\d+)\b")
+RELEASE = re.compile(r"^## (\d+\.\d+\.\d+) – ", re.MULTILINE)
+
+
+def test_every_release_pin_names_the_newest_release() -> None:
+    """The install line pins a tag that exists: the newest released version in the changelog."""
+    newest = RELEASE.findall((REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))[0]
+    pins = {
+        (path.relative_to(REPO_ROOT).as_posix(), a or b)
+        for path in REPO_ROOT.glob("**/*.md")
+        if ".venv" not in path.parts and path.name != "CHANGELOG.md"
+        for a, b in PIN.findall(path.read_text(encoding="utf-8"))
+    }
+    assert pins, "the README has no install line"
+    assert {version for _, version in pins} == {newest}, sorted(pins)
+
+
+INVARIANT_ITEM = re.compile(r"^(\d+)\. \*\*", re.MULTILINE)
+INVARIANT_CITE = re.compile(r"\binvariants?\s+#?(\d+(?:\s*(?:,|and|or)\s*#?\d+)*)", re.IGNORECASE)
+NUMBER = re.compile(r"\d+")
+
+
+def test_cited_invariants_exist_and_the_lists_agree() -> None:
+    agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    section = agents.split("## Non-Negotiable Invariants", 1)[1].split("\n## ", 1)[0]
+    count = len(INVARIANT_ITEM.findall(section))
+    skill = (REPO_ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "SKILL.md").read_text(encoding="utf-8")
+    skill_section = skill.split("Non-Negotiable Invariants", 1)[1].split("\n## ", 1)[0]
+    assert len(INVARIANT_ITEM.findall(skill_section)) == count  # the copyable kit keeps the same list
+    assert f"The {count} Non-Negotiable Invariants" in skill and f"respect the {count} invariants" in skill
+    files = [
+        REPO_ROOT / "README.md",
+        *REPO_ROOT.glob("docs/**/*.md"),
+        *REPO_ROOT.glob("ai-kit/**/*.md"),
+        *REPO_ROOT.glob("tests/*.py"),
+        *REPO_ROOT.glob("ai_agent_harness/**/*.py"),
+    ]
+    cited = {
+        (f.name, int(number))
+        for f in files
+        for group in INVARIANT_CITE.findall(f.read_text(encoding="utf-8"))
+        for number in NUMBER.findall(group)
+    }
+    assert cited, "no invariant is cited anywhere"
+    assert all(1 <= number <= count for _, number in cited), sorted(cited)

@@ -42,6 +42,7 @@ class EventType(StrEnum):
     APPROVAL_REQUESTED = "approval_requested"
     INPUT_REQUESTED = "input_requested"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    CONTEXT_COMPACTED = "context_compacted"
     RUN_FINISHED = "run_finished"
 
 
@@ -81,6 +82,10 @@ def _scalar(value: Any, depth: int) -> Any:
 Listener = Callable[[Event], Awaitable[None]]
 Emit = Callable[[EventType, dict[str, Any]], Awaitable[None]]
 """Lean emit callback passed to components outside the runner."""
+
+
+async def noop_emit(type_: EventType, data: dict[str, Any]) -> None:
+    """Default `Emit` for components used without a runner."""
 
 
 class EventBus:

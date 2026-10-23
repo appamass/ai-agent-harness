@@ -25,25 +25,25 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import hashlib
+import copy
 import inspect
 import json
-import re
 import threading
+import types
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar, get_type_hints, overload
+from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_type_hints, overload
+from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, create_model
 
 from ..core.errors import ConfigError
 from ..core.state import RunState
-from ..core.types import ID_PATTERN, Risk, ToolSpec
+from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, canonical_digest, is_positive_number
 
 InputT = TypeVar("InputT", bound=BaseModel)
-_NAME = re.compile(ID_PATTERN)
 _SCHEMA_TYPE_KEYS = frozenset({"type", "anyOf", "oneOf", "allOf", "$ref", "enum", "const"})
 
 
@@ -68,6 +68,25 @@ def _has_concrete_schema_type(raw: Any) -> bool:
     return all(_has_concrete_schema_type(sub) for sub in nested_props.values())
 
 
+_SCHEMAS: WeakKeyDictionary[type[BaseModel], dict[str, Any]] = WeakKeyDictionary()
+
+
+def json_schema(model: type[BaseModel]) -> dict[str, Any]:
+    """`model.model_json_schema()`, built once per model class (every run and resume needs it again).
+
+    Every caller gets its own copy: a hook or adapter that edits a schema cannot change it for the others.
+    """
+    schema = _SCHEMAS.get(model)
+    if schema is None:
+        schema = _SCHEMAS[model] = model.model_json_schema()
+    return copy.deepcopy(schema)
+
+
+def check_truncation_mode(mode: object, where: str) -> None:
+    if mode not in get_args(TruncationMode):
+        raise ConfigError(f"{where}: 'truncation_mode' must be 'head_and_tail' or 'head', got {mode!r}")
+
+
 @dataclass(frozen=True)
 class InputRequest:
     """Return value from a tool to pause the run for a clarifying question.
@@ -88,35 +107,44 @@ class BaseTool(ABC, Generic[InputT]):
     risk: ClassVar[Risk]
     timeout_s: ClassVar[float] = 30.0
     untrusted_output: ClassVar[bool] = False
+    strict_schema: ClassVar[bool] = True
+    """False for tools whose input model comes from elsewhere (MCP servers, the caller's output model): the
+    concrete-type check is skipped there, Pydantic and the server validate anyway."""
+    max_result_chars: ClassVar[int | None] = None
+    truncation_mode: ClassVar[TruncationMode | None] = None
+    parallel_safe: ClassVar[bool] = False
+    """True for Risk.READ tools that can safely run concurrently with other parallel_safe tools (ADR 0027)."""
 
     @abstractmethod
     async def run(self, args: InputT, state: RunState) -> ToolOutput: ...
 
     @classmethod
     def spec(cls) -> ToolSpec:
-        return ToolSpec(name=cls.name, description=cls.description, input_schema=cls.input_model.model_json_schema())
+        return ToolSpec(name=cls.name, description=cls.description, input_schema=json_schema(cls.input_model))
 
     @classmethod
     def digest(cls) -> str:
         """SHA-256 fingerprint (64 hex chars) of everything that decides what the tool is and may do.
 
-        Covers name, description, input schema, risk, timeout, and `untrusted_output`. Pin it with
-        `ToolRegistry(expected_digests=...)` to notice a changed tool.
+        Covers what the model sees (`spec()`: name, description, input schema), risk, timeout, and
+        `untrusted_output`. Pin it with `ToolRegistry(expected_digests=...)` to notice a changed tool.
         """
-        canonical = json.dumps(
-            {
-                "name": cls.name,
-                "description": cls.description,
-                "input_schema": cls.input_model.model_json_schema(),
-                "risk": cls.risk.value,
-                "timeout_s": float(cls.timeout_s),
-                "untrusted_output": cls.untrusted_output,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        spec = cls.spec()
+        payload: dict[str, Any] = {
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": spec.input_schema,
+            "risk": cls.risk.value,
+            "timeout_s": float(cls.timeout_s),
+            "untrusted_output": cls.untrusted_output,
+        }
+        if cls.max_result_chars is not None:
+            payload["max_result_chars"] = cls.max_result_chars
+        if cls.truncation_mode is not None:
+            payload["truncation_mode"] = cls.truncation_mode
+        if cls.parallel_safe:
+            payload["parallel_safe"] = True
+        return canonical_digest(payload)
 
     @classmethod
     def validate_definition(cls) -> None:
@@ -125,7 +153,7 @@ class BaseTool(ABC, Generic[InputT]):
         if inspect.isabstract(cls):
             raise ConfigError(f"{where} is abstract (missing run or run_sync?)")
         name = getattr(cls, "name", None)
-        if not isinstance(name, str) or not _NAME.fullmatch(name):
+        if not isinstance(name, str) or not ID_RE.fullmatch(name):
             raise ConfigError(f"{where}: 'name' must match {ID_PATTERN}, got {name!r}")
         description = getattr(cls, "description", None)
         if not isinstance(description, str) or not description.strip():
@@ -136,14 +164,14 @@ class BaseTool(ABC, Generic[InputT]):
         if input_model is BaseModel:
             raise ConfigError(f"{where}: 'input_model' must be a subclass of BaseModel (even without fields)")
         try:
-            schema = input_model.model_json_schema()
+            schema = json_schema(input_model)
             json.dumps(schema)
         except Exception as exc:
             raise ConfigError(f"{where}: 'input_model' cannot be represented as a JSON schema: {exc}") from exc
         if schema.get("type") != "object":
             raise ConfigError(f"{where}: 'input_model' must produce a JSON schema of type 'object'")
         defs: dict[str, dict[str, Any]] = schema.get("$defs") or {}
-        for node in (schema, *defs.values()):
+        for node in (schema, *defs.values()) if cls.strict_schema else ():
             props: dict[str, dict[str, Any]] = node.get("properties") or {}
             for field_name, prop in props.items():
                 if not _has_concrete_schema_type(prop):
@@ -153,11 +181,18 @@ class BaseTool(ABC, Generic[InputT]):
                     )
         if not isinstance(getattr(cls, "risk", None), Risk):
             raise ConfigError(f"{where}: 'risk' must be a Risk value")
-        timeout = cls.timeout_s
-        if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+        if not is_positive_number(cls.timeout_s):
             raise ConfigError(f"{where}: 'timeout_s' must be > 0")
         if not isinstance(cls.untrusted_output, bool):
             raise ConfigError(f"{where}: 'untrusted_output' must be a bool")
+        if not isinstance(cls.parallel_safe, bool):
+            raise ConfigError(f"{where}: 'parallel_safe' must be a bool")
+        if cls.parallel_safe and cls.risk is not Risk.READ:
+            raise ConfigError(f"{where}: parallel_safe is only allowed for Risk.READ tools, got {cls.risk}")
+        if cls.max_result_chars is not None and not is_positive_number(cls.max_result_chars, integer=True):
+            raise ConfigError(f"{where}: 'max_result_chars' must be a positive integer")
+        if cls.truncation_mode is not None:
+            check_truncation_mode(cls.truncation_mode, where)
 
 
 SYNC_TOOL_THREADS = 16
@@ -196,6 +231,18 @@ class SyncTool(BaseTool[InputT]):
         return await loop.run_in_executor(_sync_executor(), call)
 
 
+def make_tool(base: type[Any], class_name: str, /, **declaration: Any) -> BaseTool[BaseModel]:
+    """Builds a tool class from its declaration (ClassVar values and methods), validates it, and instantiates it.
+
+    For tools whose declaration is only known at runtime: `@tool` functions, MCP tools, the `final_output` tool.
+    """
+    namespace = {"__module__": __name__, "__qualname__": class_name, **declaration}
+    cls = types.new_class(class_name, (base,), exec_body=lambda ns: ns.update(namespace))
+    tool_cls = cast("type[BaseTool[BaseModel]]", cls)
+    tool_cls.validate_definition()
+    return tool_cls()
+
+
 ToolFn = Callable[..., Any]
 
 
@@ -209,6 +256,9 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any]: ...
 
 
@@ -222,6 +272,9 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> Callable[[ToolFn], BaseTool[Any]]: ...
 
 
@@ -234,6 +287,9 @@ def tool(
     risk: Risk,
     timeout_s: float = 30.0,
     untrusted_output: bool = False,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any] | Callable[[ToolFn], BaseTool[Any]]:
     """Turns a typed Python function (sync or async) into a validated `BaseTool` or `SyncTool`.
 
@@ -250,6 +306,9 @@ def tool(
             risk=risk,
             timeout_s=timeout_s,
             untrusted_output=untrusted_output,
+            max_result_chars=max_result_chars,
+            truncation_mode=truncation_mode,
+            parallel_safe=parallel_safe,
         )
 
     return decorate(fn) if fn is not None else decorate
@@ -263,15 +322,13 @@ def _build_function_tool(
     risk: Risk,
     timeout_s: float,
     untrusted_output: bool,
+    max_result_chars: int | None = None,
+    truncation_mode: TruncationMode | None = None,
+    parallel_safe: bool = False,
 ) -> BaseTool[Any]:
     if not callable(fn):
         raise ConfigError("@tool requires a callable function")
     tool_name = name if name is not None else getattr(fn, "__name__", "")
-    tool_desc = (description if description is not None else inspect.getdoc(fn)) or ""
-    tool_risk = risk
-    tool_timeout = timeout_s
-    tool_untrusted = untrusted_output
-
     try:
         hints = get_type_hints(fn, localns={"RunState": RunState})
     except Exception as exc:
@@ -279,7 +336,6 @@ def _build_function_tool(
 
     sig = inspect.signature(fn)
     fields: dict[str, Any] = {}
-    field_names: list[str] = []
     passes_state = False
     for param_name, param in sig.parameters.items():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
@@ -291,49 +347,35 @@ def _build_function_tool(
             raise ConfigError(f"Tool function '{tool_name}': parameter '{param_name}' is missing a type annotation")
         default = ... if param.default is inspect.Parameter.empty else param.default
         fields[param_name] = (hints[param_name], default)
-        field_names.append(param_name)
+    field_names = tuple(fields)
 
-    model_cls: type[BaseModel] = create_model(
-        f"{tool_name}_Input",
-        __config__=ConfigDict(extra="forbid"),
-        **fields,
-    )
-    names_tuple = tuple(field_names)
+    def call_kwargs(args: BaseModel, state: RunState) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {k: getattr(args, k) for k in field_names}
+        if passes_state:
+            kwargs["state"] = state
+        return kwargs
 
+    declaration: dict[str, Any] = {
+        "name": tool_name,
+        "description": (description if description is not None else inspect.getdoc(fn)) or "",
+        "input_model": create_model(f"{tool_name}_Input", __config__=ConfigDict(extra="forbid"), **fields),
+        "risk": risk,
+        "timeout_s": timeout_s,
+        "untrusted_output": untrusted_output,
+        "max_result_chars": max_result_chars,
+        "truncation_mode": truncation_mode,
+        "parallel_safe": parallel_safe,
+    }
     if inspect.iscoroutinefunction(fn):
 
-        class _AsyncFunctionTool(BaseTool[BaseModel]):
-            name: ClassVar[str] = tool_name
-            description: ClassVar[str] = tool_desc
-            input_model: ClassVar[type[BaseModel]] = model_cls
-            risk: ClassVar[Risk] = tool_risk
-            timeout_s: ClassVar[float] = tool_timeout
-            untrusted_output: ClassVar[bool] = tool_untrusted
-
-            async def run(self, args: BaseModel, state: RunState) -> ToolOutput:
-                kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}
-                if passes_state:
-                    kwargs["state"] = state
-                result: ToolOutput = await fn(**kwargs)
-                return result
-
-        _AsyncFunctionTool.validate_definition()
-        return _AsyncFunctionTool()
-
-    class _SyncFunctionTool(SyncTool[BaseModel]):
-        name: ClassVar[str] = tool_name
-        description: ClassVar[str] = tool_desc
-        input_model: ClassVar[type[BaseModel]] = model_cls
-        risk: ClassVar[Risk] = tool_risk
-        timeout_s: ClassVar[float] = tool_timeout
-        untrusted_output: ClassVar[bool] = tool_untrusted
-
-        def run_sync(self, args: BaseModel, state: RunState) -> ToolOutput:
-            kwargs: dict[str, Any] = {k: getattr(args, k) for k in names_tuple}
-            if passes_state:
-                kwargs["state"] = state
-            result: ToolOutput = fn(**kwargs)
+        async def run(self: BaseTool[BaseModel], args: BaseModel, state: RunState) -> ToolOutput:
+            result: ToolOutput = await fn(**call_kwargs(args, state))
             return result
 
-    _SyncFunctionTool.validate_definition()
-    return _SyncFunctionTool()
+        return make_tool(BaseTool[BaseModel], "_AsyncFunctionTool", run=run, **declaration)
+
+    def run_sync(self: SyncTool[BaseModel], args: BaseModel, state: RunState) -> ToolOutput:
+        result: ToolOutput = fn(**call_kwargs(args, state))
+        return result
+
+    return make_tool(SyncTool[BaseModel], "_SyncFunctionTool", run_sync=run_sync, **declaration)

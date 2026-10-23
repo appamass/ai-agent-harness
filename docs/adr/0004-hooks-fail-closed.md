@@ -1,4 +1,4 @@
-# 0004 – Typed Hooks with Per-Stage Allowed Decisions, Fail-Closed
+# 0004 – Typed Hooks, Fail-Closed
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-15
@@ -6,28 +6,17 @@
 
 ## Context
 
-Guardrails are the primary security extension point. In early prototypes, hooks were dispatched by string
-names, some returned decisions were silently ignored (e.g. at `after_tool`), and an unhandled exception
-inside a hook crashed the entire run.
+Guardrails are the main security extension point. Early hooks used string names, ignored some decisions, and crashed the run when they raised.
 
 ## Decision
 
-Each hook point is a dedicated, typed method on `Hook`. Every stage explicitly defines which `Action`
-values are valid at that stage. Any exception raised by a hook or any disallowed `Action` is converted
-into `Decision.block(...)` (fail-closed). `block` and `retry` short-circuit the pipeline immediately;
-`require_approval` is remembered while remaining hooks run so a subsequent `block` still wins.
-`on_run_end` returns `None`; exceptions there are logged without altering the final status. Tool hooks
-receive validated Pydantic arguments (`ToolInvocation`), and the `PermissionPolicy` runs before hooks.
+Each hook point is a typed method on `Hook` with its own set of allowed `Action`s. An exception or a disallowed action becomes `Decision.block(...)`. `block` and `retry` stop the pipeline; `require_approval` is remembered so a later `block` still wins. `on_run_end` returns nothing; its errors are logged. Tool hooks get validated arguments, and `PermissionPolicy` runs before them.
 
-## Alternatives
+## Rejected
 
-| Alternative | Why Rejected |
-|---|---|
-| Fail-open (ignore hook errors) | A buggy guardrail would silently allow dangerous actions through |
-| Let hook exceptions crash the run | A bug in a custom guardrail would cause unhandled crashes in production |
+- Fail-open: a buggy guardrail would let dangerous actions through.
+- Crash on hook errors: a custom guardrail bug would crash production.
 
 ## Consequences
 
-- Positive: A guardrail bug can never accidentally permit an action.
-- Negative: A buggy guardrail blocks legitimate actions until fixed — requires monitoring on `tool_blocked` and `run_finished` events.
-- Verification: `tests/test_failures.py`, `tests/test_tools.py`.
+A buggy guardrail blocks legitimate actions until fixed; watch `tool_blocked` events. Tested in `tests/test_failures.py` and `tests/test_tools.py`.

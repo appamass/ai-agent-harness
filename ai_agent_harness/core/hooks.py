@@ -131,40 +131,43 @@ class HookPipeline:
     def hooks(self) -> tuple[Hook, ...]:
         return self._hooks
 
+    @classmethod
+    def of(cls, hooks: HookPipeline | Sequence[Hook]) -> HookPipeline:
+        """The pipeline itself, or a new one running `hooks` in order."""
+        return hooks if isinstance(hooks, HookPipeline) else cls(hooks)
+
     async def on_user_input(self, state: RunState | None, text: str) -> Decision:
-        active = _ensure_state(state)
-        return await self._decide("on_user_input", lambda h: h.on_user_input(active, text))
+        return await self._decide("on_user_input", state, lambda h, s: h.on_user_input(s, text))
 
     async def before_model(self, state: RunState | None, request: ModelRequest) -> Decision:
-        active = _ensure_state(state)
-        return await self._decide("before_model", lambda h: h.before_model(active, request))
+        return await self._decide("before_model", state, lambda h, s: h.before_model(s, request))
 
     async def after_model(self, state: RunState | None, response: ModelResponse) -> Decision:
-        active = _ensure_state(state)
-        return await self._decide("after_model", lambda h: h.after_model(active, response))
+        return await self._decide("after_model", state, lambda h, s: h.after_model(s, response))
 
     async def before_tool(self, state: RunState | None, invocation: ToolInvocation) -> Decision:
-        active = _ensure_state(state)
-        return await self._decide("before_tool", lambda h: h.before_tool(active, invocation))
+        return await self._decide("before_tool", state, lambda h, s: h.before_tool(s, invocation))
 
     async def after_tool(self, state: RunState | None, invocation: ToolInvocation, result: ToolResult) -> Decision:
-        active = _ensure_state(state)
-        return await self._decide("after_tool", lambda h: h.after_tool(active, invocation, result))
+        return await self._decide("after_tool", state, lambda h, s: h.after_tool(s, invocation, result))
 
     async def on_run_end(self, state: RunState | None = None) -> None:
-        active = _ensure_state(state)
+        active = state if state is not None else RunState.standalone()
         for hook in self._hooks:
             try:
                 await hook.on_run_end(active)
             except Exception:
                 log.exception("Hook %s failed in on_run_end", hook.name)
 
-    async def _decide(self, point: str, invoke: Callable[[Hook], Awaitable[Decision]]) -> Decision:
+    async def _decide(
+        self, point: str, state: RunState | None, invoke: Callable[[Hook, RunState], Awaitable[Decision]]
+    ) -> Decision:
         allowed = _ALLOWED[point]
+        active = state if state is not None else RunState.standalone()
         approval: Decision | None = None
         for hook in self._hooks:
             try:
-                decision = await invoke(hook)
+                decision = await invoke(hook, active)
             except Exception:
                 log.exception("Hook %s failed in %s — fail-closed", hook.name, point)
                 return Decision.block(f"Guardrail '{hook.name}' failed")
@@ -177,9 +180,3 @@ class HookPipeline:
             if decision.action is Action.REQUIRE_APPROVAL and approval is None:
                 approval = decision
         return approval or CONTINUE
-
-
-def _ensure_state(state: RunState | None) -> RunState:
-    if state is not None:
-        return state
-    return RunState(agent_name="standalone")

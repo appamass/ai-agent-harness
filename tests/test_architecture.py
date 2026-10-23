@@ -8,8 +8,9 @@ import sys
 import tokenize
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-HARNESS = ROOT / "ai_agent_harness"
+from .conftest import REPO_ROOT
+
+HARNESS = REPO_ROOT / "ai_agent_harness"
 CORE = HARNESS / "core"
 ALLOWED_THIRD_PARTY = {"pydantic"}
 
@@ -39,7 +40,7 @@ def _imports(path: Path) -> set[str]:
 
 
 def test_core_imports_only_pydantic_and_stdlib() -> None:
-    """Invariant 7: `ai_agent_harness/core/` depends on nothing except Pydantic and the standard library."""
+    """Invariant 8: `ai_agent_harness/core/` depends on nothing except Pydantic and the standard library."""
     files = sorted(CORE.glob("*.py"))
     assert files
     for path in files:
@@ -52,7 +53,7 @@ def test_core_imports_only_pydantic_and_stdlib() -> None:
 
 
 def test_dependencies_point_inward_only_runtime_knows_all_parts() -> None:
-    """docs/how-it-works.md: `runtime` is the only place that brings all building blocks together."""
+    """`runtime` is the only place that brings all building blocks together."""
     files = sorted(HARNESS.rglob("*.py"))
     assert files
     for path in files:
@@ -66,7 +67,7 @@ def test_dependencies_point_inward_only_runtime_knows_all_parts() -> None:
 
 
 def test_only_tool_executor_awaits_tool_run() -> None:
-    """Invariant 4: Tools run exclusively through the execution gate (`tools/executor.py`)."""
+    """Invariant 3: Tools run exclusively through the execution gate (`tools/executor.py`)."""
     callers: list[str] = []
     for path in sorted(HARNESS.rglob("*.py")):
         rel = path.relative_to(HARNESS).as_posix()
@@ -84,8 +85,8 @@ def test_no_unapproved_suppression_comments() -> None:
     """AGENTS.md: No `# type: ignore`, `# noqa`, or `pragma: no cover` without explicit approval."""
     found: dict[str, int] = {}
     for folder in ("ai_agent_harness", "tests"):
-        for path in sorted((ROOT / folder).rglob("*.py")):
-            rel = path.relative_to(ROOT).as_posix()
+        for path in sorted((REPO_ROOT / folder).rglob("*.py")):
+            rel = path.relative_to(REPO_ROOT).as_posix()
             tokens = tokenize.generate_tokens(io.StringIO(path.read_text(encoding="utf-8")).readline)
             count = sum(
                 1
@@ -99,14 +100,47 @@ def test_no_unapproved_suppression_comments() -> None:
 
 def test_readme_is_a_short_start_with_the_demo_and_the_proof() -> None:
     """The README is the front door: short, with a no-key demo and a link to the full list of guarantees."""
-    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     lines = text.splitlines()
     assert len(lines) <= 160, f"README.md has {len(lines)} lines (limit: 160): move detail into docs/"
     assert "examples/repo_assistant.py --demo" in text
-    assert "docs/guarantees.md" in text and "docs/how-it-works.md" in text and "docs/guide.md" in text
+    assert "docs/guarantees.md" in text and "docs/guide.md" in text
 
 
 def test_agents_md_stays_concise() -> None:
     """ETH Zurich finding (arXiv:2602.11988) & AGENTS.md: concise context instead of bloated overviews."""
-    lines = (ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
+    lines = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8").splitlines()
     assert 40 <= len(lines) <= 100, f"AGENTS.md has {len(lines)} lines (limit: 100)"
+
+
+def test_only_run_state_writes_messages() -> None:
+    """ADR 0003: the message history changes only through `RunState` methods, which validate the protocol."""
+    writers: list[str] = []
+    for path in sorted(HARNESS.rglob("*.py")):
+        rel = path.relative_to(HARNESS).as_posix()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"append", "extend", "insert", "pop", "clear"}
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "messages"
+            ):
+                writers.append(f"{rel}:{node.lineno}")
+    assert {w.split(":")[0] for w in writers} <= {"core/state.py"}, f"messages changed outside RunState: {writers}"
+
+
+def test_no_placeholder_modules() -> None:
+    """ADR 0008: no empty modules and no `NotImplementedError` stubs."""
+    problems: list[str] = []
+    for path in sorted(HARNESS.rglob("*.py")):
+        rel = path.relative_to(HARNESS).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if path.name != "__init__.py" and not tree.body:
+            problems.append(f"{rel}: empty module")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                target = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+                if isinstance(target, ast.Name) and target.id == "NotImplementedError":
+                    problems.append(f"{rel}:{node.lineno}: NotImplementedError stub")
+    assert not problems, problems

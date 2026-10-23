@@ -5,8 +5,8 @@ response back into `ModelResponse`. Provider SDKs are imported only inside adapt
 
 Adapter contract — violations are bugs in the adapter, not in the harness:
 
-- Raise API errors as `ProviderError`: `retryable=True` for rate limits (429),
-  overload (5xx, 529), and network errors; `retryable=False` for everything else
+- Raise API errors as `ProviderError`: `retryable=True` for timeouts and conflicts (408, 409), rate limits (429),
+  overload (5xx, 529), and network errors (`is_retryable_status`); `retryable=False` for everything else
   (400, auth, invalid request). The router handles retry, backoff, and fallback.
 - Map provider stop reasons to `StopReason`; map unknown values to `END`.
 - Pass `ThinkingBlock.provider_data` through unchanged — but **only own blocks**:
@@ -31,13 +31,77 @@ Adapter contract — violations are bugs in the adapter, not in the harness:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Final, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-from ..core.errors import ConfigError
-from ..core.types import Block, Message, ModelRequest, ModelResponse, StopReason, TextBlock, ThinkingBlock
+from ..core.errors import ConfigError, ProviderError
+from ..core.types import Block, Message, ModelRequest, ModelResponse, StopReason, TextBlock, ThinkingBlock, ToolCall
+
+EMPTY_RESPONSE_NOTE: Final = "(empty response)"
+"""Sent instead of an assistant message that has no content left (the APIs reject empty messages)."""
+
+SDK_TIMEOUT_S: Final = 600.0
+"""Explicit SDK timeout: lifts the SDK's refusal of big requests; the router owns the real request deadline."""
+
+_RETRYABLE_STATUS = frozenset({408, 409, 429})
+
+
+def is_retryable_status(status: int) -> bool:
+    """Shared HTTP classification for adapters: rate limits, conflicts, timeouts, and server errors are retryable."""
+    return status in _RETRYABLE_STATUS or status >= 500
+
+
+def api_error(
+    api: str, provider_id: str, *, status: int | None = None, kind: str = "unknown", connection: bool = False
+) -> ProviderError:
+    """The `ProviderError` for a failed SDK call: an HTTP status, a connection failure, or an unreadable response.
+
+    Only the status and a short error code reach the message: the response body may echo the request.
+    """
+    if status is not None:
+        return ProviderError(
+            f"{api} API error {status} ({kind})", retryable=is_retryable_status(status), provider_id=provider_id
+        )
+    if connection:  # includes timeouts
+        return ProviderError(f"{api} API connection failed", retryable=True, provider_id=provider_id)
+    return ProviderError(f"{api} API returned an invalid response", retryable=False, provider_id=provider_id)
+
+
+def error_kind(value: object, pattern: re.Pattern[str]) -> str:
+    """A provider's error code for the message, if it looks like one (never free text from the body)."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else "unknown"
+
+
+def check_not_empty(who: str, **values: str) -> None:
+    for name, value in values.items():
+        if not value.strip():
+            raise ConfigError(f"{who}: {name} must not be empty")
+
+
+def tool_call(call_id: str, name: str, arguments: object) -> ToolCall:
+    """A model tool call from parsed JSON arguments; anything but an object becomes `arguments_error`."""
+    if not isinstance(arguments, dict):  # the executor reports this to the model so it can retry
+        return ToolCall(id=call_id, name=name, arguments_error="Tool input was not a JSON object")
+    return ToolCall(id=call_id, name=name, arguments=dict(cast("dict[str, Any]", arguments)))
+
+
+def assistant_message(blocks: Sequence[Block]) -> Message:
+    """The assistant message of a response. The APIs may return no content at all (for example a refusal)."""
+    return Message(role="assistant", content=tuple(blocks) or (TextBlock(text=""),))
+
+
+@dataclass(frozen=True)
+class StreamDelta:
+    """Incremental answer text produced by a streaming model provider.
+
+    Reasoning is not streamed: it only arrives as a `ThinkingBlock` in the final `ModelResponse`.
+    """
+
+    text: str = ""
 
 
 class Capabilities(BaseModel):
@@ -47,6 +111,7 @@ class Capabilities(BaseModel):
 
     tools: bool = True
     vision: bool = False
+    structured_output: bool = False
 
 
 @runtime_checkable
@@ -81,8 +146,7 @@ class CallableProvider:
     ) -> None:
         if not callable(fn):
             raise ConfigError("CallableProvider requires a callable")
-        if not id.strip():
-            raise ConfigError("CallableProvider: id must not be empty")
+        check_not_empty("CallableProvider", id=id)
         self._fn = fn
         self._id = id
         self._capabilities = Capabilities(tools=tools, vision=vision)
@@ -98,10 +162,7 @@ class CallableProvider:
     async def complete(self, request: ModelRequest) -> ModelResponse:
         result = await self._fn(request)
         if isinstance(result, str):
-            return ModelResponse(
-                message=Message(role="assistant", content=(TextBlock(text=result),)),
-                stop_reason=StopReason.END,
-            )
+            return ModelResponse(message=assistant_message([TextBlock(text=result)]), stop_reason=StopReason.END)
         return result
 
 

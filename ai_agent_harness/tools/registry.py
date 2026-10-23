@@ -31,6 +31,11 @@ class ToolRegistry:
         if unknown:
             raise ConfigError(f"Pinned digests for tools that are not registered: {', '.join(unknown)}")
 
+    @classmethod
+    def of(cls, tools: ToolRegistry | Iterable[BaseTool[Any]]) -> ToolRegistry:
+        """The registry itself, or a new one holding `tools`."""
+        return tools if isinstance(tools, ToolRegistry) else cls(tools)
+
     def register(self, tool: BaseTool[Any]) -> None:
         if not isinstance(tool, BaseTool):
             raise ConfigError(f"{tool!r} is not a BaseTool")
@@ -39,6 +44,14 @@ class ToolRegistry:
             raise ConfigError(f"Tool '{tool.name}' is already registered")
         self._check_pin(tool)
         self._tools[tool.name] = tool
+
+    def extended(self, tool: BaseTool[Any]) -> ToolRegistry:
+        """A copy with one more tool. Only the new tool is validated; the others already were."""
+        copy = ToolRegistry()
+        copy._tools = dict(self._tools)
+        copy._expected_digests = dict(self._expected_digests)
+        copy.register(tool)
+        return copy
 
     def digests(self) -> dict[str, str]:
         """Returns `{tool_name: digest}` for all registered tools, as they are now."""

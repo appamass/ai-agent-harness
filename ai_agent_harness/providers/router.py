@@ -18,22 +18,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import cast
 
 from ..core.errors import ConfigError, ProviderError
-from ..core.events import Emit, EventType
+from ..core.events import Emit, EventType, noop_emit
 from ..core.types import ModelRequest, ModelResponse
-from .base import ModelProvider
+from .base import ModelProvider, StreamDelta
 
 log = logging.getLogger("ai_agent_harness.providers")
 
 Sleep = Callable[[float], Awaitable[None]]
-
-
-async def _noop_emit(type_: EventType, data: dict[str, Any]) -> None:
-    return None
 
 
 @dataclass(frozen=True)
@@ -75,16 +71,87 @@ class ModelRouter:
         self._sleep = sleep
         self._jitter = jitter
 
+    @property
+    def providers(self) -> tuple[ModelProvider, ...]:
+        return self._providers
+
     def candidates(self, request: ModelRequest) -> tuple[ModelProvider, ...]:
+        has_images = request.has_images
         return tuple(
             p
             for p in self._providers
-            if (p.capabilities.tools or not request.tools) and (p.capabilities.vision or not request.has_images)
+            if (p.capabilities.tools or not request.tools)
+            and (p.capabilities.vision or not has_images)
+            and (p.capabilities.structured_output or not request.output_schema)
         )
 
     async def complete(self, request: ModelRequest, emit: Emit | None = None) -> tuple[ModelResponse, str]:
         """Returns `(response, provider_id_that_answered)`."""
-        active_emit = emit or _noop_emit
+        return await self._route(request, emit, lambda provider: self._complete_once(provider, request))
+
+    async def _complete_once(self, provider: ModelProvider, request: ModelRequest) -> object:
+        # Adapters are external code: the result is verified at runtime by `_route`, not trusted from annotations
+        return await asyncio.wait_for(provider.complete(request), self._retry.request_timeout_s)
+
+    async def stream(
+        self,
+        request: ModelRequest,
+        emit: Emit | None = None,
+        on_delta: Callable[[StreamDelta], Awaitable[None]] | None = None,
+    ) -> tuple[ModelResponse, str]:
+        """Streams the response, with the same retry and failover as `complete`.
+
+        Calls `on_delta` with each `StreamDelta`. Once a delta has been delivered, a failure is raised as it
+        is: a retry or another model would show the consumer a second, different answer.
+        Providers without `stream()` answer through `complete()` as a single delta.
+        """
+        delivered = 0
+
+        async def attempt(provider: ModelProvider) -> object:
+            nonlocal delivered
+            delivered = 0
+            stream_fn = getattr(provider, "stream", None)
+            if not callable(stream_fn):
+                response = await self._complete_once(provider, request)
+                if isinstance(response, ModelResponse) and on_delta is not None and response.message.text:
+                    await on_delta(StreamDelta(text=response.message.text))
+                    delivered += 1
+                return response
+            final: ModelResponse | None = None
+            loop = asyncio.get_running_loop()
+            async with asyncio.timeout(self._retry.request_timeout_s) as deadline:
+                async for chunk in cast(AsyncIterator[object], stream_fn(request)):
+                    if isinstance(chunk, StreamDelta):
+                        if on_delta is not None and chunk.text:
+                            # A slow consumer is not a slow provider: the provider's clock stops while it holds us up
+                            when = deadline.when()
+                            left = None if when is None else when - loop.time()
+                            deadline.reschedule(None)
+                            await on_delta(chunk)
+                            deadline.reschedule(None if left is None else loop.time() + left)
+                            delivered += 1
+                    elif isinstance(chunk, ModelResponse):
+                        final = chunk
+            if final is None:
+                raise ProviderError(
+                    "Streaming provider finished without returning ModelResponse",
+                    retryable=False,
+                    provider_id=provider.id,
+                )
+            return final
+
+        return await self._route(request, emit, attempt, committed=lambda: delivered > 0)
+
+    async def _route(
+        self,
+        request: ModelRequest,
+        emit: Emit | None,
+        attempt_call: Callable[[ModelProvider], Awaitable[object]],
+        *,
+        committed: Callable[[], bool] = lambda: False,
+    ) -> tuple[ModelResponse, str]:
+        """Retry, backoff, and failover over the capable models. `committed()`: output already reached the consumer."""
+        active_emit = emit or noop_emit
         candidates = self.candidates(request)
         if not candidates:
             raise ProviderError("No configured model satisfies the requirements of this request", retryable=False)
@@ -98,8 +165,7 @@ class ModelRouter:
                 )
             for attempt in range(1, self._retry.max_attempts + 1):
                 try:
-                    # Adapters are external code: verify return type at runtime, not just via type annotations
-                    response: object = await asyncio.wait_for(provider.complete(request), self._retry.request_timeout_s)
+                    response = await attempt_call(provider)
                 except TimeoutError:
                     last_error = ProviderError("Request timed out", retryable=True, provider_id=provider.id)
                 except ProviderError as exc:
@@ -116,6 +182,8 @@ class ModelRouter:
                     last_error = ProviderError(
                         "Adapter returned an invalid response", retryable=False, provider_id=provider.id
                     )
+                if committed():
+                    raise last_error
                 if not last_error.retryable or attempt == self._retry.max_attempts:
                     break
                 delay = self._retry.delay(attempt, self._jitter())

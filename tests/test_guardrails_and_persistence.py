@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import shutil
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -11,7 +10,6 @@ from pydantic import BaseModel
 from ai_agent_harness import (
     Autonomy,
     HookPipeline,
-    InMemoryCheckpointStore,
     JsonFileCheckpointStore,
     ProtectedPaths,
     Risk,
@@ -23,14 +21,12 @@ from ai_agent_harness.core import (
     ConfigError,
     InvalidStateError,
     ProtocolError,
-    ToolCall,
-    ToolInvocation,
 )
 from ai_agent_harness.core.hooks import Action
 from ai_agent_harness.persistence import CheckpointStore
 from ai_agent_harness.testing import text_response, tool_response
 
-from .conftest import Echo, PathInput, WriteFile, fresh_postgres_schema, make_agent, results_of, run_sync
+from .conftest import Echo, PathInput, WriteFile, invocation, make_agent, results_of, run_sync
 
 
 class NestedInput(BaseModel):
@@ -67,8 +63,7 @@ def test_ordinary_keys_and_nested_field_names_are_not_paths() -> None:
 
 
 def decide(guard: ProtectedPaths, args: BaseModel, risk: Risk = Risk.WRITE) -> Action:
-    invocation = ToolInvocation(call=ToolCall(id="1", name="w"), tool_name="w", risk=risk, args=args)
-    return run_sync(guard.before_tool(RunState(agent_name="t"), invocation)).action
+    return run_sync(guard.before_tool(RunState(agent_name="t"), invocation(args, risk=risk))).action
 
 
 class TestProtectedPaths:
@@ -122,48 +117,33 @@ class TestProtectedPaths:
         assert "protected" in results_of(state)[0].content
 
 
-@pytest.fixture(params=["memory", "file", "postgres"])
-def store(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[CheckpointStore]:
-    if request.param == "memory":
-        yield InMemoryCheckpointStore()
-    elif request.param == "file":
-        yield JsonFileCheckpointStore(tmp_path / "cp")
-    else:  # needs HARNESS_TEST_POSTGRES_DSN, skipped otherwise
-        with fresh_postgres_schema() as (dsn, schema):
-            from ai_agent_harness.persistence_postgres import PostgresCheckpointStore
-
-            postgres = PostgresCheckpointStore(dsn, schema=schema)
-            run_sync(postgres.setup())
-            yield postgres
-
-
 class TestCheckpoints:
-    def test_roundtrip_and_revision(self, store: CheckpointStore) -> None:
+    def test_roundtrip_and_revision(self, any_store: CheckpointStore) -> None:
         state = RunState(agent_name="a", tenant_id="tenant1")
         state.add_user_text("hi")
-        run_sync(store.save(state))
-        run_sync(store.save(state))
-        loaded = run_sync(store.load("tenant1", state.run_id))
+        run_sync(any_store.save(state))
+        run_sync(any_store.save(state))
+        loaded = run_sync(any_store.load("tenant1", state.run_id))
         assert loaded is not None and loaded.revision == 2 == state.revision
         assert loaded.messages == state.messages
 
-    def test_stale_copy_cannot_overwrite(self, store: CheckpointStore) -> None:
+    def test_stale_copy_cannot_overwrite(self, any_store: CheckpointStore) -> None:
         state = RunState(agent_name="a")
-        run_sync(store.save(state))
+        run_sync(any_store.save(state))
         stale = state.model_copy(deep=True)
-        run_sync(store.save(state))
+        run_sync(any_store.save(state))
         with pytest.raises(ConcurrencyError):
-            run_sync(store.save(stale))
+            run_sync(any_store.save(stale))
 
-    def test_tenants_are_separated(self, store: CheckpointStore) -> None:
+    def test_tenants_are_separated(self, any_store: CheckpointStore) -> None:
         state = RunState(agent_name="a", tenant_id="tenant1", run_id="r1")
-        run_sync(store.save(state))
-        assert run_sync(store.load("tenant2", "r1")) is None
+        run_sync(any_store.save(state))
+        assert run_sync(any_store.load("tenant2", "r1")) is None
 
     @pytest.mark.parametrize(("tenant", "run"), [("../x", "r"), ("t", "../../escape"), ("t", "a/b")])
-    def test_invalid_ids_are_rejected(self, store: CheckpointStore, tenant: str, run: str) -> None:
+    def test_invalid_ids_are_rejected(self, any_store: CheckpointStore, tenant: str, run: str) -> None:
         with pytest.raises(ValueError, match="Invalid"):
-            run_sync(store.load(tenant, run))
+            run_sync(any_store.load(tenant, run))
 
     def test_file_store_writes_atomically_without_leftovers(self, tmp_path: Path) -> None:
         file_store = JsonFileCheckpointStore(tmp_path)

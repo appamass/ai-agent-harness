@@ -16,7 +16,7 @@ Reference implementation: `ai_agent_harness/tools/builtin.py` (`AskUser` = async
 | `Risk.IRREVERSIBLE` | Sending, deleting, paying, publishing, merging | **Always** requires human approval |
 
 When in doubt, pick the higher risk level. Downgrading a tool's risk (e.g. small refunds classified as `WRITE`)
-is a business decision that requires an ADR and a hard guardrail (see `docs/use-cases/03-multi-tenant-customer-support.md`).
+is a business decision that requires an ADR and a hard guardrail.
 
 ## 2. Writing the Tool
 

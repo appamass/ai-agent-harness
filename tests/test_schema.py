@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -18,11 +18,9 @@ from pydantic import BaseModel
 from ai_agent_harness import (
     Agent,
     Autonomy,
-    BaseTool,
     ContextBuilder,
     JsonFileCheckpointStore,
     ModelRouter,
-    Risk,
     RunState,
     RunStatus,
     ToolRegistry,
@@ -31,46 +29,22 @@ from ai_agent_harness import (
 )
 from ai_agent_harness.core import InvalidStateError, SchemaVersionError
 from ai_agent_harness.core import state as state_module
+from ai_agent_harness.core.types import canonical_digest
 from ai_agent_harness.testing import FakeProvider, text_response
 
-from .conftest import assert_consistent, run_sync
+from .conftest import FIXTURES_DIR, Echo, WriteFile, assert_consistent, run_sync
 
-FIXTURE = Path(__file__).parent / "fixtures" / "checkpoint_v1_waiting_for_approval.json"
-
-
-class WriteInput(BaseModel):
-    path: str
-
-
-class Write(BaseTool[WriteInput]):
-    name: ClassVar[str] = "write_file"
-    description: ClassVar[str] = "writes a file"
-    input_model: ClassVar[type[BaseModel]] = WriteInput
-    risk: ClassVar[Risk] = Risk.WRITE
-
-    def __init__(self) -> None:
-        self.written: list[str] = []
-
-    async def run(self, args: WriteInput, state: RunState) -> str:
-        self.written.append(args.path)
-        return "ok"
+FIXTURE = FIXTURES_DIR / "checkpoint_v1_waiting_for_approval.json"
+FIXTURE_V2 = FIXTURES_DIR / "checkpoint_v2_waiting_for_approval.json"
+FIXTURE_V3 = FIXTURES_DIR / "checkpoint_v3_done_with_output.json"
+FIXTURE_V4 = FIXTURES_DIR / "checkpoint_v4_done_with_output.json"
 
 
-class NoInput(BaseModel):
-    pass
+def load_fixture(path: Path) -> RunState:
+    return restore_state(path.read_text(encoding="utf-8"))
 
 
-class Echo(BaseTool[NoInput]):
-    name: ClassVar[str] = "echo"
-    description: ClassVar[str] = "echo"
-    input_model: ClassVar[type[BaseModel]] = NoInput
-    risk: ClassVar[Risk] = Risk.READ
-
-    async def run(self, args: NoInput, state: RunState) -> str:
-        return "echo"
-
-
-def _agent(write: Write, store: JsonFileCheckpointStore | None = None) -> Agent:
+def _agent(write: WriteFile, store: JsonFileCheckpointStore | None = None) -> Agent:
     return Agent(
         name="fixture",
         router=ModelRouter(FakeProvider([text_response("completed")])),
@@ -92,7 +66,7 @@ def test_v1_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
     assert state.schema_version == state_module.SCHEMA_VERSION
     assert state.status is RunStatus.WAITING_FOR_APPROVAL
 
-    write = Write()
+    write = WriteFile()
     done = run_sync(resume(_agent(write, store), state, approved=True, pending_id=state.pending_id))
     assert done.status is RunStatus.DONE
     assert write.written == ["a.py"]
@@ -102,11 +76,86 @@ def test_v1_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
     assert reloaded.model_dump() == done.model_dump()
 
 
+def test_v2_fixture_still_loads_and_resumes(tmp_path: Path) -> None:
+    """Verifies that real v2 checkpoints load, migrate to the current version, and resume cleanly."""
+    (tmp_path / "customer-1").mkdir()
+    shutil.copy(FIXTURE_V2, tmp_path / "customer-1" / "fixture-v2-waiting.json")
+    store = JsonFileCheckpointStore(tmp_path)
+    state = run_sync(store.load("customer-1", "fixture-v2-waiting"))
+    assert state is not None
+    assert state.schema_version == state_module.SCHEMA_VERSION
+    assert state.status is RunStatus.WAITING_FOR_APPROVAL
+
+    write = WriteFile()
+    done = run_sync(resume(_agent(write, store), state, approved=True, pending_id=state.pending_id))
+    assert done.status is RunStatus.DONE
+    assert write.written == ["a.py"]
+    assert_consistent(done)
+    reloaded = run_sync(store.load("customer-1", "fixture-v2-waiting"))
+    assert reloaded is not None
+    assert reloaded.model_dump() == done.model_dump()
+
+
+@pytest.mark.parametrize("fixture", [FIXTURE_V3, FIXTURE_V4], ids=["v3", "v4"])
+def test_a_fixture_keeps_its_structured_output_and_demands_the_same_model_on_resume(fixture: Path) -> None:
+    """The v3 format added `output_schema`, `output_model_name`, and `output`; v4 keeps only the schema's digest."""
+
+    class Weather(BaseModel):
+        city: str
+        celsius: float
+
+    class Other(BaseModel):
+        value: int
+
+    state = load_fixture(fixture)
+    assert state.schema_version == state_module.SCHEMA_VERSION and state.status is RunStatus.DONE
+    assert state.output_model_name == "Weather"
+    assert state.output_as(Weather) == Weather(city="customer-city", celsius=3.5)
+    assert state.output_schema_digest == canonical_digest(Weather.model_json_schema())
+
+    write = WriteFile()
+    with pytest.raises(InvalidStateError, match="output_model"):
+        run_sync(resume(_agent(write), state, user_input="again"))
+    with pytest.raises(InvalidStateError, match="does not match"):
+        run_sync(resume(_agent(write), state, user_input="again", output_model=Other))
+
+
+def test_the_migrated_v3_fixture_resumes_with_its_own_output_model() -> None:
+    class Weather(BaseModel):
+        city: str
+        celsius: float
+
+    state = load_fixture(FIXTURE_V3)
+    answer = text_response('{"city": "Bern", "celsius": 2.0}')
+    agent = Agent(name="fixture", router=ModelRouter(FakeProvider([answer])), context=ContextBuilder("s"))
+    done = run_sync(resume(agent, state, user_input="again", output_model=Weather))
+    assert done.status is RunStatus.DONE  # the digest of the migrated schema matches the model
+    assert done.output_as(Weather) == Weather(city="Bern", celsius=2.0)
+
+
+@pytest.mark.parametrize("value", ["garbage", [1, 2], 5])
+def test_a_v3_state_with_an_invalid_output_schema_is_rejected(value: object) -> None:
+    raw = json.loads(FIXTURE_V3.read_text(encoding="utf-8"))
+    raw["output_schema"] = value
+    with pytest.raises(SchemaVersionError, match="output_schema"):
+        restore_state(json.dumps(raw))
+
+
+@pytest.mark.parametrize("drop", [True, False])
+def test_a_v3_state_without_an_output_schema_stays_unbound(drop: bool) -> None:
+    raw = json.loads(FIXTURE_V3.read_text(encoding="utf-8"))
+    if drop:
+        del raw["output_schema"]
+    else:
+        raw["output_schema"] = None
+    assert restore_state(json.dumps(raw)).output_schema_digest is None
+
+
 def test_resume_refuses_a_state_from_another_schema_version() -> None:
     """States loaded bypassing `restore_state` (e.g. a broken custom store) must not be allowed to run."""
-    state = restore_state(FIXTURE.read_text(encoding="utf-8"))
+    state = load_fixture(FIXTURE)
     state.schema_version = state_module.SCHEMA_VERSION + 1
-    write = Write()
+    write = WriteFile()
     with pytest.raises(InvalidStateError, match="schema version"):
         run_sync(resume(_agent(write), state, approved=True, pending_id=state.pending_id))
     assert write.written == []
@@ -119,7 +168,7 @@ def test_migration_returning_garbage_is_a_schema_error(monkeypatch: pytest.Monke
     monkeypatch.setattr(state_module, "SCHEMA_VERSION", 2)
     monkeypatch.setattr(state_module, "MIGRATIONS", {1: broken})
     with pytest.raises(SchemaVersionError, match="Migration"):
-        restore_state(FIXTURE.read_text(encoding="utf-8"))
+        load_fixture(FIXTURE)
 
 
 def test_state_without_version_is_treated_as_v1(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -167,7 +216,7 @@ def test_migrations_are_applied_in_order(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(state_module, "SCHEMA_VERSION", 3)
     monkeypatch.setattr(state_module, "MIGRATIONS", {1: v1_to_v2, 2: v2_to_v3})
-    state = restore_state(FIXTURE.read_text(encoding="utf-8"))
+    state = load_fixture(FIXTURE)
     assert calls == [1, 2]
     assert state.schema_version == 3
     assert state.status_reason == "migrated"
@@ -177,7 +226,7 @@ def test_missing_migration_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(state_module, "SCHEMA_VERSION", 2)
     monkeypatch.setattr(state_module, "MIGRATIONS", {})
     with pytest.raises(SchemaVersionError, match="No migration"):
-        restore_state(FIXTURE.read_text(encoding="utf-8"))
+        load_fixture(FIXTURE)
 
 
 def test_non_object_is_rejected() -> None:
@@ -193,9 +242,9 @@ def test_migrated_state_resumes_after_a_version_bump(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(state_module, "SCHEMA_VERSION", 2)
     monkeypatch.setattr(state_module, "MIGRATIONS", {1: v1_to_v2})
-    state = restore_state(FIXTURE.read_text(encoding="utf-8"))
+    state = load_fixture(FIXTURE)
     assert state.schema_version == 2
-    write = Write()
+    write = WriteFile()
     done = run_sync(resume(_agent(write), state, approved=True, pending_id=state.pending_id))
     assert done.status is RunStatus.DONE
     assert write.written == ["a.py"]

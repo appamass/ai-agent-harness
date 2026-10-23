@@ -1,0 +1,28 @@
+{
+  "id": "chatcmpl-fixture-reasoning",
+  "object": "chat.completion",
+  "created": 1729600000,
+  "model": "o3-mini",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "The answer is 42.",
+        "reasoning_content": "Let me calculate step by step..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 60,
+    "completion_tokens": 100,
+    "total_tokens": 160,
+    "prompt_tokens_details": {
+      "cached_tokens": 30
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 80
+    }
+  }
+}

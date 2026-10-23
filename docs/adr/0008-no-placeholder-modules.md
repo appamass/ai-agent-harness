@@ -6,18 +6,12 @@
 
 ## Context
 
-An early draft of this repository contained 37 out of 68 Python files with no working logic (empty
-packages, stubs raising `NotImplementedError`, and protocols without implementations). They created a
-false sense of completeness and added maintenance overhead.
+An early draft had 37 of 68 Python files without working logic (empty packages, `NotImplementedError` stubs). They gave a false sense of completeness.
 
 ## Decision
 
-New modules, packages, and interfaces may only be added when accompanied by at least one real,
-working implementation and automated tests. Planned extension points are documented in `docs/how-it-works.md`
-(Mapping to the harness taxonomy) and demonstrated as executable patterns in `docs/use-cases/`.
+New modules, packages, and interfaces need a real implementation and tests. Ideas for later are not kept as empty files; `HARNESS_TAXONOMY.md` only catalogues concepts.
 
 ## Consequences
 
-- Positive: Every file in `ai_agent_harness/` represents working, tested production code.
-- Negative: The directory tree alone does not advertise every future extension — `docs/how-it-works.md` and `docs/use-cases/` serve that role instead.
-- Verification: Enforced by `tests/test_architecture.py` (no empty files or `NotImplementedError` stubs).
+The file tree does not show future extensions. Enforced by `test_no_placeholder_modules` in `tests/test_architecture.py` (no empty modules, no `NotImplementedError` stubs).

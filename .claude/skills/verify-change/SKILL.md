@@ -43,7 +43,7 @@ Check against **all** invariants in `AGENTS.md` (do not rely on memory). Pay spe
 
 ## 4. Documentation
 
-- Executable blocks (`# executable`) in `docs/use-cases/` and `docs/first-real-run.md` pass (`pytest tests/test_docs.py`).
+- Executable blocks (`# executable`) in `README.md`, `docs/guide.md`, and the ai-kit recipes pass (`pytest tests/test_docs.py`).
 - `README.md`, `AGENTS.md`, and ADRs remain accurate.
 
 ## 5. Independent Architecture Review

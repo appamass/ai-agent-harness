@@ -126,8 +126,7 @@ class TestRunStateProtocol:
 def _state_with_open_call() -> RunState:
     state = RunState(agent_name="t")
     state.add_user_text("go")
-    call = ToolCall(id="c1", name="echo")
-    state.add_assistant(Message(role="assistant", content=(call,)))
+    state.add_assistant(assistant_with_call())
     return state
 
 

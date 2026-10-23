@@ -31,7 +31,6 @@ from ai_agent_harness import (
     Risk,
     RunState,
     RunStatus,
-    ToolRegistry,
     resume,
     start,
 )
@@ -60,11 +59,11 @@ def live_agent(
     **kwargs: Any,
 ) -> tuple[Agent, list[Event]]:
     events: list[Event] = []
-    agent = Agent(
+    agent = Agent.create(
+        ModelRouter(live_provider(), retry=RetryPolicy(max_attempts=2, base_delay_s=2.0, max_delay_s=10.0)),
+        ContextBuilder("You are a precise assistant in an automated test. Be brief.", max_tokens=max_tokens),
         name="live",
-        router=ModelRouter(live_provider(), retry=RetryPolicy(max_attempts=2, base_delay_s=2.0, max_delay_s=10.0)),
-        context=ContextBuilder("You are a precise assistant in an automated test. Be brief.", max_tokens=max_tokens),
-        tools=ToolRegistry(tools),
+        tools=tools,
         autonomy=autonomy,
         limits=SMALL_LIMITS,
         **kwargs,
@@ -130,11 +129,11 @@ def test_sequential_tool_calls_keep_thinking_signatures_valid() -> None:
 def test_high_effort_with_tool_calls_round_trips_thinking_if_the_model_thinks() -> None:
     """Best effort: at high effort the model may think before a tool call; if it does, the signature is sent back."""
     provider = live_provider(effort="high")
-    agent = Agent(
+    agent = Agent.create(
+        ModelRouter(provider, retry=RetryPolicy(max_attempts=2, base_delay_s=2.0)),
+        ContextBuilder("You solve puzzles step by step and use tools for arithmetic.", max_tokens=4096),
         name="live-effort",
-        router=ModelRouter(provider, retry=RetryPolicy(max_attempts=2, base_delay_s=2.0)),
-        context=ContextBuilder("You solve puzzles step by step and use tools for arithmetic.", max_tokens=4096),
-        tools=ToolRegistry([AddOne()]),
+        tools=[AddOne()],
         limits=SMALL_LIMITS,
     )
     prompt = (

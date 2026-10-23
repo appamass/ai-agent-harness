@@ -18,9 +18,9 @@ from ai_agent_harness import RunState, RunStatus, resume, start
 from ai_agent_harness.core import InvalidStateError
 from ai_agent_harness.testing import FakeProvider, text_response, tool_response
 
-from .conftest import load_example, run_sync
+from .conftest import REPO_ROOT, Crash, load_example, results_of, run_sync
 
-EXAMPLE = Path(__file__).resolve().parent.parent / "examples" / "repo_assistant.py"
+EXAMPLE = REPO_ROOT / "examples" / "repo_assistant.py"
 
 
 @pytest.fixture(scope="module")
@@ -129,10 +129,6 @@ def test_resuming_an_unknown_or_finished_run_fails_clearly(example: Any, project
 # ------------------------------------------------------------------ Safety of the tools
 
 
-def results(state: RunState) -> list[Any]:
-    return [r for m in state.messages for r in m.tool_results]
-
-
 def test_secrets_cannot_be_read_even_if_the_model_asks(example: Any, project: Path, tmp_path: Path) -> None:
     agent, _ = agent_for(
         example,
@@ -146,7 +142,7 @@ def test_secrets_cannot_be_read_even_if_the_model_asks(example: Any, project: Pa
     )
     state = run_sync(example.run_question(agent, "Show me the token.", approve))
     assert state.status is RunStatus.DONE
-    assert [r.is_error for r in results(state)] == [True, True]
+    assert [r.is_error for r in results_of(state)] == [True, True]
     assert "do-not-leak" not in state.model_dump_json()
 
 
@@ -193,7 +189,7 @@ def test_a_bad_note_name_is_rejected_before_any_approval(example: Any, project: 
 
     state = run_sync(example.run_question(agent, "Save it.", record_and_approve))
     assert state.status is RunStatus.DONE and asked == []
-    assert results(state)[0].is_error and not (tmp_path / "evil.md").exists()
+    assert results_of(state)[0].is_error and not (tmp_path / "evil.md").exists()
 
 
 def test_kill_switch_stops_the_run_before_the_model_is_called(example: Any, project: Path, tmp_path: Path) -> None:
@@ -248,10 +244,6 @@ def test_without_a_key_the_real_mode_explains_what_to_do(
 
 
 # ------------------------------------------------------------------ Findings from the review
-
-
-class Crash(BaseException):  # not an Exception: the runner does not turn it into a status, like a killed process
-    pass
 
 
 def test_a_run_that_died_mid_way_is_recovered_with_resume(example: Any, project: Path, tmp_path: Path) -> None:
@@ -310,8 +302,8 @@ def test_ctrl_c_at_the_approval_prompt_exits_promptly() -> None:
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        cwd=EXAMPLE.parent.parent,
-        env={**os.environ, "PYTHONPATH": str(EXAMPLE.parent.parent)},
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
     )
     assert process.stdin is not None and process.stdout is not None
     try:
@@ -333,3 +325,51 @@ def test_ctrl_c_at_the_approval_prompt_exits_promptly() -> None:
         process.stdout.close()
         if process.stderr is not None:
             process.stderr.close()
+
+
+def test_incident_responder_demo() -> None:
+    mod = load_example("incident_responder")
+    assert mod.main(["--demo"]) == 0
+
+
+def test_incident_responder_missing_args() -> None:
+    mod = load_example("incident_responder")
+    assert mod.main([]) == 2
+
+
+def test_incident_responder_stage1_and_stage2_flows() -> None:
+    mod = load_example("incident_responder")
+    from ai_agent_harness import Autonomy
+
+    provider1 = FakeProvider([text_response("Stage 1 complete")])
+    agent1 = mod.build_incident_agent(provider1, stage=1)
+    assert agent1.autonomy is Autonomy.READ_ONLY
+    assert "rollback_deploy" not in agent1.tools.names()
+
+    provider2 = FakeProvider([text_response("Stage 2 complete")])
+    agent2 = mod.build_incident_agent(provider2, stage=2)
+    assert agent2.autonomy is Autonomy.ACT_WITH_APPROVAL
+    assert "rollback_deploy" in agent2.tools.names()
+
+
+def test_incident_responder_stage_1_cannot_roll_back_and_stage_2_needs_approval() -> None:
+    """Runs the real agents: a rollback asked for in stage 1 is refused, in stage 2 it waits for a human."""
+    from ai_agent_harness import RunStatus, start
+
+    mod = load_example("incident_responder")
+    rollback = (
+        "rollback_deploy",
+        {"service": "checkout", "to_deploy": "d-1041", "reason": "d-1042 caused the 500 spike"},
+    )
+    deploys = mod.IncidentDeps(deploys=mod.DeployClient(token="test-token"))
+
+    stage_1 = mod.build_incident_agent(FakeProvider([tool_response(rollback), text_response("cannot")]), stage=1)
+    refused = run_sync(start(stage_1, "Roll it back", deps=deploys))
+    assert refused.status is RunStatus.DONE
+    assert "Unknown tool" in refused.messages[2].tool_results[0].content
+    assert deploys.deploys.rollbacks == []
+
+    stage_2 = mod.build_incident_agent(FakeProvider([tool_response(rollback)]), stage=2)
+    waiting = run_sync(start(stage_2, "Roll it back", deps=deploys))
+    assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
+    assert deploys.deploys.rollbacks == []  # nothing ran before a human said yes

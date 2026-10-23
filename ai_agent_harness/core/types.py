@@ -9,7 +9,10 @@ so typos in adapters fail immediately.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
@@ -17,6 +20,42 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 ID_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 """Allowed format for tool names, run IDs, and tenant IDs (safe for filenames and APIs)."""
+ID_RE = re.compile(ID_PATTERN)
+_NOT_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def canonical_digest(payload: dict[str, Any]) -> str:
+    """SHA-256 (64 hex chars) over the canonical JSON form of `payload`: stable across key order and platforms."""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def sanitize_id(value: str) -> str:
+    """Replaces every character an ID may not contain with `_` (the length is not changed)."""
+    return _NOT_ID_CHARS.sub("_", value)
+
+
+def is_positive_number(value: object, *, integer: bool = False) -> bool:
+    """True for a finite number > 0 (an `int` when `integer`). Bools are ints in Python and are rejected."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    if isinstance(value, float):  # ints are always finite (and `math.isfinite` would overflow on huge ones)
+        return not integer and math.isfinite(value) and value > 0
+    return value > 0
+
+
+TruncationMode = Literal["head_and_tail", "head"]
+"""How an oversized tool result is cut: keep head and tail, or only the head."""
+
+DEFAULT_MAX_RESULT_CHARS = 20_000
+DEFAULT_TRUNCATION_MODE: TruncationMode = "head_and_tail"
+
+CHARS_PER_TOKEN = 3
+"""Characters per token when a size in characters becomes a token estimate (ADR 0026).
+Deliberately low (real text is about 3.5 to 4 characters per token), so the estimate errs on the side of caution."""
+
+FINAL_OUTPUT_TOOL_NAME = "final_output"
+"""Reserved tool name the runner offers for structured final output (ADR 0023). Agents cannot register it."""
 
 
 class _Frozen(BaseModel):
@@ -180,6 +219,11 @@ class Usage(_Frozen):
         """All processed tokens — basis for `Limits.max_total_tokens`."""
         return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens + self.output_tokens
 
+    @property
+    def prompt_tokens(self) -> int:
+        """All input tokens of one call: fresh input plus cache reads and cache writes (ADR 0026)."""
+        return self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+
     def __add__(self, other: Usage) -> Usage:
         return Usage(
             input_tokens=self.input_tokens + other.input_tokens,
@@ -204,6 +248,7 @@ class ModelRequest(_Frozen):
     system: str
     messages: tuple[Message, ...] = Field(min_length=1)
     tools: tuple[ToolSpec, ...] = ()
+    output_schema: dict[str, Any] | None = None
     max_tokens: int = Field(default=4096, gt=0)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
@@ -217,28 +262,40 @@ class ModelRequest(_Frozen):
 
         Provider data on thinking blocks (e.g. encrypted reasoning) is included. Image data is not
         counted (providers bill images by pixel dimensions, not base64 string length).
-        Basis for `Limits.max_context_chars` — an estimate, not a tokenizer.
+        Basis for `Limits.max_context_chars` — an estimate, not a tokenizer. `CHARS_PER_TOKEN` turns it into tokens.
         """
-        size = len(self.system) + sum(len(spec.model_dump_json()) for spec in self.tools)
-        for message in self.messages:
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    size += len(block.text)
-                elif isinstance(block, ThinkingBlock):
-                    size += len(block.text) + (_json_len(block.provider_data) if block.provider_data else 0)
-                elif isinstance(block, ToolResult):
-                    size += len(block.content)
-                elif isinstance(block, ToolCall):
-                    size += len(block.model_dump_json())
-        return size
+        size = len(self.system) + sum(tool_spec_chars(spec) for spec in self.tools)
+        if self.output_schema is not None:
+            size += json_chars(self.output_schema)
+        return size + sum(message_chars(message) for message in self.messages)
 
 
-def _json_len(data: dict[str, Any]) -> int:
+def json_chars(data: dict[str, Any]) -> int:
     """Length of opaque provider data as JSON — with a fallback so the estimate never fails."""
     try:
         return len(json.dumps(data, default=repr, ensure_ascii=False))
     except (TypeError, ValueError):  # e.g. non-string dictionary keys
         return len(repr(data))
+
+
+def tool_spec_chars(spec: ToolSpec) -> int:
+    """Size of one tool spec in characters, as counted by `ModelRequest.estimated_chars`."""
+    return len(spec.model_dump_json())
+
+
+def message_chars(message: Message) -> int:
+    """Size of one message in characters, as counted by `ModelRequest.estimated_chars`."""
+    size = 0
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            size += len(block.text)
+        elif isinstance(block, ThinkingBlock):
+            size += len(block.text) + (json_chars(block.provider_data) if block.provider_data else 0)
+        elif isinstance(block, ToolResult):
+            size += len(block.content)
+        elif isinstance(block, ToolCall):
+            size += len(block.model_dump_json())
+    return size
 
 
 class ModelResponse(_Frozen):

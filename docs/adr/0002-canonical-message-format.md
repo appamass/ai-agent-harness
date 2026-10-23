@@ -1,4 +1,4 @@
-# 0002 – Canonical Message Format with Provider Adapters
+# 0002 – Canonical Message Format
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-15
@@ -6,26 +6,17 @@
 
 ## Context
 
-Models from different providers differ in message structure, tool calls, thinking/reasoning blocks,
-error codes, and stop reasons. Without a unified internal representation, provider-specific quirks
-leak into the agent loop and guardrails.
+Providers differ in messages, tool calls, reasoning blocks, errors, and stop reasons. Without one internal format, their quirks leak into the loop and the guardrails.
 
 ## Decision
 
-We define a canonical, immutable message format (`Message`, `TextBlock`, `ImageBlock`, `ThinkingBlock`
-with opaque `provider_data`, `ToolCall`, `ToolResult`, `StopReason`, `Usage`). Each provider gets an
-adapter that translates strictly at the boundary and declares its `Capabilities`. `ModelRouter` filters
-providers by capability, retries transient errors, fails over across providers, and enforces request timeouts.
+One immutable format (`Message`, `TextBlock`, `ImageBlock`, `ThinkingBlock` with opaque `provider_data`, `ToolCall`, `ToolResult`, `StopReason`, `Usage`). Each provider has an adapter that translates at the boundary and declares its `Capabilities`. `ModelRouter` picks capable providers, retries transient errors, fails over, and enforces timeouts.
 
-## Alternatives
+## Rejected
 
-| Alternative | Why Rejected |
-|---|---|
-| Use one provider's wire format internally | Couples the core to that vendor and turns every other adapter into a leaky special case |
-| Lowest common denominator (text + tool calls only, no thinking/images) | Sacrifices model capabilities and breaks providers that require thinking blocks to be echoed back in multi-turn tool loops |
+- One vendor's wire format inside: couples the core to that vendor.
+- Text and tool calls only: loses thinking blocks that some providers need echoed back.
 
 ## Consequences
 
-- Positive: The agent loop, hooks, and tests are completely provider-agnostic; `FakeProvider` enables deterministic testing of every path.
-- Negative: Each provider adapter must carefully translate wire formats and classify errors accurately.
-- Verification: `extra="forbid"` and validators in `types.py`; tested in `tests/test_types_and_state.py` and `tests/test_router.py`.
+Each adapter must translate carefully and classify errors accurately. Tested in `tests/test_types_and_state.py` and `tests/test_router.py`.

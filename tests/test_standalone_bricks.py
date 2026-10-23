@@ -18,7 +18,6 @@ from ai_agent_harness import (
     Risk,
     RunState,
     StopReason,
-    TextBlock,
     ToolCall,
     ToolExecutor,
     ToolInvocation,
@@ -28,8 +27,9 @@ from ai_agent_harness import (
 from ai_agent_harness.core import ConfigError, ProviderError
 from ai_agent_harness.core.hooks import Action
 from ai_agent_harness.core.state import PendingCall
+from ai_agent_harness.testing import text_response
 
-from .conftest import PathInput, no_sleep, run_sync
+from .conftest import PathInput, invocation, no_sleep, run_sync
 
 
 def test_hook_pipeline_runs_standalone_with_none_state() -> None:
@@ -64,18 +64,14 @@ def test_hook_pipeline_runs_standalone_with_none_state() -> None:
     assert run_sync(pipeline.on_user_input(None, "bad")).action is Action.BLOCK
 
     req = ModelRequest(system="sys", messages=(Message.user("hi"),))
-    resp = ModelResponse(
-        message=Message(role="assistant", content=(TextBlock(text="ok"),)),
-        stop_reason=StopReason.END,
-    )
+    resp = text_response("ok")
     assert run_sync(pipeline.before_model(None, req)).action is Action.CONTINUE
     assert run_sync(pipeline.after_model(None, resp)).action is Action.CONTINUE
 
-    call = ToolCall(id="c1", name="write_file", arguments={"path": "tests/test_x.py"})
-    inv = ToolInvocation(call=call, tool_name="write_file", risk=Risk.WRITE, args=PathInput(path="tests/test_x.py"))
+    inv = invocation(PathInput(path="tests/test_x.py"), name="write_file")
     assert run_sync(pipeline.before_tool(None, inv)).action is Action.BLOCK
 
-    ok_inv = ToolInvocation(call=call, tool_name="write_file", risk=Risk.WRITE, args=PathInput(path="src/app.py"))
+    ok_inv = invocation(PathInput(path="src/app.py"), name="write_file")
     assert run_sync(pipeline.before_tool(None, ok_inv)).action is Action.CONTINUE
     res = ToolResult(call_id="c1", content="done")
     assert run_sync(pipeline.after_tool(None, ok_inv, res)).action is Action.CONTINUE
@@ -149,10 +145,7 @@ def test_callable_provider_and_standalone_router() -> None:
 
 def test_callable_provider_validation() -> None:
     async def valid(request: ModelRequest) -> ModelResponse:
-        return ModelResponse(
-            message=Message(role="assistant", content=(TextBlock(text="full"),)),
-            stop_reason=StopReason.END,
-        )
+        return text_response("full")
 
     provider = CallableProvider(valid, id="custom")
     req = ModelRequest(system="s", messages=(Message.user("hi"),))

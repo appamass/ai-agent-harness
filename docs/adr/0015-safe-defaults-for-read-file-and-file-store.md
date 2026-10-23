@@ -1,50 +1,31 @@
-# 0015 – Default Deny List for `ReadFile`; File Store Is POSIX-Only
+# 0015 – Deny List for `ReadFile`; File Store Is POSIX-Only
 
 - **Status:** Accepted (maintainer, 2026-10-18)
 - **Date:** 2026-10-18
-- **Affects:** `ai_agent_harness/tools/builtin.py` (`ReadFile`, `DEFAULT_DENIED_READS`), `ai_agent_harness/persistence.py`
-  (`JsonFileCheckpointStore`), `ai_agent_harness/policy.py` (`Limits`), public API (`DEFAULT_DENIED_READS`)
+- **Affects:** `ai_agent_harness/tools/builtin.py` (`ReadFile`, `DEFAULT_DENIED_READS`), `persistence.py` (`JsonFileCheckpointStore`), `policy.py` (`Limits`)
 
 ## Context
 
-A pre-publication review found three safe-by-default gaps:
+A review before publication found three unsafe defaults:
 
-1. `ReadFile` is `Risk.READ`, so the policy allows it even at `read_only`. Its only boundary was the root
-   directory. A model could read `.env`, `secrets/`, private keys, and `.git/` inside the project.
-2. Without `fcntl` (e.g. Windows), `JsonFileCheckpointStore` took no lock at all, while a comment claimed
-   in-process locking. Two workers could claim the same run and execute one action twice (invariant 6, ADR 0006).
-3. `Limits` accepted NaN: every comparison with NaN is false, so `max_seconds=nan` silently disabled the time limit.
+1. `ReadFile` is `Risk.READ`, so it runs even at `read_only`, and its only limit was the root directory. A model could read `.env`, `secrets/`, keys, and `.git/`.
+2. Without `fcntl` (Windows) the file store took no lock, so two workers could claim a run and run an action twice.
+3. `Limits` accepted NaN, so `max_seconds=nan` silently disabled the time limit.
 
 ## Decision
 
-- `ReadFile(root, *, max_bytes=..., denied=DEFAULT_DENIED_READS)`. `DEFAULT_DENIED_READS` is
-  `(".env", ".env.*", "*.env", "secrets", ".git", "*.pem", "*.key")` and part of the public API. Each pattern is a
-  name (no path separators, no outer spaces) and matches any single part of the path relative to the root,
-  case-insensitive (`casefold` + `fnmatchcase`). Both the requested path (normalized, not resolved) and the
-  resolved path are checked, so `harmless.txt -> .env` and the alias `.env -> vault/prod` are both blocked.
-  Blocking a denied alias does not protect its target: `vault/prod` stays readable by its own name unless it
-  also matches a pattern or lies outside the root.
-  `denied` **replaces** the default; callers extend it with `(*DEFAULT_DENIED_READS, ...)`, `()` disables it.
-  Invalid patterns raise `ConfigError` at construction.
-- `JsonFileCheckpointStore.__init__` raises `ConfigError` when `fcntl` is missing. There is no Windows lock.
+- `ReadFile(root, *, max_bytes=..., denied=DEFAULT_DENIED_READS)`. The default is `(".env", ".env.*", "*.env", "secrets", ".git", "*.pem", "*.key")` (later extended, ADR 0019). A pattern is a plain name and matches any single part of the path relative to the root, case-insensitively. Both the requested path (normalized) and the resolved path are checked, so an alias such as `harmless.txt -> .env` is blocked. The target of a denied alias stays readable under its own name unless it matches too or lies outside the root. `denied` **replaces** the default (`(*DEFAULT_DENIED_READS, ...)` extends it, `()` disables it); invalid patterns raise `ConfigError`.
+- `JsonFileCheckpointStore` raises `ConfigError` when `fcntl` is missing.
 - `Limits` rejects bools, non-numbers, and non-finite floats with `ConfigError`.
 
-## Alternatives
+## Rejected
 
-| Alternative | Why Rejected |
-|---|---|
-| Lock with `msvcrt.locking` on Windows | Cannot be tested in CI today; an untested lock in a crash-safety path is worse than a clear refusal. |
-| Thread lock only on Windows | Does not protect two processes — exactly the case that repeats actions. |
-| Allowlist of readable files | Safer, but breaks the common "read the project" use; projects can still build one as a hook. |
-| Deny list that extends instead of replaces | Then the default cannot be removed for projects that need it; replacing is explicit and auditable. |
-| Content-based secret scanning | Heuristic, slow, and gives a false sense of safety; out of scope for a reference tool. |
+- `msvcrt.locking` on Windows: untestable in CI; an untested lock in a crash-safety path is worse than a refusal.
+- Thread lock only: does not protect two processes.
+- Allowlist of files: breaks "read the project"; projects can add one as a hook.
+- Extending instead of replacing the list: the default could not be removed.
+- Content scanning for secrets: heuristic and false comfort.
 
 ## Consequences
 
-- Positive: The read-only default no longer exposes common secret files; the file store never runs without
-  a cross-process lock; misconfigured limits fail at construction.
-- Negative / Cost: Breaking behavior for projects that read `.env*`, `*.key`, etc. via `ReadFile`, and for
-  Windows users of `JsonFileCheckpointStore`. The deny list checks names only: hard links, symlink chains,
-  symlink swaps between check and read, and targets of denied aliases (by their own names) still get through (README Known Limitations).
-- Verification: `tests/test_tools.py::TestReadFile`, `tests/test_guardrails_and_persistence.py::TestCheckpoints::
-  test_file_store_refuses_platforms_without_file_locks`, `tests/test_config_and_misc.py::test_limits_*`.
+Breaking for projects that read `.env*` or `*.key` with `ReadFile`, and for Windows users of the file store. Hard links, symlink chains, and swaps between check and read still get through (`docs/known-limitations.md`). Tested in `tests/test_tools.py`, `tests/test_guardrails_and_persistence.py`, `tests/test_config_and_misc.py`.

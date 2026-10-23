@@ -1,12 +1,10 @@
 # Architecture Decision Records
 
-Every decision affecting architecture, invariants, the public API, security, or dependencies is
-documented here with context, rejected alternatives, and consequences. Create new ADRs using the
-`write-adr` skill or [`0000-template.md`](0000-template.md). The `Accepted` status is set by a human.
+Short records of decisions that affect architecture, invariants, the public API, security, or dependencies: context, decision, what was rejected, consequences. New ones follow [`0000-template.md`](0000-template.md) (or use the `write-adr` skill). A human sets `Accepted`.
 
 | No. | Decision | Status |
 |---|---|---|
-| [0001](0001-custom-core-over-agent-framework.md) | Custom lean core instead of an external agent framework | Accepted |
+| [0001](0001-custom-core-over-agent-framework.md) | Own core instead of an agent framework | Accepted |
 | [0002](0002-canonical-message-format.md) | Canonical message format with provider adapters | Accepted |
 | [0003](0003-protocol-invariants-in-runstate.md) | Enforce protocol invariants in `RunState` | Accepted |
 | [0004](0004-hooks-fail-closed.md) | Typed hooks with per-stage allowed decisions, fail-closed | Accepted |
@@ -25,3 +23,13 @@ documented here with context, rejected alternatives, and consequences. Create ne
 | [0017](0017-anthropic-provider-adapter.md) | Anthropic provider adapter as an optional extra | Accepted |
 | [0018](0018-postgres-checkpoint-store.md) | PostgreSQL checkpoint store as an optional extra | Accepted |
 | [0019](0019-modular-bricks-and-security-guards.md) | Standalone modular bricks, ergonomic shorthands, and built-in security guards | Accepted |
+| [0020](0020-sqlite-checkpoint-store.md) | SQLite checkpoint store for local, embedded, and Windows environments | Accepted |
+| [0021](0021-openai-provider-adapter.md) | OpenAI-compatible provider adapter as an optional extra | Accepted |
+| [0022](0022-opentelemetry-and-smart-truncation.md) | OpenTelemetry event listener and smart tool truncation | Accepted |
+| [0023](0023-structured-final-output.md) | Structured final output (`output_model`) with 3-tier capability degradation | Accepted |
+| [0024](0024-mcp-integration-and-trust-model.md) | MCP integration with mandatory risk classification and rug-pull prevention | Accepted |
+| [0025](0025-streaming-events-and-text-deltas.md) | Streaming events and text deltas with backpressure and cancellation safety | Accepted |
+| [0026](0026-token-estimate-and-context-compaction.md) | Token estimate calibrated by the provider; context compaction by clearing old tool results | Accepted |
+| [0027](0027-parallel-read-tools.md) | Optional parallel execution of read-only tools | Accepted |
+| [0028](0028-guard-precision-and-opt-in-detection.md) | Guard precision and opt-in detection | Accepted |
+| [0029](0029-checkpoint-encryption-and-retention.md) | Optional checkpoint encryption and retention purge | Accepted |

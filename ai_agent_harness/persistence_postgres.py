@@ -24,7 +24,7 @@ How it stays safe:
   `recover=True`.
 
 What it does not do: encrypt. Checkpoints contain full conversations. Use TLS (`sslmode=require`), a least-privilege
-database role, encryption at rest, or wrap the store like Use Case 01 (`EncryptedCheckpointStore`).
+database role, encryption at rest, or wrap the store with per-tenant encryption.
 By default every call opens a short-lived connection (simple, independent of the event loop). Pass `pool=` (an
 `AsyncConnectionPool` opened in your event loop) for a busy service.
 """
@@ -32,17 +32,18 @@ By default every call opens a short-lived connection (simple, independent of the
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import re
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Final
+from datetime import timedelta
+from typing import TYPE_CHECKING, Any, Final, LiteralString
 
 from .core.errors import ConcurrencyError, ConfigError
-from .core.state import RunState, RunStatus, restore_state
-from .persistence import check_ids, settle_write
+from .core.state import RunState, RunStatus
+from .persistence import RunInfo, check_ids, check_list_limit, check_tenant_id, load_state, settle_write
+from .persistence_sql import DEFAULT_TABLE, WriteRecord, sql_identifier, statements, status_index_name
+
+if TYPE_CHECKING:
+    from .encryption import StateCodec
 
 try:
     import psycopg
@@ -51,43 +52,14 @@ try:
 except ImportError as exc:
     raise ConfigError("The Postgres store needs the driver: pip install 'ai-agent-harness[postgres]'") from exc
 
-DEFAULT_TABLE: Final = "ai_agent_harness_checkpoints"
-MAX_LIST_LIMIT: Final = 10_000
-_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
-_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
-
-@dataclass(frozen=True)
-class RunInfo:
-    """Metadata of a stored run, for approval queues and recovery jobs. Content stays in the state itself."""
-
-    run_id: str
-    status: RunStatus
-    revision: int
-    updated_at: datetime
-
-
-@dataclass(frozen=True)
-class _Record:
-    tenant_id: str
-    run_id: str
-    expected: int
-    new_revision: int
-    payload: str
-    status: str
-    schema_version: int
-
-
-def _identifier(value: str, what: str) -> str:
-    if not _IDENTIFIER.fullmatch(value):
-        raise ConfigError(f"Invalid {what} identifier {value!r}: use 1-63 lower-case letters, digits, or underscores")
-    return value
+_CUTOFF: Final[LiteralString] = "(now() - (%s * interval '1 second'))"
+_SQL = statements("%s", "now()", _CUTOFF)
 
 
 def _create_statements(schema: str, table: str) -> list[sql.Composed]:
-    qualified = sql.Identifier(_identifier(schema, "schema"), _identifier(table, "table"))
-    # Names are cut at 63 characters: a short hash keeps long tables with a shared prefix from sharing an index name
-    index = sql.Identifier(f"{table[:30]}_{hashlib.sha256(table.encode()).hexdigest()[:8]}_status_idx")
+    qualified = sql.Identifier(sql_identifier(schema, "schema"), sql_identifier(table, "table"))
+    index = sql.Identifier(status_index_name(table))
     return [
         sql.SQL(
             "CREATE TABLE IF NOT EXISTS {table} ("
@@ -116,14 +88,16 @@ class PostgresCheckpointStore:
         pool: AsyncConnectionPool[Any] | None = None,
         schema: str = "public",
         table: str = DEFAULT_TABLE,
+        codec: StateCodec | None = None,
     ) -> None:
         if (dsn is None) == (pool is None):
             raise ConfigError("PostgresCheckpointStore needs exactly one of dsn or pool")
         self._dsn = dsn
         self._pool = pool
-        self._schema = _identifier(schema, "schema")
-        self._table = _identifier(table, "table")
+        self._schema = sql_identifier(schema, "schema")
+        self._table = sql_identifier(table, "table")
         self._qualified = sql.Identifier(self._schema, self._table)
+        self._codec = codec
 
     # ------------------------------------------------------------------ Setup
 
@@ -138,70 +112,60 @@ class PostgresCheckpointStore:
     async def save(self, state: RunState) -> None:
         """Saves and increments `state.revision`. Raises `ConcurrencyError` if another worker saved first."""
         check_ids(state.tenant_id, state.run_id)
-        new_revision = state.revision + 1
-        payload = state.model_copy(update={"revision": new_revision}).model_dump_json()
-        record = _Record(
-            state.tenant_id,
-            state.run_id,
-            state.revision,
-            new_revision,
-            payload,
-            str(state.status),
-            state.schema_version,
-        )
+        record = await asyncio.to_thread(WriteRecord.from_state, state, self._codec)
         write = asyncio.ensure_future(self._write(record))
-        await settle_write(write, state, new_revision)
+        await settle_write(write, state, record.new_revision)
 
     async def load(self, tenant_id: str, run_id: str) -> RunState | None:
         check_ids(tenant_id, run_id)
-        query = sql.SQL("SELECT state FROM {table} WHERE tenant_id = %s AND run_id = %s").format(table=self._qualified)
+        query = self._sql(_SQL.load)
         async with self._connection() as connection:
             row = await (await connection.execute(query, (tenant_id, run_id))).fetchone()
-        return restore_state(str(row[0]), tenant_id=tenant_id, run_id=run_id) if row is not None else None
+        if row is None:
+            return None
+        return await asyncio.to_thread(load_state, str(row[0]), tenant_id=tenant_id, run_id=run_id, codec=self._codec)
 
-    async def _write(self, record: _Record) -> None:
-        query = sql.SQL(
-            "INSERT INTO {table} AS c (tenant_id, run_id, revision, status, schema_version, state, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, now()) "
-            "ON CONFLICT (tenant_id, run_id) DO UPDATE SET revision = EXCLUDED.revision, status = EXCLUDED.status, "
-            "schema_version = EXCLUDED.schema_version, state = EXCLUDED.state, updated_at = now() "
-            "WHERE c.revision = %s RETURNING c.revision"
-        ).format(table=self._qualified)
-        params = (
-            record.tenant_id,
-            record.run_id,
-            record.new_revision,
-            record.status,
-            record.schema_version,
-            record.payload,
-            record.expected,
-        )
+    async def _write(self, record: WriteRecord) -> None:
+        query = self._sql(_SQL.upsert)
         async with self._connection() as connection:
-            row = await (await connection.execute(query, params)).fetchone()
+            row = await (await connection.execute(query, record.params)).fetchone()
         if row is None:  # the row exists with another revision: someone saved in the meantime
             raise ConcurrencyError(f"Run {record.run_id} was modified concurrently")
 
     # ------------------------------------------------------------------ Queries and retention
 
+    async def purge_finished(self, *, older_than: timedelta, tenant_id: str | None = None) -> int:
+        """Purges finished runs updated more than `older_than` ago.
+
+        Never touches running or waiting runs. If `tenant_id` is given, restricts to that tenant.
+        Returns the number of purged runs.
+        """
+        if not isinstance(older_than, timedelta) or older_than.total_seconds() <= 0:
+            raise ValueError("older_than must be a positive timedelta")
+        if tenant_id is not None:
+            check_tenant_id(tenant_id)
+        seconds = older_than.total_seconds()
+        if tenant_id is None:
+            query = self._sql(_SQL.purge_all)
+            params: tuple[Any, ...] = (seconds,)
+        else:
+            query = self._sql(_SQL.purge_tenant)
+            params = (tenant_id, seconds)
+        async with self._connection() as connection:
+            result = await connection.execute(query, params)
+            return result.rowcount if result.rowcount >= 0 else 0
+
     async def list_runs(self, tenant_id: str, *, status: RunStatus | None = None, limit: int = 100) -> list[RunInfo]:
         """Runs of one tenant, newest first. For example `status=RunStatus.WAITING_FOR_APPROVAL` for an approval queue.
         For a recovery job use `RunStatus.RUNNING` and look at `updated_at`: a run that is `running` but has not been
         saved for longer than your longest step has probably lost its process (resume it with `recover=True`)."""
-        if not _ID.fullmatch(tenant_id):
-            raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
-        if not 1 <= limit <= MAX_LIST_LIMIT:
-            raise ValueError(f"limit must be between 1 and {MAX_LIST_LIMIT}")
+        check_tenant_id(tenant_id)
+        check_list_limit(limit)
         if status is None:
-            query = sql.SQL(
-                "SELECT run_id, status, revision, updated_at FROM {table} WHERE tenant_id = %s "
-                "ORDER BY updated_at DESC, run_id LIMIT %s"
-            ).format(table=self._qualified)
+            query = self._sql(_SQL.list_all)
             params: tuple[Any, ...] = (tenant_id, limit)
         else:
-            query = sql.SQL(
-                "SELECT run_id, status, revision, updated_at FROM {table} WHERE tenant_id = %s AND status = %s "
-                "ORDER BY updated_at DESC, run_id LIMIT %s"
-            ).format(table=self._qualified)
+            query = self._sql(_SQL.list_status)
             params = (tenant_id, str(status), limit)
         async with self._connection() as connection:
             records = await (await connection.execute(query, params)).fetchall()
@@ -210,21 +174,23 @@ class PostgresCheckpointStore:
     async def delete_run(self, tenant_id: str, run_id: str) -> bool:
         """Deletes one run (retention policy, right to erasure). Returns whether a run existed."""
         check_ids(tenant_id, run_id)
-        query = sql.SQL("DELETE FROM {table} WHERE tenant_id = %s AND run_id = %s").format(table=self._qualified)
+        query = self._sql(_SQL.delete_run)
         async with self._connection() as connection:
             cursor = await connection.execute(query, (tenant_id, run_id))
             return cursor.rowcount > 0
 
     async def delete_tenant(self, tenant_id: str) -> int:
         """Deletes all runs of a tenant (for example when an account is closed). Returns how many were deleted."""
-        if not _ID.fullmatch(tenant_id):
-            raise ValueError(f"Invalid tenant_id: {tenant_id!r}")
-        query = sql.SQL("DELETE FROM {table} WHERE tenant_id = %s").format(table=self._qualified)
+        check_tenant_id(tenant_id)
+        query = self._sql(_SQL.delete_tenant)
         async with self._connection() as connection:
             cursor = await connection.execute(query, (tenant_id,))
             return cursor.rowcount
 
     # ------------------------------------------------------------------ Connections
+
+    def _sql(self, template: LiteralString) -> sql.Composed:
+        return sql.SQL(template).format(table=self._qualified)
 
     @asynccontextmanager
     async def _connection(self) -> AsyncGenerator[psycopg.AsyncConnection[Any]]:

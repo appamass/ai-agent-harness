@@ -1,7 +1,7 @@
 # CI for ai-agent-harness. Runs on every push and pull request.
 #
 # - "check" installs the exact versions from uv.lock, so a new release of ruff, mypy, pyright, or
-#   pytest can never turn CI red by surprise. Run the same commands locally (see CONTRIBUTING.md).
+#   pytest can never turn CI red by surprise. Run the same commands locally (see AGENTS.md).
 # - "lowest" installs the lowest versions that pyproject.toml allows (e.g. pydantic 2.13) and runs
 #   the tests, so the lower bounds we promise to users are real.
 # - Dependabot (.github/dependabot.yml) proposes updates to uv.lock and to these actions as pull requests.
@@ -34,10 +34,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install locked dependencies (fails if uv.lock does not match pyproject.toml)
@@ -71,7 +71,7 @@ jobs:
       HARNESS_TEST_POSTGRES_DSN: postgresql://harness:harness@localhost:5432/harness_test
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           python-version: "3.11"
       - name: Install the lowest allowed versions (does not touch uv.lock)

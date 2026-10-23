@@ -7,11 +7,20 @@ from typing import Any
 
 import pytest
 
-from ai_agent_harness import Capabilities, EventType, ModelRequest, ModelResponse, ModelRouter, RetryPolicy
+from ai_agent_harness import (
+    Capabilities,
+    EventType,
+    ModelProvider,
+    ModelRequest,
+    ModelResponse,
+    ModelRouter,
+    RetryPolicy,
+    StreamDelta,
+)
 from ai_agent_harness.core import ConfigError, ImageBlock, Message, ProviderError, ToolSpec
-from ai_agent_harness.testing import FakeProvider, text_response
+from ai_agent_harness.testing import FakeProvider, Streamed, text_response
 
-from .conftest import run_sync
+from .conftest import no_sleep, run_sync
 
 REQUEST = ModelRequest(system="s", messages=(Message.user("hi"),))
 
@@ -28,7 +37,7 @@ class Recorder:
         self.sleeps.append(seconds)
 
 
-def router(*providers: FakeProvider, rec: Recorder, **policy: Any) -> ModelRouter:
+def router(*providers: ModelProvider, rec: Recorder, **policy: Any) -> ModelRouter:
     kwargs: dict[str, Any] = {"base_delay_s": 1.0, **policy}
     return ModelRouter(providers[0], providers[1:], RetryPolicy(**kwargs), sleep=rec.sleep, jitter=lambda: 1.0)
 
@@ -93,6 +102,15 @@ def test_capabilities_filter_candidates() -> None:
     assert pid == "full" and no_tools.requests == []
 
 
+def test_structured_output_capabilities_filter_candidates() -> None:
+    rec = Recorder()
+    no_so = FakeProvider([], id="no-so", capabilities=Capabilities(structured_output=False))
+    so = FakeProvider([text_response('{"ok": true}')], id="so", capabilities=Capabilities(structured_output=True))
+    request = REQUEST.model_copy(update={"output_schema": {"type": "object"}})
+    _, pid = run_sync(router(no_so, so, rec=rec).complete(request, rec.emit))
+    assert pid == "so" and no_so.requests == []
+
+
 def test_no_capable_provider_fails_fast() -> None:
     rec = Recorder()
     text_only = FakeProvider([], capabilities=Capabilities(vision=False))
@@ -112,3 +130,81 @@ def test_invalid_configuration_is_rejected() -> None:
         RetryPolicy(max_attempts=0)
     with pytest.raises(ConfigError):
         ModelRouter(FakeProvider([], id="x"), [FakeProvider([], id="x")])
+
+
+def test_router_stream_yields_deltas_and_returns_response() -> None:
+    rec = Recorder()
+    deltas: list[str] = []
+
+    async def on_delta(d: StreamDelta) -> None:
+        deltas.append(d.text)
+
+    p = FakeProvider([text_response("streaming text response")])
+    r = router(p, rec=rec)
+    res, pid = run_sync(r.stream(REQUEST, rec.emit, on_delta=on_delta))
+    assert res.message.text == "streaming text response"
+    assert pid == "fake"
+    assert "".join(deltas) == "streaming text response"
+
+
+def test_router_stream_fallback_when_provider_lacks_stream() -> None:
+    rec = Recorder()
+    deltas: list[str] = []
+
+    async def on_delta(d: StreamDelta) -> None:
+        deltas.append(d.text)
+
+    class OnlyCompleteProvider:
+        id = "only_complete"
+        capabilities = Capabilities()
+
+        def __init__(self, response: ModelResponse) -> None:
+            self.response = response
+
+        async def complete(self, request: ModelRequest) -> ModelResponse:
+            return self.response
+
+    p = OnlyCompleteProvider(text_response("non-streaming result"))
+    r = router(p, rec=rec)
+    res, pid = run_sync(r.stream(REQUEST, rec.emit, on_delta=on_delta))
+    assert pid == "only_complete"
+    assert res.message.text == "non-streaming result"
+    assert "".join(deltas) == "non-streaming result"
+
+
+def test_router_stream_failover_before_deltas() -> None:
+    rec = Recorder()
+    primary = FakeProvider([ProviderError("500 Overloaded", retryable=True)], id="primary")
+    backup = FakeProvider([text_response("backup response")], id="backup")
+    r = router(primary, backup, rec=rec, max_attempts=1)
+    res, pid = run_sync(r.stream(REQUEST, rec.emit))
+    assert pid == "backup"
+    assert res.message.text == "backup response"
+    assert rec.events[0][0] is EventType.PROVIDER_FAILOVER
+
+
+# ------------------------------------------------------------------ Streaming: never a second answer
+
+
+def test_stream_does_not_fail_over_after_deltas_were_delivered() -> None:
+    primary = FakeProvider([Streamed(StreamDelta(text="partial "), ProviderError("reset", retryable=True))], id="p")
+    backup = FakeProvider([text_response("other")], id="b")
+    router = ModelRouter(primary, [backup], RetryPolicy(max_attempts=2, base_delay_s=0, max_delay_s=0), sleep=no_sleep)
+    seen: list[str] = []
+
+    async def on_delta(delta: StreamDelta) -> None:
+        seen.append(delta.text)
+
+    request = ModelRequest(system="s", messages=(Message.user("hi"),))
+    with pytest.raises(ProviderError):
+        run_sync(router.stream(request, on_delta=on_delta))
+
+    assert seen == ["partial "] and backup.requests == [] and len(primary.requests) == 1
+
+
+def test_stream_without_a_final_response_is_an_error() -> None:
+    provider = FakeProvider([Streamed(StreamDelta(text="x"))])
+    router = ModelRouter(provider, retry=RetryPolicy(max_attempts=1), sleep=no_sleep)
+    request = ModelRequest(system="s", messages=(Message.user("hi"),))
+    with pytest.raises(ProviderError, match="without returning"):
+        run_sync(router.stream(request))
