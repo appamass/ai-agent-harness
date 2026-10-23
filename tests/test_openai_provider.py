@@ -42,9 +42,9 @@ from .provider_helpers import ECHO_SPEC, complete, load_fixture, request, stream
 
 API_KEY = "sk-openai-test-key-1234567890"
 if TYPE_CHECKING:
-    import httpx2 as httpx
+    import httpx2 as http
 else:  # openai 1 uses httpx, openai 3 uses httpx2: the mock transport must come from the library the SDK uses
-    httpx = importlib.import_module(openai.DefaultAsyncHttpxClient.__mro__[1].__module__.split(".")[0])
+    http = importlib.import_module(openai.DefaultAsyncHttpxClient.__mro__[1].__module__.split(".")[0])
 
 MODEL = "gpt-4o"
 
@@ -53,19 +53,19 @@ def fixture(name: str) -> dict[str, Any]:
     return load_fixture("openai", name)
 
 
-def ok(name: str, **changes: Any) -> httpx.Response:
+def ok(name: str, **changes: Any) -> http.Response:
     data = {**fixture(name), **changes}
-    return httpx.Response(200, json=data)
+    return http.Response(200, json=data)
 
 
 class Wire:
     """Scripted HTTP responses; records every request body the SDK sends."""
 
-    def __init__(self, *script: httpx.Response | Exception) -> None:
+    def __init__(self, *script: http.Response | Exception) -> None:
         self._script = list(script)
         self.bodies: list[dict[str, Any]] = []
 
-    def _handle(self, request: httpx.Request) -> httpx.Response:
+    def _handle(self, request: http.Request) -> http.Response:
         self.bodies.append(json.loads(request.content))
         item = self._script.pop(0)
         if isinstance(item, Exception):
@@ -76,7 +76,7 @@ class Wire:
         return openai.AsyncOpenAI(
             api_key=API_KEY,
             max_retries=0,
-            http_client=httpx.AsyncClient(transport=httpx.MockTransport(self._handle)),
+            http_client=http.AsyncClient(transport=http.MockTransport(self._handle)),
         )
 
 
@@ -152,7 +152,7 @@ def test_malformed_tool_call_json_reports_error_without_raising() -> None:
     broken_payload = fixture("tool_calls")
     broken_payload["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = "invalid json{"
 
-    wire = Wire(httpx.Response(200, json=broken_payload))
+    wire = Wire(http.Response(200, json=broken_payload))
     provider = provider_for(wire)
 
     response = complete(provider)
@@ -308,7 +308,7 @@ def test_foreign_thinking_blocks_stripped_for_openai() -> None:
 
 @pytest.mark.parametrize("status_code", [408, 409, 429, 500, 502, 503, 504])
 def test_retryable_errors(status_code: int) -> None:
-    wire = Wire(httpx.Response(status_code, json={"error": {"code": "rate_limit_exceeded"}}))
+    wire = Wire(http.Response(status_code, json={"error": {"code": "rate_limit_exceeded"}}))
     provider = provider_for(wire)
 
     with pytest.raises(ProviderError) as exc_info:
@@ -321,7 +321,7 @@ def test_retryable_errors(status_code: int) -> None:
 
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
 def test_non_retryable_errors(status_code: int) -> None:
-    wire = Wire(httpx.Response(status_code, json={"error": {"type": "invalid_request_error"}}))
+    wire = Wire(http.Response(status_code, json={"error": {"type": "invalid_request_error"}}))
     provider = provider_for(wire)
 
     with pytest.raises(ProviderError) as exc_info:
@@ -333,7 +333,7 @@ def test_non_retryable_errors(status_code: int) -> None:
 
 
 def test_connection_errors_are_retryable() -> None:
-    wire = Wire(httpx.ConnectError("connection refused"))
+    wire = Wire(http.ConnectError("connection refused"))
     provider = provider_for(wire)
 
     with pytest.raises(ProviderError) as exc_info:
@@ -346,7 +346,7 @@ def test_connection_errors_are_retryable() -> None:
 def test_error_messages_do_not_leak_secrets() -> None:
     # Error message with sensitive info in body
     secret_body = {"error": {"message": f"key {API_KEY} expired", "code": "invalid_api_key"}}
-    wire = Wire(httpx.Response(401, json=secret_body))
+    wire = Wire(http.Response(401, json=secret_body))
     provider = provider_for(wire)
 
     with pytest.raises(ProviderError) as exc_info:
@@ -444,9 +444,9 @@ def test_invalid_max_tokens_parameter_rejected() -> None:
         OpenAIProvider(MODEL, api_key=API_KEY, max_tokens_param=cast("Any", "tokens"))
 
 
-def _sse(*chunks: dict[str, Any]) -> httpx.Response:
+def _sse(*chunks: dict[str, Any]) -> http.Response:
     body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
-    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+    return http.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
 
 
 def _chunk(delta: dict[str, Any], finish: str | None = None, usage: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -568,7 +568,7 @@ def test_stream_mixes_missing_and_numeric_indexes_without_merging_calls() -> Non
 
 
 def test_stream_http_error_becomes_a_provider_error() -> None:
-    provider = provider_for(Wire(httpx.Response(429, json={"error": {"code": "rate_limit_exceeded"}})))
+    provider = provider_for(Wire(http.Response(429, json={"error": {"code": "rate_limit_exceeded"}})))
 
     with pytest.raises(ProviderError) as info:
         stream_items(provider)
@@ -577,7 +577,7 @@ def test_stream_http_error_becomes_a_provider_error() -> None:
 
 def test_the_error_kind_is_taken_from_the_body_when_it_looks_like_a_code() -> None:
     body = {"error": {"code": "context_length_exceeded", "message": "your prompt secret"}}
-    provider = provider_for(Wire(httpx.Response(400, json=body)))
+    provider = provider_for(Wire(http.Response(400, json=body)))
     with pytest.raises(ProviderError) as info:
         run_sync(provider.complete(request()))
     assert "(context_length_exceeded)" in str(info.value)
@@ -585,7 +585,7 @@ def test_the_error_kind_is_taken_from_the_body_when_it_looks_like_a_code() -> No
 
 
 def test_the_error_kind_is_not_copied_unless_it_looks_like_a_code() -> None:
-    provider = provider_for(Wire(httpx.Response(400, json={"error": {"code": "My Secret Token sk-ABC123"}})))
+    provider = provider_for(Wire(http.Response(400, json={"error": {"code": "My Secret Token sk-ABC123"}})))
     with pytest.raises(ProviderError) as info:
         run_sync(provider.complete(request()))
     assert "sk-ABC123" not in str(info.value) and "(unknown)" in str(info.value)
@@ -658,9 +658,9 @@ def test_aclose_closes_a_client_the_adapter_created_but_not_one_it_was_given(
 
 
 def test_the_sdk_timeout_is_set_explicitly() -> None:
-    seen: list[httpx.Request] = []
+    seen: list[http.Request] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: http.Request) -> http.Response:
         seen.append(request)
         return ok("text")
 
@@ -668,7 +668,7 @@ def test_the_sdk_timeout_is_set_explicitly() -> None:
         api_key=API_KEY,
         max_retries=0,
         timeout=5.0,  # the client's own default: the adapter must still ask for its longer limit
-        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        http_client=http.AsyncClient(transport=http.MockTransport(handler)),
     )
     complete(OpenAIProvider(MODEL, client=client))
 
@@ -685,7 +685,7 @@ def test_tool_calls_that_are_not_functions_are_ignored() -> None:
     data = fixture("text")
     message = data["choices"][0]["message"]
     message["tool_calls"] = [{"id": "c1", "type": "custom", "custom": {"name": "x", "input": "y"}}]
-    provider = provider_for(Wire(httpx.Response(200, json=data)))
+    provider = provider_for(Wire(http.Response(200, json=data)))
 
     response = complete(provider)
 
