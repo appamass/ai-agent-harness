@@ -5,7 +5,7 @@ description = "Model-agnostic Python harness for AI agents: human approval, guar
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "appamass", email = "info@appamass.com" }]
 keywords = [
   "ai",
@@ -24,7 +24,6 @@ classifiers = [
   "Operating System :: POSIX",
   "Operating System :: MacOS",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
@@ -89,7 +88,7 @@ markers = ["live: calls a real model API (needs an API key, costs money); run wi
 filterwarnings = ["error"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
 warn_unreachable = true
@@ -100,7 +99,7 @@ init_typed = true
 warn_required_dynamic_aliases = true
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]
@@ -120,7 +119,7 @@ ignore = [
 
 [tool.pyright]
 include = ["ai_agent_harness", "examples", "tests"]
-pythonVersion = "3.11"
+pythonVersion = "3.12"
 typeCheckingMode = "strict"
 # Runtime checks against external code (adapters, tools, hooks) are intentional even when static types make them look redundant
 reportUnnecessaryIsInstance = false

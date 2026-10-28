@@ -52,7 +52,7 @@ With a real model: `pip install -e ".[anthropic]"`, `export ANTHROPIC_API_KEY=..
 - **Crash-safe, several workers:** state is saved before every tool call, in a file, SQLite, or PostgreSQL, and two workers cannot resume the same run.
   An approval can arrive days later in another process.
 - **Safe logs:** events carry only metadata, never prompts, arguments, or results. Limits on steps, tokens, and time, and a kill switch, hold across restarts.
-- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 20 guarantees and the test for each, including a test that injects random failures.
+- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 22 guarantees and the test for each, including a test that injects random failures.
 
 ## How to use this
 
@@ -123,7 +123,7 @@ Context compaction, parallel read tools, streaming, MCP, and structured output e
 pip install "ai-agent-harness @ git+https://github.com/appamass/ai-agent-harness@v0.8.0"
 ```
 
-Python 3.11+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[openai]` (OpenAI/compat), `[postgres]` (PostgreSQL store), `[encryption]` (AES-256-GCM), `[opentelemetry]` (tracing).
+Python 3.12+. The only runtime dependency is Pydantic 2. Optional extras: `[anthropic]` (Claude), `[openai]` (OpenAI/compat), `[postgres]` (PostgreSQL store), `[encryption]` (AES-256-GCM), `[opentelemetry]` (tracing).
 Pin a release tag (for example `@v0.8.0`) and commit your lockfile: before 1.0, a minor version may contain breaking changes ([`CHANGELOG.md`](CHANGELOG.md)).
 What has been run against a real model, and what has not: [`docs/known-limitations.md`](docs/known-limitations.md).
 
@@ -131,7 +131,8 @@ What has been run against a real model, and what has not: [`docs/known-limitatio
 
 | Read | When |
 |---|---|
-| [`docs/guide.md`](docs/guide.md) | You want to build: tools, guardrails, providers, stores (tested examples) |
+| [`docs/guide.md`](docs/guide.md) | You want to build: tools, guardrails, providers, stores, sub-agents (tested examples) |
+| [`docs/agent-package.md`](docs/agent-package.md) | You lay out an agent project: what goes in files, what stays in code |
 | [`docs/guarantees.md`](docs/guarantees.md) | You want proof: every guarantee and the test behind it |
 | [`docs/production-checklist.md`](docs/production-checklist.md) · [`docs/known-limitations.md`](docs/known-limitations.md) | You go to production |
 | [`docs/adr/`](docs/adr/README.md) · [`HARNESS_TAXONOMY.md`](HARNESS_TAXONOMY.md) | You want the decisions and the concepts |

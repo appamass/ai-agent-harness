@@ -7,7 +7,7 @@ import os
 import uuid
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import anthropic
 import httpx2
@@ -15,8 +15,6 @@ import httpx2
 from ai_agent_harness.providers.anthropic import AnthropicProvider
 
 from ..conftest import run_sync
-
-T = TypeVar("T")
 
 MODEL = os.environ.get("HARNESS_LIVE_MODEL", "claude-haiku-5-5")
 
@@ -53,7 +51,7 @@ def track(provider: AnthropicProvider) -> AnthropicProvider:
 RUN_LIVE_CALLS: list[int] = []
 
 
-def run_live(coro: Coroutine[Any, Any, T]) -> T:
+def run_live[T](coro: Coroutine[Any, Any, T]) -> T:
     """Runs a coroutine and closes every provider and client it used inside the same loop (no leaked connections).
 
     Call it once per test: put all steps of a test into one async function.

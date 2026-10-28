@@ -34,7 +34,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, ClassVar, Generic, TypeVar, cast, get_args, get_type_hints, overload
+from typing import Any, ClassVar, cast, get_args, get_type_hints, overload
 from weakref import WeakKeyDictionary
 
 from pydantic import BaseModel, ConfigDict, create_model
@@ -43,7 +43,6 @@ from ..core.errors import ConfigError
 from ..core.state import RunState
 from ..core.types import ID_PATTERN, ID_RE, Risk, ToolSpec, TruncationMode, canonical_digest, is_positive_number
 
-InputT = TypeVar("InputT", bound=BaseModel)
 _SCHEMA_TYPE_KEYS = frozenset({"type", "anyOf", "oneOf", "allOf", "$ref", "enum", "const"})
 
 
@@ -100,7 +99,7 @@ class InputRequest:
 ToolOutput = str | InputRequest
 
 
-class BaseTool(ABC, Generic[InputT]):
+class BaseTool[InputT: BaseModel](ABC):
     name: ClassVar[str]
     description: ClassVar[str]
     input_model: ClassVar[type[BaseModel]]
@@ -209,7 +208,7 @@ def _sync_executor() -> ThreadPoolExecutor:
         return _sync_pool[0]
 
 
-class SyncTool(BaseTool[InputT]):
+class SyncTool[InputT: BaseModel](BaseTool[InputT]):
     """For blocking code. `run_sync` executes in a worker thread.
 
     SyncTools have a **dedicated, bounded thread pool** (`SYNC_TOOL_THREADS`). Python cannot forcibly

@@ -75,6 +75,16 @@ class ModelRouter:
     def providers(self) -> tuple[ModelProvider, ...]:
         return self._providers
 
+    @property
+    def retry(self) -> RetryPolicy:
+        return self._retry
+
+    def worst_case_s(self) -> float:
+        """Longest time one `complete()` can take: every provider, every attempt timing out, and the longest backoff."""
+        per_provider = self._retry.max_attempts * self._retry.request_timeout_s
+        per_provider += (self._retry.max_attempts - 1) * self._retry.max_delay_s
+        return per_provider * len(self._providers)
+
     def candidates(self, request: ModelRequest) -> tuple[ModelProvider, ...]:
         has_images = request.has_images
         return tuple(

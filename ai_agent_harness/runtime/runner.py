@@ -74,6 +74,7 @@ INTERRUPTED = (
     "Execution was interrupted (restart). Whether the tool already executed "
     "is unknown — check the current state before retrying."
 )
+CANCELLED_CALL = "Not executed: run was cancelled."
 
 
 @dataclass(frozen=True)
@@ -351,6 +352,30 @@ def _build_resume(
     output_model: type[BaseModel] | None,
     sink: _StreamSink | None = None,
 ) -> _Run:
+    _check_loaded(agent, state)
+    _check_resume_args(state, args, agent.limits.max_input_chars)
+    _check_output_binding(state, output_model)
+    return _bind(_Run(agent, state, output_model=output_model, stream_sink=sink), deps)
+
+
+def _build_cancel(agent: Agent, state: RunState, *, recover: bool, reason: str) -> _Run:
+    _check_loaded(agent, state)
+    _require_text(reason, "reason", agent.limits.max_input_chars)
+    status = state.status
+    if status is RunStatus.RUNNING and not recover:
+        raise InvalidStateError(
+            "Run has status 'running': it is either still running or crashed. "
+            "Only cancel it after a crash with recover=True."
+        )
+    if recover and status is not RunStatus.RUNNING:
+        raise InvalidStateError(f"recover=True is only allowed when status is 'running', got '{status}'")
+    if status is not RunStatus.RUNNING and not status.is_waiting:
+        raise InvalidStateError(f"Run with status '{status}' has already finished and cannot be cancelled")
+    return _bind(_Run(agent, state), None)
+
+
+def _check_loaded(agent: Agent, state: RunState) -> None:
+    """A state handed back to the harness belongs to this agent, has the current schema, and a valid history."""
     if state.agent_name != agent.name:
         raise InvalidStateError(f"Run belongs to agent '{state.agent_name}', not '{agent.name}'")
     if state.schema_version != state_schema.SCHEMA_VERSION:
@@ -359,9 +384,6 @@ def _build_resume(
             "always load persisted states via restore_state (ADR 0010)"
         )
     state.check_protocol()
-    _check_resume_args(state, args, agent.limits.max_input_chars)
-    _check_output_binding(state, output_model)
-    return _bind(_Run(agent, state, output_model=output_model, stream_sink=sink), deps)
 
 
 def _spawn(run: _Run, body: Coroutine[Any, Any, None], sink: _StreamSink, *, new_run: bool) -> StreamHandle:
@@ -433,6 +455,26 @@ async def resume(
     args = _ResumeInput(answer=answer, approved=approved, user_input=user_input, recover=recover, pending_id=pending_id)
     run = _build_resume(agent, state, args, deps=deps, output_model=output_model)
     return await run.guarded(run.resume_body(args))
+
+
+async def cancel(
+    agent: Agent,
+    state: RunState,
+    *,
+    recover: bool = False,
+    reason: str = "Run was cancelled",
+) -> RunState:
+    """Ends a run that waits for a human, or with `recover=True` one that a crash left `running`, as `cancelled`.
+
+    Runs neither the model nor any tool (ADR 0031). Finished results of the current batch stay; every other open call
+    is answered as not executed, or after a crash as "outcome unknown" (Invariant 5). With a checkpoint store it saves
+    with the optimistic lock, so another copy of the same revision fails with `ConcurrencyError` when it is resumed or
+    cancelled later. It needs no `pending_id`: nothing is approved or run. A cancelled run can go on later with
+    `resume(..., user_input=...)`. Never pass the state of a run that is still executing: to stop a live run, cancel
+    its task or call `StreamHandle.cancel()`.
+    """
+    run = _build_cancel(agent, state, recover=recover, reason=reason)
+    return await run.guarded(run.cancel_body(reason))
 
 
 def stream_start(
@@ -695,6 +737,15 @@ class _Run:
         elif args.user_input is not None and not await self._accept_user_text(args.user_input):
             return
         await self._loop()
+
+    async def cancel_body(self, reason: str) -> None:
+        state = self.state
+        if state.pending is not None:
+            state.batch_done = state.pending.done
+            state.close_open_tool_calls(CANCELLED_CALL, known=state.batch_done)
+        else:  # a crash left the run `running`: like `recover`, interrupted calls have an unknown outcome
+            state.close_open_tool_calls(INTERRUPTED, known=state.batch_done)
+        await self._finish(RunStatus.CANCELLED, reason)
 
     async def _resolve_waiting(self, waiting: PendingCall, args: _ResumeInput, *, rest: Sequence[ToolCall]) -> bool:
         """Resolves the waiting tool call. Returns False if the run ended or paused again."""
