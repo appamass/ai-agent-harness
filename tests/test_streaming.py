@@ -458,8 +458,8 @@ async def test_stream_resume_closed_before_it_starts_leaves_a_waiting_run_untouc
     before = waiting.model_dump_json()
 
     handle = stream_resume(agent, waiting, approved=True, pending_id=shown)
-    handle.cancel()  # synchronous: before the task starts. `wait_for` runs `aclose()` as a task on Python 3.11,
-    await asyncio.wait_for(handle.aclose(), timeout=3)  # which would let the run task start first
+    handle.cancel()  # synchronous: before the task starts
+    await asyncio.wait_for(handle.aclose(), timeout=3)
 
     assert waiting.model_dump_json() == before  # nothing was claimed, nothing was overwritten
     assert write.written == []

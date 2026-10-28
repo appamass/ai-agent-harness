@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import itertools
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
@@ -358,11 +359,12 @@ def test_ask_user_registered_after_wrapping_is_refused_before_the_sub_run_starts
     assert provider.requests == []
 
 
-async def close_crashed_sub_runs(
-    specialist: Agent, store: SqliteCheckpointStore, tenant_id: str, older_than: timedelta
-) -> int:
+async def close_crashed_sub_runs(specialist: Agent, tenant_id: str, older_than: timedelta) -> int:
     """A copy of the recipe in docs/guide.md (keep both the same): a `running` sub-run older than the tool's timeout was
     left by a crash."""
+    store = specialist.checkpoints
+    if not isinstance(store, SqliteCheckpointStore):
+        raise ValueError("The specialist needs a SQLite or PostgreSQL checkpoint store")
     cutoff = datetime.now(UTC) - older_than
     closed = 0
     # Newest first and the crashed ones are the oldest: ask for the maximum (10,000) and run the job repeatedly
@@ -385,18 +387,27 @@ def test_a_sub_run_left_running_by_a_crash_is_closed_by_the_recovery_recipe_and_
         async def run(self, args: EmptyInput, state: RunState) -> str:
             raise SystemExit
 
-    async def scenario() -> tuple[int, RunStatus | None, int]:
-        with SqliteCheckpointStore(tmp_path / "runs.sqlite") as store:
+    database = tmp_path / "runs.sqlite"
+    specialist, _, _ = _agent("specialist", [tool_response(("dies", {}))], [Dies()])
+
+    async def crash() -> None:
+        # A real delegation that crashes, in its own event loop like the other crash tests
+        with SqliteCheckpointStore(database) as store:
             await store.setup()
-            specialist, _, _ = _agent("specialist", [tool_response(("dies", {}))], [Dies()], checkpoints=store)
-            parent, _, _ = _agent("parent", [tool_response(("research", {"task": "x"}))], [_research(specialist)])
-            with pytest.raises(SystemExit):
-                await start(parent, "Go", tenant_id="t1")
+            crashing = dataclasses.replace(specialist, checkpoints=store)
+            parent, _, _ = _agent("parent", [tool_response(("research", {"task": "x"}))], [_research(crashing)])
+            await start(parent, "Go", tenant_id="t1")
+
+    async def recovery_job() -> tuple[int, RunStatus, int]:
+        with SqliteCheckpointStore(database) as store:
             await asyncio.sleep(0.01)
-            closed = await close_crashed_sub_runs(specialist, store, "t1", older_than=timedelta(milliseconds=1))
+            recovering = dataclasses.replace(specialist, checkpoints=store)
+            closed = await close_crashed_sub_runs(recovering, "t1", older_than=timedelta(milliseconds=1))
             [info] = await store.list_runs("t1")
             await asyncio.sleep(0.01)
             purged = await store.purge_finished(older_than=timedelta(milliseconds=1), tenant_id="t1")
             return closed, info.status, purged
 
-    assert run_sync(scenario()) == (1, RunStatus.CANCELLED, 1)
+    with pytest.raises(SystemExit):
+        run_sync(crash())
+    assert run_sync(recovery_job()) == (1, RunStatus.CANCELLED, 1)

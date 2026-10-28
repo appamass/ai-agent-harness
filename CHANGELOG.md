@@ -5,6 +5,7 @@ Semantic versioning. Changes to the persisted checkpoint format also list their 
 
 ## Unreleased
 
+- Changed (breaking, ADR 0032): Python 3.12 is the minimum; 3.11 is no longer supported. CI tests 3.12 to 3.14, and the `lowest` job runs on 3.12. `BaseTool` and `SyncTool` use the PEP 695 syntax (`BaseTool[InputT: BaseModel]`); the unexported module-level `ai_agent_harness.tools.base.InputT` is gone, and type checkers infer the parameter as contravariant. Runtime behavior and tool digests are unchanged.
 - New (sub-agents, ADR 0030): `sub_agent(specialist, *, name=None, description, timeout_s=None)` wraps a `read_only` agent as a `Risk.READ` tool. It refuses specialists that can write or ask the user, reports every status other than `done` as a tool error, derives a deterministic sub-run ID from the caller's tenant, agent, run, creation time, step, and batch position, and refuses cycles (also back to the top-level agent) and chains deeper than `MAX_SUB_AGENT_DEPTH` (4). Guarantee 21.
 - New (cancel, ADR 0031): `cancel(agent, state, *, recover=False, reason=...)` ends a waiting run, or with `recover=True` a run a crash left `running`, as `cancelled` without a model call or tool. Finished batch results stay; other open calls are answered "not executed" or "outcome unknown". The sub-agent tool cancels a sub-run that would wait. Guarantee 22.
 - New: `ModelRouter.retry` and `ModelRouter.worst_case_s()` (the longest time one model call can take with all retries and fallbacks).

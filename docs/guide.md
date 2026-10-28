@@ -522,13 +522,17 @@ is older than the tool's `timeout_s`, so let the job that recovers the caller cl
 
 ```python
 # executable
+import dataclasses
 from datetime import UTC, datetime, timedelta
 
 from ai_agent_harness import SqliteCheckpointStore, cancel
 
 
-async def close_crashed_sub_runs(specialist, store, tenant_id: str, older_than: timedelta) -> int:
+async def close_crashed_sub_runs(specialist, tenant_id: str, older_than: timedelta) -> int:
     """Cancels `sub-` runs of `specialist` that a crash left `running` for longer than `older_than` (the tool's timeout_s)."""
+    store = specialist.checkpoints  # cancel() writes the cancelled run there; list_runs needs a SQLite or PostgreSQL store
+    if not hasattr(store, "list_runs"):
+        raise ValueError("The specialist needs a SQLite or PostgreSQL checkpoint store")
     cutoff = datetime.now(UTC) - older_than
     closed = 0
     # Newest first and the crashed ones are the oldest: ask for the maximum (10,000) and run the job repeatedly
@@ -546,7 +550,8 @@ async def recovery_job() -> int:
         await sub_runs.setup()
         # updated_at comes from the store's clock (PostgreSQL: the database), so add a margin for clock skew
         older_than = timedelta(seconds=research.timeout_s) + timedelta(minutes=5)
-        return await close_crashed_sub_runs(specialist, sub_runs, "tenant-42", older_than)
+        saving = dataclasses.replace(specialist, checkpoints=sub_runs)  # in your app: the specialist as configured
+        return await close_crashed_sub_runs(saving, "tenant-42", older_than)
 
 
 assert asyncio.run(recovery_job()) == 0  # nothing crashed here; tests/test_sub_agents.py runs it against a real crash

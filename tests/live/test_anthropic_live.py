@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar, TypeVar
+from typing import Any, ClassVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict
@@ -40,8 +40,6 @@ from ai_agent_harness.providers.anthropic import AnthropicProvider
 
 from ..conftest import WriteFile
 from .helpers import MODEL, live_provider, run_live, track
-
-T = TypeVar("T")
 
 pytestmark = [
     pytest.mark.live,

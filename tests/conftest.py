@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Callable, Coroutine, Generator, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, LiteralString, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, LiteralString
 
 if TYPE_CHECKING:
     from ai_agent_harness.encryption import AesGcmCodec, StateCodec
@@ -46,7 +46,6 @@ if TYPE_CHECKING:
     from ai_agent_harness.persistence_postgres import PostgresCheckpointStore
     from ai_agent_harness.persistence_sqlite import SqliteCheckpointStore
 
-T = TypeVar("T")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -85,7 +84,7 @@ def load_example(name: str = "repo_assistant") -> Any:
     return module
 
 
-def run_sync(coro: Coroutine[Any, Any, T]) -> T:
+def run_sync[T](coro: Coroutine[Any, Any, T]) -> T:
     return asyncio.run(coro)
 
 

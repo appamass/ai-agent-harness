@@ -35,3 +35,4 @@ Short records of decisions that affect architecture, invariants, the public API,
 | [0029](0029-checkpoint-encryption-and-retention.md) | Optional checkpoint encryption and retention purge | Accepted |
 | [0030](0030-sub-agents-as-read-only-tools.md) | Sub-agents as read-only tools with least-privilege checks | Accepted |
 | [0031](0031-cancel-waiting-or-crashed-runs.md) | `cancel` ends a waiting or crashed run without running anything | Accepted |
+| [0032](0032-python-3-12-minimum.md) | Python 3.12 is the minimum | Accepted |

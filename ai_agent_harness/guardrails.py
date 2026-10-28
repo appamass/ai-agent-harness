@@ -17,7 +17,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any, TypeVar, get_args
+from typing import Any, get_args
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel
@@ -28,10 +28,8 @@ from .core.hooks import CONTINUE, Decision, Hook, ToolInvocation
 from .core.state import RunState
 from .core.types import ModelRequest, ModelResponse, Risk, ToolResult
 
-_T = TypeVar("_T")
 
-
-def _at_least_one(items: tuple[_T, ...], guard: str) -> tuple[_T, ...]:
+def _at_least_one[T](items: tuple[T, ...], guard: str) -> tuple[T, ...]:
     if not items:
         raise ValueError(f"{guard} requires at least one pattern")
     return items
