@@ -3,7 +3,7 @@
 Semantic versioning. Changes to the persisted checkpoint format also list their schema version
 (ADR 0010). Prior to `1.0.0`, minor versions may introduce breaking changes to the public API.
 
-## Unreleased
+## 0.9.0 – 2026-10-28
 
 - Changed (breaking, ADR 0032): Python 3.12 is the minimum; 3.11 is no longer supported. CI tests 3.12 to 3.14, and the `lowest` job runs on 3.12. `BaseTool` and `SyncTool` use the PEP 695 syntax (`BaseTool[InputT: BaseModel]`); the unexported module-level `ai_agent_harness.tools.base.InputT` is gone, and type checkers infer the parameter as contravariant. Runtime behavior and tool digests are unchanged.
 - New (sub-agents, ADR 0030): `sub_agent(specialist, *, name=None, description, timeout_s=None)` wraps a `read_only` agent as a `Risk.READ` tool. It refuses specialists that can write or ask the user, reports every status other than `done` as a tool error, derives a deterministic sub-run ID from the caller's tenant, agent, run, creation time, step, and batch position, and refuses cycles (also back to the top-level agent) and chains deeper than `MAX_SUB_AGENT_DEPTH` (4). Guarantee 21.
