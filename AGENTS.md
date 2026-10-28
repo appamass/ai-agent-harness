@@ -33,6 +33,8 @@ Whether you use, copy, or rebuild, these properties must survive:
 | Guardrails | `ai_agent_harness/guardrails.py` | `SecretGuard`, `EgressGuard`, `ProtectedPaths`, `KillSwitch` |
 | Checkpoint stores | `persistence_sqlite.py`, `persistence_postgres.py` | Optimistic locking on SQLite (stdlib) & PostgreSQL |
 | Provider failover | `providers/router.py`, `providers/base.py` | Retry and failover loop; stripping foreign reasoning blocks (`without_foreign_thinking`) |
+| Sub-agents | `ai_agent_harness/runtime/delegation.py` | `sub_agent(...)`: a read-only specialist as one gated tool ([ADR 0030](docs/adr/0030-sub-agents-as-read-only-tools.md)) |
+| Agent project layout | `docs/agent-package.md` | Definition vs. runtime vs. system; prose in files, rules in code (tested) |
 | Integration recipes | `ai-kit/skills/ai-agent-harness/references/adopt-in-x.md` | `ToolExecutor` as the tool node of any loop (tested), guardrails, crash recovery |
 
 ## Development and Verification Commands

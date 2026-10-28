@@ -55,6 +55,14 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   if the pool fills up, new `SyncTool` calls time out cleanly. On process **shutdown**, however, Python waits for hanging threads. Only initialize the
   pool after `fork` (for example Gunicorn `--preload`). For hard isolation, run untrusted or blocking code in a subprocess or sandbox and enforce
   timeouts inside the tool itself.
+- **Sub-agents (`sub_agent`, ADR 0030):** The specialist runs read-only and cannot ask questions; a specialist that must write or ask stays a
+  separate run started by your code. Its tokens and events stay on its own run and `EventBus`: subscribe your cost listener to both agents.
+  `deps` are not passed on. The caller's `KillSwitch` and `Limits` do not reach into a sub-run: give the specialist its own. The default
+  timeout covers the specialist's time limit, one worst-case model call, and one slow tool; a response with many slow tool calls takes
+  longer and is cancelled by the caller, so pass `timeout_s` when you know better. A sub-run that ends waiting (a hook that requires
+  approval) is cancelled at once. A sub-run that a crash of the caller interrupts stays `running` until your recovery job cancels it
+  with `cancel(..., recover=True)` (recipe in the [guide](guide.md#sub-agents)). Without a store on the specialist, nothing on the sub-agent side stops a
+  second start of the same call; the runner never re-runs a call, so this matters only if you call the tool yourself.
 - **Sequential tool execution:** Tool calls within a single response run one after the other by default. Set `Agent.max_parallel_tools > 1` (ADR 0027) to run consecutive `parallel_safe=True` read-only tools concurrently under an `asyncio.Semaphore`. Write-risk tools, tools requiring human approval, MCP tools, and tools with `parallel_safe=False` always run sequentially. Hooks running during parallel groups must be thread-safe / coroutine-safe and stateless.
 - **Estimated context size and compaction:** Without a tokenizer, the context size is an estimate. `max_context_chars` counts characters (images are excluded).
   `max_context_tokens` (optional) starts from the prompt tokens the provider reported for the last call and adds the new characters at

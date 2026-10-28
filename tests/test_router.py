@@ -208,3 +208,10 @@ def test_stream_without_a_final_response_is_an_error() -> None:
     request = ModelRequest(system="s", messages=(Message.user("hi"),))
     with pytest.raises(ProviderError, match="without returning"):
         run_sync(router.stream(request))
+
+
+def test_worst_case_covers_every_provider_attempt_and_backoff() -> None:
+    retry = RetryPolicy(max_attempts=3, base_delay_s=1.0, max_delay_s=4.0, request_timeout_s=10.0)
+    router = ModelRouter(FakeProvider([], id="a"), [FakeProvider([], id="b")], retry=retry)
+    assert router.retry is retry
+    assert router.worst_case_s() == 2 * (3 * 10.0 + 2 * 4.0)

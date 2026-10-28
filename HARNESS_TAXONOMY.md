@@ -130,7 +130,7 @@
 
 | Concept | Classical Equivalent | Purpose (Including Practical Caveats) |
 |---|---|---|
-| Sub-Agent | Function call / microservice | Delegate a sub-task to an agent with its own isolated context. |
+| Sub-Agent | Function call / microservice | Delegate a sub-task to an agent with its own isolated context. In this harness: `sub_agent(...)`, a read-only specialist wrapped as one gated tool. |
 | Handoff (Context Transfer) | `goto` / thread ownership transfer | Hand over conversation and responsibility completely to a specialist agent. |
 | Message Passing | Inter-service messaging / event bus | Let agents exchange results asynchronously via messages. |
 | Shared State | Shared database, blackboard | Allow multiple agents to read and write to a shared store. |

@@ -3,6 +3,13 @@
 Semantic versioning. Changes to the persisted checkpoint format also list their schema version
 (ADR 0010). Prior to `1.0.0`, minor versions may introduce breaking changes to the public API.
 
+## Unreleased
+
+- New (sub-agents, ADR 0030): `sub_agent(specialist, *, name=None, description, timeout_s=None)` wraps a `read_only` agent as a `Risk.READ` tool. It refuses specialists that can write or ask the user, reports every status other than `done` as a tool error, derives a deterministic sub-run ID from the caller's tenant, agent, run, creation time, step, and batch position, and refuses cycles (also back to the top-level agent) and chains deeper than `MAX_SUB_AGENT_DEPTH` (4). Guarantee 21.
+- New (cancel, ADR 0031): `cancel(agent, state, *, recover=False, reason=...)` ends a waiting run, or with `recover=True` a run a crash left `running`, as `cancelled` without a model call or tool. Finished batch results stay; other open calls are answered "not executed" or "outcome unknown". The sub-agent tool cancels a sub-run that would wait. Guarantee 22.
+- New: `ModelRouter.retry` and `ModelRouter.worst_case_s()` (the longest time one model call can take with all retries and fallbacks).
+- Docs: `docs/agent-package.md` shows how to lay out an agent project on the harness; `docs/guide.md` has a sub-agent section.
+
 ## 0.8.0 – 2026-10-23
 
 - New (token estimate, ADR 0026): `Limits.max_context_tokens` (optional, last field; `Limits()` is unchanged) limits the estimated prompt tokens. The estimate starts from the prompt tokens the provider reported (`Usage.prompt_tokens`) and adds new characters at `CHARS_PER_TOKEN` (3). `MODEL_REQUEST` events carry `context_chars` and `context_tokens_est`. Each message is measured once per step (`context.ContextMeter`).

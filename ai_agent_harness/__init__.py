@@ -48,7 +48,18 @@ from .providers import (
     StreamDelta,
     without_foreign_thinking,
 )
-from .runtime import Agent, StreamHandle, StreamItem, TextDelta, resume, start, stream_resume, stream_start
+from .runtime import (
+    Agent,
+    StreamHandle,
+    StreamItem,
+    TextDelta,
+    cancel,
+    resume,
+    start,
+    stream_resume,
+    stream_start,
+    sub_agent,
+)
 from .tools import (
     DEFAULT_DENIED_READS,
     AskUser,
@@ -133,6 +144,7 @@ __all__ = [
     "Verdict",
     "WeakeningGuard",
     "as_untrusted",
+    "cancel",
     "load_mcp_tools",
     "mcp_tool_digest",
     "restore_state",
@@ -140,6 +152,7 @@ __all__ = [
     "start",
     "stream_resume",
     "stream_start",
+    "sub_agent",
     "tool",
     "without_foreign_thinking",
 ]

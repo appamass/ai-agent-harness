@@ -1,5 +1,5 @@
-"""Documentation tests: code blocks in README.md, docs/guide.md and the ai-kit recipes are executed
-so documentation never drifts from the code.
+"""Documentation tests: code blocks in README.md, docs/guide.md, docs/agent-package.md and the ai-kit
+recipes are executed so documentation never drifts from the code.
 
 Only ```python blocks whose first line is `# executable` are executed. All blocks in a file
 run sequentially in the same module namespace — so a scenario can be built up step by step and
@@ -20,6 +20,7 @@ from .conftest import REPO_ROOT
 DOC_FILES = (
     REPO_ROOT / "README.md",
     REPO_ROOT / "docs" / "guide.md",
+    REPO_ROOT / "docs" / "agent-package.md",
     REPO_ROOT / "ai-kit" / "skills" / "ai-agent-harness" / "references" / "adopt-in-x.md",
 )
 BLOCK = re.compile(r"^```python\n(# executable\n.*?)^```", re.MULTILINE | re.DOTALL)

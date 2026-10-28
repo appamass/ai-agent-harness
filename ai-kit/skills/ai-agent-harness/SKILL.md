@@ -74,6 +74,9 @@ The harness provides self-contained building blocks ready to copy or adapt:
   - `ProtectedPaths`: Blocks write-tool arguments that touch protected paths (tests, CI, config); symlinks are resolved only with `root=`.
   - `KillSwitch`: Halts runs when your check function says so (a kill file, a flag, a database row).
 
+- **Sub-Agents as Read Tools (`ai_agent_harness.sub_agent`):**
+  A specialist runs at `read_only` without `ask_user`, under the caller's tenant, with a deterministic sub-run ID; every status other than `done` comes back as a tool error, and cycles (also back to the top-level agent) are refused.
+
 - **Postgres Optimistic Concurrency (`PostgresCheckpointStore`):**
   Atomic conditional upsert (`INSERT ... ON CONFLICT DO UPDATE ... WHERE revision = :expected RETURNING revision`) preventing concurrent workers from racing or double-executing actions. `SqliteCheckpointStore` uses the same statement.
 
@@ -82,3 +85,4 @@ The harness provides self-contained building blocks ready to copy or adapt:
 ## Reference Guides
 
 - [Recipes for other frameworks](references/adopt-in-x.md): the gate as your tool node (tested), fail-closed guardrails, and crash recovery.
+- [Agent project layout](../../../docs/agent-package.md): prose in files, every hard rule in code, runtime data outside the package.

@@ -52,7 +52,7 @@ With a real model: `pip install -e ".[anthropic]"`, `export ANTHROPIC_API_KEY=..
 - **Crash-safe, several workers:** state is saved before every tool call, in a file, SQLite, or PostgreSQL, and two workers cannot resume the same run.
   An approval can arrive days later in another process.
 - **Safe logs:** events carry only metadata, never prompts, arguments, or results. Limits on steps, tokens, and time, and a kill switch, hold across restarts.
-- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 20 guarantees and the test for each, including a test that injects random failures.
+- **Tested:** [`docs/guarantees.md`](docs/guarantees.md) lists all 22 guarantees and the test for each, including a test that injects random failures.
 
 ## How to use this
 
@@ -131,7 +131,8 @@ What has been run against a real model, and what has not: [`docs/known-limitatio
 
 | Read | When |
 |---|---|
-| [`docs/guide.md`](docs/guide.md) | You want to build: tools, guardrails, providers, stores (tested examples) |
+| [`docs/guide.md`](docs/guide.md) | You want to build: tools, guardrails, providers, stores, sub-agents (tested examples) |
+| [`docs/agent-package.md`](docs/agent-package.md) | You lay out an agent project: what goes in files, what stays in code |
 | [`docs/guarantees.md`](docs/guarantees.md) | You want proof: every guarantee and the test behind it |
 | [`docs/production-checklist.md`](docs/production-checklist.md) · [`docs/known-limitations.md`](docs/known-limitations.md) | You go to production |
 | [`docs/adr/`](docs/adr/README.md) · [`HARNESS_TAXONOMY.md`](HARNESS_TAXONOMY.md) | You want the decisions and the concepts |

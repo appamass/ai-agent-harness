@@ -451,6 +451,109 @@ Set it on `Agent`, `ToolExecutor`, or a single tool (`@tool(max_result_chars=...
 `await load_mcp_tools(MCPServerConfig(server_name=..., command=[...], tool_risks={"tool": Risk.READ}))` turns MCP tools into gated tools; every tool
 needs a risk you set locally ([ADR 0024](adr/0024-mcp-integration-and-trust-model.md)).
 
+## Sub-agents
+
+A specialist agent with its own model, prompt, tools, and limits becomes one read tool of another agent with `sub_agent(...)`. The specialist
+must be `read_only` and must not offer `ask_user`: a delegated run can never write under the caller's rights and never waits for a human.
+Its answer comes back framed as untrusted data. Any other ending (`limit_reached`, `failed`, a question) comes back as a tool error, so
+the caller's run always goes on ([ADR 0030](adr/0030-sub-agents-as-read-only-tools.md)).
+
+```python
+# executable
+from ai_agent_harness import Limits, sub_agent
+
+
+class TopicInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    topic: str = Field(min_length=3, max_length=200)
+
+
+class SearchDocs(BaseTool[TopicInput]):
+    name: ClassVar[str] = "search_docs"
+    description: ClassVar[str] = "Searches the internal runbooks."
+    input_model: ClassVar[type[BaseModel]] = TopicInput
+    risk: ClassVar[Risk] = Risk.READ
+
+    async def run(self, args: TopicInput, state: RunState) -> str:
+        return f"Runbook RB-12 covers '{args.topic}': the pool size is 20."
+
+
+specialist = Agent(
+    name="doc-search",
+    router=ModelRouter(
+        FakeProvider([
+            tool_response(("search_docs", {"topic": "checkout pool"})),
+            text_response("RB-12: the checkout pool size is 20."),
+            tool_response(("search_docs", {"topic": "incident history"})),
+            tool_response(("search_docs", {"topic": "older incidents"})),  # second sub-run: out of steps
+        ])
+    ),
+    context=ContextBuilder("You search the runbooks and answer in one sentence."),
+    tools=ToolRegistry([SearchDocs()]),
+    limits=Limits(max_steps=2, max_seconds=60),
+)
+research = sub_agent(specialist, name="research", description="Has a specialist search the runbooks.")
+
+orchestrator = make_agent(
+    [
+        tool_response(("research", {"task": "What is the checkout pool size?"})),
+        tool_response(("research", {"task": "Summarize the full incident history."})),
+        text_response("The pool size is 20; the full history was not found."),
+    ],
+    research,
+)
+state = asyncio.run(start(orchestrator, "Prepare the incident brief", tenant_id="tenant-42"))
+found, gave_up = [result for message in state.messages for result in message.tool_results]
+assert state.status is RunStatus.DONE
+assert "pool size is 20" in found.content and found.content.startswith('<untrusted source="research">')
+assert gave_up.is_error and "limit_reached" in gave_up.content
+```
+
+The sub-run uses the caller's `tenant_id` and an ID that starts with `sub-` and is derived from the caller's agent, run, step, and
+position in the tool batch, so a resumed caller names the same sub-run again.
+Tokens, events, limits, and the kill switch belong to the specialist: subscribe your cost listener to both agents. A specialist that must write is a separate run
+that your own code starts, with its own approvals.
+
+**Ending runs that nobody will answer:** `cancel(agent, state)` ends a waiting run as `cancelled` without calling the model or any tool
+([ADR 0031](adr/0031-cancel-waiting-or-crashed-runs.md)). Finished results stay; other open calls are answered "not executed". The sub-agent
+tool does this itself when a sub-run would wait. A sub-run that a crash of the caller interrupted stays `running`; it is surely dead once it
+is older than the tool's `timeout_s`, so let the job that recovers the caller close it as well:
+
+```python
+# executable
+from datetime import UTC, datetime, timedelta
+
+from ai_agent_harness import SqliteCheckpointStore, cancel
+
+
+async def close_crashed_sub_runs(specialist, store, tenant_id: str, older_than: timedelta) -> int:
+    """Cancels `sub-` runs of `specialist` that a crash left `running` for longer than `older_than` (the tool's timeout_s)."""
+    cutoff = datetime.now(UTC) - older_than
+    closed = 0
+    # Newest first and the crashed ones are the oldest: ask for the maximum (10,000) and run the job repeatedly
+    for info in await store.list_runs(tenant_id, status=RunStatus.RUNNING, limit=10_000):
+        if info.run_id.startswith("sub-") and info.updated_at < cutoff:
+            crashed = await store.load(tenant_id, info.run_id)
+            if crashed is not None and crashed.agent_name == specialist.name:
+                await cancel(specialist, crashed, recover=True)  # interrupted calls are reported as "outcome unknown"
+                closed += 1
+    return closed
+
+
+async def recovery_job() -> int:
+    with SqliteCheckpointStore(":memory:") as sub_runs:
+        await sub_runs.setup()
+        # updated_at comes from the store's clock (PostgreSQL: the database), so add a margin for clock skew
+        older_than = timedelta(seconds=research.timeout_s) + timedelta(minutes=5)
+        return await close_crashed_sub_runs(specialist, sub_runs, "tenant-42", older_than)
+
+
+assert asyncio.run(recovery_job()) == 0  # nothing crashed here; tests/test_sub_agents.py runs it against a real crash
+```
+
+After `cancel`, the runs are finished, so `purge_finished` removes them with your other old runs.
+
 ## Where to go next
 
-[`guarantees.md`](guarantees.md) for what is enforced and by which test · [`production-checklist.md`](production-checklist.md) before you go live.
+[`agent-package.md`](agent-package.md) to lay out an agent project · [`guarantees.md`](guarantees.md) for what is enforced and by which test · [`production-checklist.md`](production-checklist.md) before you go live.
