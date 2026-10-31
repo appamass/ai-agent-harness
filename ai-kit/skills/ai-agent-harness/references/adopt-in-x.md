@@ -95,3 +95,7 @@ instead:
 
 The stores (`SqliteCheckpointStore`, `PostgresCheckpointStore`, `JsonFileCheckpointStore`) implement this. If you rebuild
 it in your own stack, these three rules are the part to keep.
+
+Recover a run only when its worker is surely dead. The lock stops two recoveries, but not a recovery of a run that is still alive: its tool
+can run twice. Wait until the run has been silent for longer than a live worker can be, as the
+[recovery job](../../../../docs/guide.md#shutdown-and-crash-recovery) does.

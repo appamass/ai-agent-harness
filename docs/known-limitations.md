@@ -43,6 +43,9 @@ Read this before you rely on the harness. Everything here is deliberate or not b
   `final_output` tool. The result is always validated by your Pydantic model, and resuming a run needs the same `output_model` again (ADR 0023).
   Compatible servers that reject `json_schema` (Ollama, vLLM, Gemini-compat) need `OpenAIProvider(..., structured_output=False)`.
   With several providers in one router, the tier every provider supports is used.
+- **Old MCP protocol revision:** The client speaks revision `2024-11-05` and always starts with `initialize`. Servers that also support older
+  revisions work. A server that supports only revision `2026-07-28` or later rejects `initialize`, so `load_mcp_tools` fails. It has not been
+  tested against a real server.
 - **MCP trust is configuration, not discovery:** every tool needs a local `Risk`, digests pin the raw definition at load time only, and a
   `list_changed` notification makes calls fail until you reload. The local argument model is a coarse pre-check; the server validates. The
   server allowlist is opt-in (`allowed_servers`). Stdio servers get a minimal environment and a bounded message size (`DEFAULT_MAX_MESSAGE_BYTES`). Remote transports (HTTP/SSE) and
@@ -50,6 +53,14 @@ Read this before you rely on the harness. Everything here is deliberate or not b
 
 ## Runtime behavior
 
+- **`recover=True` trusts you:** The harness cannot tell a crashed run from a live one, because it has no leases (ADR 0006). If you recover a run
+  whose worker still lives, the model hears "outcome unknown" and may call the tool again; the live worker fails with `ConcurrencyError` only at
+  its next save, after its tool has finished. Recover a run only when it has been silent for longer than a live worker can be, and keep write
+  tools idempotent. The [recovery job](guide.md#shutdown-and-crash-recovery) does this. Nothing recovers runs for you: without such a job, a run
+  that a crash interrupted stays `running`.
+- **A clean stop is a `KillSwitch` block, not a pause:** The [recipe](guide.md#shutdown-and-crash-recovery) ends the run as `blocked`, a finished
+  status. Calls that did not run are answered with an error, an approval that meets the switch is used up, and `purge_finished` can delete the
+  run. How a real model reacts to the blocked calls has not been tested.
 - **Thread timeouts:** Python cannot forcibly kill threads. A `SyncTool` that exceeds its timeout continues running in the background inside a
   dedicated thread pool (`SYNC_TOOL_THREADS`, default 16). While the process is running, this never starves the event loop or the checkpoint store;
   if the pool fills up, new `SyncTool` calls time out cleanly. On process **shutdown**, however, Python waits for hanging threads. Only initialize the

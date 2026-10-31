@@ -39,5 +39,7 @@ CI runs a few hundred scenarios; `HARNESS_STRESS=3000 pytest tests/test_stress.p
 
 - They hold for the code paths the harness controls. They do **not** make a model correct, and they do not stop prompt injection by
   themselves: real protection comes from least-privilege tools, human approval, argument validation, and egress filtering.
+- Row 7 holds between workers that resume a run. It does not hold when you pass `recover=True` for a run whose worker still lives: the
+  harness cannot tell it from a crashed one, so the tool can run twice. See [Shutdown and crash recovery](guide.md#shutdown-and-crash-recovery).
 - Tools you write are yours: the harness decides *whether* a tool may run, not what it does once it runs. Keep write tools idempotent.
   See also [`known-limitations.md`](known-limitations.md).

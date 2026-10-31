@@ -31,8 +31,8 @@ def test_every_doc_file_has_executable_blocks() -> None:
         assert BLOCK.findall(path.read_text(encoding="utf-8")), f"{path.name} contains no executable block"
 
 
-@pytest.mark.parametrize("path", DOC_FILES, ids=lambda p: p.stem)
-def test_doc_file_runs(path: Path) -> None:
+def run_doc_blocks(path: Path) -> types.ModuleType:
+    """Runs the executable blocks of a document. Returns the module, so tests can use what the blocks define."""
     # Real module so dataclasses/Pydantic can resolve annotations just like in normal code.
     module = types.ModuleType(f"doc_{path.stem.replace('-', '_')}")
     sys.modules[module.__name__] = module
@@ -47,6 +47,12 @@ def test_doc_file_runs(path: Path) -> None:
                 ) from exc
     finally:
         sys.modules.pop(module.__name__, None)
+    return module
+
+
+@pytest.mark.parametrize("path", DOC_FILES, ids=lambda p: p.stem)
+def test_doc_file_runs(path: Path) -> None:
+    run_doc_blocks(path)
 
 
 # ------------------------------------------------------------------ The README demo transcript is real

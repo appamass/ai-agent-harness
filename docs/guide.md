@@ -559,6 +559,120 @@ assert asyncio.run(recovery_job()) == 0  # nothing crashed here; tests/test_sub_
 
 After `cancel`, the runs are finished, so `purge_finished` removes them with your other old runs.
 
+## Shutdown and crash recovery
+
+A deploy sends your worker `SIGTERM` and kills it a few seconds later. Without a handler, its runs stay `running` in the store and nobody
+picks them up. You need two pieces: a clean stop, and a job that continues what was stopped.
+
+**A clean stop:** flip a `KillSwitch` on `SIGTERM`. Running tool and model calls finish, later tool calls are blocked, and the run ends as
+`blocked`. Stop taking new work first: a run that starts now is blocked before its input is stored, so it has nothing to continue. Then wait
+for the running calls and exit.
+
+```python
+# executable
+import signal
+
+from ai_agent_harness import KillSwitch
+
+SHUTDOWN = "Worker is restarting: this call did not run, so call it again"
+stopping = asyncio.Event()
+shutdown_switch = KillSwitch(lambda state: stopping.is_set(), reason=SHUTDOWN)  # a hook on every agent of this worker
+
+
+def stop_on_sigterm() -> None:
+    """Call it once inside the running event loop. A server such as uvicorn owns SIGTERM: set `stopping` in its shutdown hook."""
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopping.set)
+```
+
+The model sees a blocked call as an error, so `SHUTDOWN` tells it what to do. An approval that meets the switch is used up, and the model must
+ask again. `blocked` is a finished status: `on_run_end` hooks and your `blocked` alerts fire, and `purge_finished` can delete a stopped run.
+A call that takes longer than the time your platform gives (`docker stop`: 10 seconds, Kubernetes: 30 seconds by default) is killed. That is a
+crash: the run stays `running`, and the job below handles it. In a container, start Python directly (`CMD ["python", "worker.py"]`): a shell in
+front of it may not pass `SIGTERM` on.
+
+**Continuing runs:** run this job when a worker starts, and on a schedule. A stopped run can go on at once. A `running` run can be
+continued only when its worker is surely dead: the harness cannot tell a crashed run from a live one, and
+[recovering a live run can run a tool twice](known-limitations.md#runtime-behavior). So the job waits until the run has been silent for longer
+than a live worker can be.
+
+```python
+# executable
+from ai_agent_harness.core import ConcurrencyError, InvalidStateError
+
+
+def silence_limit(agent, margin: timedelta = timedelta(minutes=5)) -> timedelta:
+    """How long a live worker can stay silent: the slowest tool, plus the model calls between two saves."""
+    slowest_tool = max((tool.timeout_s for tool in agent.tools), default=0.0)
+    model_calls = agent.limits.max_consecutive_retries + 1  # a rejected answer is not saved before the next call
+    return timedelta(seconds=slowest_tool + model_calls * agent.router.worst_case_s()) + margin
+
+
+async def continue_runs(agent, tenant_id: str, older_than: timedelta) -> int:
+    """Continues runs of `agent` that a shutdown stopped or a crash left `running`. Returns how many."""
+    store = agent.checkpoints  # list_runs needs a SQLite or PostgreSQL store
+    cutoff = datetime.now(UTC) - older_than
+    # Newest first: ask for the maximum (10,000) and run the job repeatedly
+    found = await store.list_runs(tenant_id, status=RunStatus.BLOCKED, limit=10_000)
+    found += [
+        info
+        for info in await store.list_runs(tenant_id, status=RunStatus.RUNNING, limit=10_000)
+        if info.updated_at < cutoff
+    ]
+    continued = 0
+    for info in found:
+        state = await store.load(tenant_id, info.run_id)
+        if state is None or state.revision != info.revision:
+            continue  # it moved on since the list
+        crashed = info.status is RunStatus.RUNNING
+        if not crashed and state.status_reason != SHUTDOWN:
+            continue  # a guard blocked this run: that decision stays
+        try:
+            await resume(agent, state, recover=crashed)
+        except (ConcurrencyError, InvalidStateError):
+            continue  # another job was faster, it belongs to another agent, or it never stored its input
+        continued += 1
+    return continued
+```
+
+Several jobs may run at once: the optimistic lock lets one win. The job works through the runs one by one, so you may prefer to hand each
+run to your own queue. Run it more often than `purge_finished`. Runs a guard blocked stay on its list until they are purged, and it loads each
+of them on every pass. Keep the text of `SHUTDOWN` stable: the job skips runs that were stopped with another text.
+Pass `deps=` and `output_model=` to `resume` if your runs use them; they are not stored. With `max_parallel_tools`,
+add a whole group of parallel tools to `slowest_tool`. A hook, context source, or stream consumer that can hang needs its own timeout or a
+larger margin. `updated_at` comes from the store's clock, and `margin` covers the clock skew. Close crashed sub-runs with the
+[job above](#sub-agents).
+
+The whole path, with a real signal that arrives while a tool runs:
+
+```python
+# executable
+@tool(risk=Risk.READ)
+async def lookup() -> str:
+    """Looks something up."""
+    signal.raise_signal(signal.SIGTERM)  # the deploy arrives now
+    await stopping.wait()
+    return "Found it."
+
+
+async def deploy() -> None:
+    with SqliteCheckpointStore(":memory:") as store:
+        await store.setup()
+        old_worker = make_agent([tool_response(("lookup", {}))], lookup, hooks=HookPipeline([shutdown_switch]), checkpoints=store)
+        stop_on_sigterm()
+        stopped = await start(old_worker, "Look it up", tenant_id="tenant-42", run_id="run-7")
+        assert stopped.status is RunStatus.BLOCKED and stopped.status_reason == SHUTDOWN
+
+        new_worker = make_agent([text_response("Here it is.")], lookup, checkpoints=store)
+        assert await continue_runs(new_worker, "tenant-42", silence_limit(new_worker)) == 1
+
+        finished = await store.load("tenant-42", "run-7")
+        assert finished is not None and finished.status is RunStatus.DONE
+        assert [result.content for message in finished.messages for result in message.tool_results] == ["Found it."]
+
+
+asyncio.run(deploy())
+```
+
 ## Where to go next
 
 [`agent-package.md`](agent-package.md) to lay out an agent project · [`guarantees.md`](guarantees.md) for what is enforced and by which test · [`production-checklist.md`](production-checklist.md) before you go live.
