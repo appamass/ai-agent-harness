@@ -3,6 +3,11 @@
 Semantic versioning. Changes to the persisted checkpoint format also list their schema version
 (ADR 0010). Prior to `1.0.0`, minor versions may introduce breaking changes to the public API.
 
+## Unreleased
+
+- Docs: `docs/guide.md` has a section on shutdown and crash recovery: flip a `KillSwitch` on `SIGTERM`, then continue stopped and crashed runs with a recovery job. No code changed. `tests/test_shutdown.py` checks the behavior with real signals.
+- Docs: the production checklist, `docs/known-limitations.md`, and `docs/guarantees.md` now say that `recover=True` on a run whose worker still lives can run a tool twice, and that the MCP client speaks only revision `2024-11-05`.
+
 ## 0.9.0 – 2026-10-28
 
 - Changed (breaking, ADR 0032): Python 3.12 is the minimum; 3.11 is no longer supported. CI tests 3.12 to 3.14, and the `lowest` job runs on 3.12. `BaseTool` and `SyncTool` use the PEP 695 syntax (`BaseTool[InputT: BaseModel]`); the unexported module-level `ai_agent_harness.tools.base.InputT` is gone, and type checkers infer the parameter as contravariant. Runtime behavior and tool digests are unchanged.

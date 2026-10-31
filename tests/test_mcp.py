@@ -595,6 +595,21 @@ def test_tools_list_follows_pagination() -> None:
     assert transport.cursors == [None, "p2"]
 
 
+def test_a_server_that_rejects_initialize_cannot_be_loaded() -> None:
+    """A server that supports only revision 2026-07-28 or later has no `initialize` (see known-limitations)."""
+
+    class ModernOnly(InMemoryMCPTransport):
+        async def send_request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+            if method == "initialize":
+                raise ToolError("Method not found")
+            return await super().send_request(method, params)
+
+    config = MCPServerConfig(server_name="modern", transport=ModernOnly(MockMCPServer("modern")))
+
+    with pytest.raises(ToolError, match="Method not found"):
+        run_sync(load_mcp_tools(config))
+
+
 # ------------------------------------------------------------------ Strict recheck: real-world schemas and names
 
 

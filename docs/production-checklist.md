@@ -12,6 +12,8 @@ Work through this list before you let an agent act on real data. Items marked wi
       the tokens your provider reports), and `max_input_chars`.
       `max_total_tokens` counts `Usage.total`, which **includes** cache read and write tokens
 - [ ] Wire `KillSwitch` to a runtime toggle (feature flag, file, or database row) that operations can flip without redeploying
+- [ ] Stop cleanly on `SIGTERM` and run a recovery job, so that deploys and crashes do not leave runs `running` forever. Never use `recover=True`
+      on a run whose worker may still live: the tool can run twice (see [Shutdown and crash recovery](guide.md#shutdown-and-crash-recovery))
 - [ ] Subscribe event listeners for logging, tracing, and cost tracking; alert on `failed` and `limit_reached`
 - [ ] Keep secrets strictly inside tool code and adapters — never in prompts, context, or checkpoints
 - [ ] Build project-specific evals with representative tasks and run them in CI as a release gate
